@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Local typed app IPC only. No shell, arbitrary filesystem or renderer networking.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "allow-app-request",
+    "allow-copy-last-report",
+    "allow-stop-backend",
+    "allow-clash-request",
+    "allow-copy-clash-config",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

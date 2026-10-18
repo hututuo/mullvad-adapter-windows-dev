@@ -1,0 +1,11 @@
+# Mullvad PQ negotiator
+
+This bounded command-line helper links Mullvad's official `talpid-tunnel-config-client` at desktop 2026.5, commit `19fb87407f4b81fe15372c2c7f8a20e7ab4eb220`. It negotiates ML-KEM-1024 and HQC-256 inside an already established WireGuard tunnel. It does not provide DAITA, OS routing, account registration or its own VPN service.
+
+Input is a maximum 4 KiB JSON object on stdin: `parentkey` is the registered public WG key; `socks_ports` contains one or two loopback SOCKS ports. An optional `ephemeral_private_key` reuses the first hop's fresh identity for the second hop of the same transaction. The SOCKS connector targets the official in-tunnel configuration gateway `10.64.0.1:1337` using a literal IPv4 address. No credentials or keys are accepted in command-line arguments or environment variables.
+
+Successful stdout is schema 1 JSON containing a fresh private/public key pair and one PSK per requested hop. **This output is secret:** pipe it to the daemon, never save it in diagnostics, print it or copy it into Git. Failures return a generic stderr message and nonzero exit. `--version` prints only public component identity. The helper's network negotiation deadline is 25 seconds; the daemon independently enforces 28 seconds and reaps failed processes.
+
+The current daemon supports single-hop PQ. The helper can reuse an ephemeral identity during controlled two-hop experiments; combined multihop/PQ remains explicitly blocked pending reliable final-tunnel acceptance. Its bootstrap workers are isolated from the application front; it switches to the final ephemeral key/PSK graph and requires full IP/DNS/HTTPS readiness. Failures do not select an unprotected fallback. Persistent account/device keys remain unchanged.
+
+Build using `scripts/build-pq-helper.sh` with Rust 1.97.1 or compatible Rust >=1.95. The script obtains a checksum-verified project-local protoc; no protobuf installation is required. Candidate packages contain the compiled arm64 helper, this source, Cargo.lock and GPL license. End users do not need Rust or protoc. Upstream source and dependency revisions are recorded in Cargo.lock; [official source](https://github.com/mullvad/mullvadvpn-app/tree/19fb87407f4b81fe15372c2c7f8a20e7ab4eb220) and [GPL license](https://github.com/mullvad/mullvadvpn-app/blob/2026.5/LICENSE.md) remain available.

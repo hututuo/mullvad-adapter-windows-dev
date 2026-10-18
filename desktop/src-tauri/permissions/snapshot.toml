@@ -1,0 +1,24 @@
+[[permission]]
+identifier = "allow-app-request"
+description = "Send typed commands to the local authorized per-user backend."
+commands.allow = ["app_request"]
+
+[[permission]]
+identifier = "allow-copy-last-report"
+description = "Copy only the current verified diagnostic report path."
+commands.allow = ["copy_last_report"]
+
+[[permission]]
+identifier = "allow-stop-backend"
+description = "Explicitly stop the owned backend and confirm its exit before quitting."
+commands.allow = ["stop_backend_and_exit"]
+
+[[permission]]
+identifier = "allow-clash-request"
+description = "Preview and manage the current user's external Clash profile through validated native transactions."
+commands.allow = ["clash_request"]
+
+[[permission]]
+identifier = "allow-copy-clash-config"
+description = "Copy only the verified backend's public local SOCKS5 node configuration."
+commands.allow = ["copy_clash_config"]

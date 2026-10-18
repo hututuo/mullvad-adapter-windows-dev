@@ -1,0 +1,11 @@
+{
+  "id": "fixture-operation",
+  "kind": "select",
+  "relay": "one",
+  "state": "succeeded",
+  "stage": "finished",
+  "message": "controlled example",
+  "result": {
+    "ok": true
+  }
+}

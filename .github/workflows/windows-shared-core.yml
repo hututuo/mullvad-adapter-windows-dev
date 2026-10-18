@@ -1,0 +1,136 @@
+name: windows-shared-core
+on:
+  workflow_dispatch:
+    inputs:
+      build_candidate:
+        description: Build unsigned Windows x64 NSIS candidate after checks
+        type: boolean
+        default: false
+  push:
+    branches: ['docs/windows-architecture-*', 'feat/windows-*']
+permissions:
+  contents: read
+jobs:
+  core-checks:
+    env:
+      ADAPTER_SOURCE_SHA: ${{ github.sha }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: rustfmt
+      - run: cargo fmt --manifest-path core/Cargo.toml --all -- --check
+      - run: cargo test --manifest-path core/Cargo.toml --locked
+      - run: cargo build --manifest-path core/Cargo.toml --locked --release
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: windows-development-agent-${{ github.sha }}
+          path: core/target/release/adapter-agent.exe
+          if-no-files-found: error
+          retention-days: 14
+  mihomo-config-parser:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+      - run: cargo build --manifest-path core/Cargo.toml -p adapter-engine-mihomo --example synthetic_config --locked
+      - if: runner.os == 'Windows'
+        run: cargo build --manifest-path core/Cargo.toml -p adapter-engine-mihomo --example synthetic_lifecycle --locked
+      - run: python scripts/test_mihomo_config_test.py
+      - if: runner.os == 'Linux'
+        run: python3 scripts/test-mihomo-config.py --fixture-generator core/target/debug/examples/synthetic_config
+      - if: runner.os == 'Windows'
+        run: python scripts/test-mihomo-config.py --fixture-generator core/target/debug/examples/synthetic_config.exe --lifecycle-fixture core/target/debug/examples/synthetic_lifecycle.exe
+  macos-compatibility:
+    runs-on: macos-14
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_15.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3.11'
+      - run: ruby -c daemon/mullvad_adapter.rb
+      - run: ruby -I . -I daemon -e 'ARGV.each { |f| require File.expand_path(f) }' daemon/test_*.rb
+      - run: ruby scripts/test-shared-contract.rb
+      - name: Stage daemon payload and run packaged regressions
+        run: ruby scripts/stage-daemon-payload.rb "$RUNNER_TEMP/mullvad-daemon-payload"
+      - run: swift test -c release
+        working-directory: ui
+  desktop-checks:
+    env:
+      ADAPTER_SOURCE_SHA: ${{ github.sha }}
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - run: python packaging/windows/test_build_candidate.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.19.0'
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - run: npm ci --ignore-scripts
+        working-directory: desktop
+      - run: npm run build
+        working-directory: desktop
+      - run: cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked
+      - run: cargo build --manifest-path desktop/src-tauri/Cargo.toml --locked --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-development-ui-${{ github.sha }}
+          path: desktop/src-tauri/target/release/mullvad-adapter-desktop.exe
+          if-no-files-found: error
+          retention-days: 14
+  candidate-build:
+    name: unsigned Windows installer candidate
+    if: github.event_name == 'workflow_dispatch' && inputs.build_candidate
+    needs: [core-checks, mihomo-config-parser, macos-compatibility, desktop-checks]
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.19.0'
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - run: npm ci --ignore-scripts
+        working-directory: desktop
+      - name: Assemble full unsigned installer
+        shell: pwsh
+        run: >-
+          python packaging/windows/build_candidate.py
+          --source-sha '${{ github.sha }}'
+          --output "$env:RUNNER_TEMP/windows-candidate"
+          --target-dir "$env:RUNNER_TEMP/windows-candidate-target"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer-candidate-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/windows-candidate/*.exe
+            ${{ runner.temp }}/windows-candidate/candidate.json
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,15 @@
+[package]
+name = "adapter-clash-integration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+adapter-platform.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "=0.10.9"
+serde_yaml_ng = "=0.10.0"
+fs2 = "=0.4.3"
+ureq = { version = "=3.4.2", default-features = false, features = ["json"] }

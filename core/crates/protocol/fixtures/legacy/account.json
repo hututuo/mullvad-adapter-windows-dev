@@ -1,0 +1,12 @@
+{
+  "signed_in": false,
+  "verified": false,
+  "account_suffix": null,
+  "expiry": null,
+  "checked_at": null,
+  "public_key": "fixture-public-key-not-a-real-identity",
+  "device_match": "unknown",
+  "devices": [
+
+  ]
+}

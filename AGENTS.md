@@ -1,0 +1,15 @@
+# Public Windows maintenance rules
+
+This is a development/maintenance repository. Read README.md, SOURCE_BASELINE.json, docs/development.md, docs/windows-maintenance.md, docs/architecture.md and docs/network-capabilities.md first. For behavior changes consult docs/spec-development.md and the relevant openspec change. Do not send the maintainer through recipient installation/report-return workflows; implement the requested scoped fix and verify it here.
+
+Inspect branch, full SHA, worktrees and uncommitted changes before editing. Use short task branches and narrow staging; preserve other work. No force push, reset, clean, automatic stash or whole-tree staging. Locked dependencies and the pinned engine are part of the build contract. Mock/fixture and PROPOSED history are not runtime acceptance.
+
+Preserve same-city/original-path recovery, physical-offline waiting, unique peer ownership, operation cancellation, epoch/generation and evidence freshness. Never add DIRECT fallback to the front or lower required protection to obtain success. Do not probe spare WG tunnels concurrently with an active identity. Account/device/catalogue/interface facts must come from actual runtime/API data, not developer machine constants.
+
+Run checks relevant to each change; distinguish PASS, FAIL, NOT_RUN and BLOCKED. Complete candidate builds bind the exact source SHA and runtime manifest; a standalone UI/agent binary is not an installer. Windows-specific behavior requires Windows evidence. Source, CI, package, installation, actual egress and long-term recovery are separate claims. Record version, SHA, architecture, size/hash, signing status and tests for candidates. Historical Mac references do not establish current Mac parity.
+
+Keep credentials, private keys, subscription URLs, DPAPI files, full configs, raw diagnostic JSON and private context out of this public repository and CI. Raw JSON can contain user paths and device identifiers; extract minimal allowlisted evidence locally before model output or public sharing. Internal progress/incident records remain private. If local project.devContext* mapping exists, use it only with access; absence does not prevent public-source work, and does not grant knowledge of private history.
+
+No automatic sleep, physical network interruption, power/firewall changes, broad resets, device creation/revocation/rotation, data deletion, name-based process kills or repeated foreground window/menu/focus tests. Keep the model/remote-control connection independent of the tunnel being tested. These require their own appropriate user scope; ordinary code maintenance is not authorization for live-machine disruption.
+
+This repository and the distribution repository have no automatic sync. Transfer only reviewed source changes explicitly, retaining provenance and each repository's own entry documents; never push original private Git history to either public remote. Signing keys, tags, public releases, feeds, installed-app replacement and deployment require their corresponding user authorization. Report the actual branch/commit, checks, remaining limits and rollback point.

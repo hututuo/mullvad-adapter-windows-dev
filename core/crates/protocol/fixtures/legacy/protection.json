@@ -1,0 +1,36 @@
+{
+  "profile": {
+    "multihop": false,
+    "entry_city": null,
+    "post_quantum": false
+  },
+  "config_error": null,
+  "checked_at": "2026-01-01T00:00:00Z",
+  "effective": {
+    "relay": "one",
+    "multihop": false,
+    "entry_relay": null,
+    "entry_city": null,
+    "post_quantum": false,
+    "pq_helper_sha256": null,
+    "daita": false,
+    "transport": "ss",
+    "transport_mode": "ss",
+    "endpoint": "192.0.2.2",
+    "endpoint_port": null,
+    "endpoint_kind": null,
+    "interface": null,
+    "mixed_port": 17910,
+    "started_at": "2026-01-01T00:00:00Z",
+    "front_connection_count": 0
+  },
+  "capabilities": {
+    "multihop": "mihomo-nested-wireguard",
+    "shadowsocks": "supported",
+    "post_quantum": "requires-packaged-pq-helper",
+    "daita": "requires-daita-tunnel-engine",
+    "quic": "requires-obfuscation-helper",
+    "udp_over_tcp": "requires-obfuscation-helper",
+    "lwo": "requires-compatible-tunnel-engine"
+  }
+}

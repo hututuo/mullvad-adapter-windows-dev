@@ -1,0 +1,437 @@
+[
+  {
+    "name": "valid_two_cities",
+    "payload": {
+      "wireguard": {
+        "port_ranges": [
+          [
+            33431,
+            33431
+          ],
+          [
+            51820,
+            51820
+          ]
+        ],
+        "shadowsocks_port_ranges": [
+          [
+            20000,
+            21000
+          ]
+        ],
+        "relays": [
+          {
+            "hostname": "us-sea-wg-1",
+            "location": "us-sea",
+            "active": true,
+            "public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "ipv4_addr_in": "192.0.2.10",
+            "ipv6_addr_in": "2001:db8::10",
+            "shadowsocks_extra_addr_in": [
+              "198.51.100.5"
+            ]
+          },
+          {
+            "hostname": "ca-tor-wg-1",
+            "location": "ca-tor",
+            "active": true,
+            "public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "ipv4_addr_in": "192.0.2.10",
+            "ipv6_addr_in": "2001:db8::10",
+            "shadowsocks_extra_addr_in": [
+              "198.51.100.5"
+            ]
+          }
+        ]
+      }
+    },
+    "accepted": true,
+    "hostnames": [
+      "us-sea-wg-1",
+      "ca-tor-wg-1"
+    ],
+    "rejected": 0,
+    "transports": [
+      [
+        "ss",
+        "ipv6",
+        "ipv4"
+      ],
+      [
+        "ss",
+        "ipv6",
+        "ipv4"
+      ]
+    ]
+  },
+  {
+    "name": "bad_row_filtered",
+    "payload": {
+      "wireguard": {
+        "port_ranges": [
+          [
+            33431,
+            33431
+          ],
+          [
+            51820,
+            51820
+          ]
+        ],
+        "shadowsocks_port_ranges": [
+          [
+            20000,
+            21000
+          ]
+        ],
+        "relays": [
+          {
+            "hostname": "us-sea-wg-1",
+            "location": "us-sea",
+            "active": true,
+            "public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "ipv4_addr_in": "192.0.2.10",
+            "ipv6_addr_in": "2001:db8::10",
+            "shadowsocks_extra_addr_in": [
+              "198.51.100.5"
+            ]
+          },
+          {
+            "hostname": "bad-ip",
+            "location": "us-sea",
+            "active": true,
+            "public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "ipv4_addr_in": "not-an-ip",
+            "ipv6_addr_in": "2001:db8::10",
+            "shadowsocks_extra_addr_in": [
+              "198.51.100.5"
+            ]
+          }
+        ]
+      }
+    },
+    "accepted": true,
+    "hostnames": [
+      "us-sea-wg-1"
+    ],
+    "rejected": 1,
+    "transports": [
+      [
+        "ss",
+        "ipv6",
+        "ipv4"
+      ]
+    ]
+  },
+  {
+    "name": "inactive_retained",
+    "payload": {
+      "wireguard": {
+        "port_ranges": [
+          [
+            33431,
+            33431
+          ],
+          [
+            51820,
+            51820
+          ]
+        ],
+        "shadowsocks_port_ranges": [
+          [
+            20000,
+            21000
+          ]
+        ],
+        "relays": [
+          {
+            "hostname": "inactive",
+            "location": "us-sea",
+            "active": false,
+            "public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "ipv4_addr_in": "192.0.2.10",
+            "ipv6_addr_in": "2001:db8::10",
+            "shadowsocks_extra_addr_in": [
+              "198.51.100.5"
+            ]
+          }
+        ]
+      }
+    },
+    "accepted": true,
+    "hostnames": [
+      "inactive"
+    ],
+    "rejected": 0,
+    "transports": [
+      []
+    ]
+  },
+  {
+    "name": "duplicate_first_wins",
+    "payload": {
+      "wireguard": {
+        "port_ranges": [
+          [
+            33431,
+            33431
+          ],
+          [
+            51820,
+            51820
+          ]
+        ],
+        "shadowsocks_port_ranges": [
+          [
+            20000,
+            21000
+          ]
+        ],
+        "relays": [
+          {
+            "hostname": "us-sea-wg-1",
+            "location": "us-sea",
+            "active": true,
+            "public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "ipv4_addr_in": "192.0.2.10",
+            "ipv6_addr_in": "2001:db8::10",
+            "shadowsocks_extra_addr_in": [
+              "198.51.100.5"
+            ]
+          },
+          {
+            "hostname": "us-sea-wg-1",
+            "location": "us-sea",
+            "active": true,
+            "public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "ipv4_addr_in": "192.0.2.10",
+            "ipv6_addr_in": "2001:db8::10",
+            "shadowsocks_extra_addr_in": [
+              "198.51.100.5"
+            ]
+          }
+        ]
+      }
+    },
+    "accepted": true,
+    "hostnames": [
+      "us-sea-wg-1"
+    ],
+    "rejected": 1,
+    "transports": [
+      [
+        "ss",
+        "ipv6",
+        "ipv4"
+      ]
+    ]
+  },
+  {
+    "name": "invalid_first_reserves_name",
+    "payload": {
+      "wireguard": {
+        "port_ranges": [
+          [
+            33431,
+            33431
+          ],
+          [
+            51820,
+            51820
+          ]
+        ],
+        "shadowsocks_port_ranges": [
+          [
+            20000,
+            21000
+          ]
+        ],
+        "relays": [
+          {
+            "hostname": "us-sea-wg-1",
+            "location": "us-sea",
+            "active": true,
+            "public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "ipv4_addr_in": "invalid",
+            "ipv6_addr_in": "2001:db8::10",
+            "shadowsocks_extra_addr_in": [
+              "198.51.100.5"
+            ]
+          },
+          {
+            "hostname": "us-sea-wg-1",
+            "location": "us-sea",
+            "active": true,
+            "public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "ipv4_addr_in": "192.0.2.10",
+            "ipv6_addr_in": "2001:db8::10",
+            "shadowsocks_extra_addr_in": [
+              "198.51.100.5"
+            ]
+          }
+        ]
+      }
+    },
+    "accepted": false,
+    "hostnames": [],
+    "rejected": 0,
+    "transports": []
+  },
+  {
+    "name": "ipv6_only",
+    "payload": {
+      "wireguard": {
+        "port_ranges": [
+          [
+            33431,
+            33431
+          ],
+          [
+            51820,
+            51820
+          ]
+        ],
+        "shadowsocks_port_ranges": [
+          [
+            20000,
+            21000
+          ]
+        ],
+        "relays": [
+          {
+            "hostname": "v6-only",
+            "location": "us-sea",
+            "active": true,
+            "public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "ipv4_addr_in": "",
+            "ipv6_addr_in": "2001:db8::10",
+            "shadowsocks_extra_addr_in": [
+              "2001:db8::22"
+            ]
+          }
+        ]
+      }
+    },
+    "accepted": true,
+    "hostnames": [
+      "v6-only"
+    ],
+    "rejected": 0,
+    "transports": [
+      [
+        "ipv6"
+      ]
+    ]
+  },
+  {
+    "name": "port_zero_rejected",
+    "payload": {
+      "wireguard": {
+        "port_ranges": [
+          [
+            0,
+            65535
+          ]
+        ],
+        "shadowsocks_port_ranges": [
+          [
+            20000,
+            21000
+          ]
+        ],
+        "relays": [
+          {
+            "hostname": "us-sea-wg-1",
+            "location": "us-sea",
+            "active": true,
+            "public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "ipv4_addr_in": "192.0.2.10",
+            "ipv6_addr_in": "2001:db8::10",
+            "shadowsocks_extra_addr_in": [
+              "198.51.100.5"
+            ]
+          }
+        ]
+      }
+    },
+    "accepted": false,
+    "hostnames": [],
+    "rejected": 0,
+    "transports": []
+  },
+  {
+    "name": "missing_ss_ranges",
+    "payload": {
+      "wireguard": {
+        "port_ranges": [
+          [
+            33431,
+            33431
+          ],
+          [
+            51820,
+            51820
+          ]
+        ],
+        "shadowsocks_port_ranges": [],
+        "relays": [
+          {
+            "hostname": "us-sea-wg-1",
+            "location": "us-sea",
+            "active": true,
+            "public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "ipv4_addr_in": "192.0.2.10",
+            "ipv6_addr_in": "2001:db8::10",
+            "shadowsocks_extra_addr_in": [
+              "198.51.100.5"
+            ]
+          }
+        ]
+      }
+    },
+    "accepted": false,
+    "hostnames": [],
+    "rejected": 0,
+    "transports": []
+  },
+  {
+    "name": "non_boolean_active",
+    "payload": {
+      "wireguard": {
+        "port_ranges": [
+          [
+            33431,
+            33431
+          ],
+          [
+            51820,
+            51820
+          ]
+        ],
+        "shadowsocks_port_ranges": [
+          [
+            20000,
+            21000
+          ]
+        ],
+        "relays": [
+          {
+            "hostname": "us-sea-wg-1",
+            "location": "us-sea",
+            "active": "true",
+            "public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "ipv4_addr_in": "192.0.2.10",
+            "ipv6_addr_in": "2001:db8::10",
+            "shadowsocks_extra_addr_in": [
+              "198.51.100.5"
+            ]
+          }
+        ]
+      }
+    },
+    "accepted": false,
+    "hostnames": [],
+    "rejected": 0,
+    "transports": []
+  }
+]

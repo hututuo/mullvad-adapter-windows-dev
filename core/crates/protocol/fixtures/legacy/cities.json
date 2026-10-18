@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "generation": 1,
+  "favorite_cities": [
+    "us-sjc"
+  ],
+  "selected_city": "us-sjc",
+  "cities": [
+    {
+      "id": "us-sjc",
+      "country": null,
+      "city": null,
+      "relay_count": 5,
+      "primary": {
+        "relay": "one",
+        "transport": null,
+        "evidence": "unverified",
+        "checked_at": null,
+        "age_seconds": null,
+        "outer_probe": null,
+        "active": true
+      },
+      "backups": [
+        {
+          "relay": "five",
+          "transport": null,
+          "evidence": "unverified",
+          "checked_at": null,
+          "age_seconds": null,
+          "outer_probe": null,
+          "active": false
+        },
+        {
+          "relay": "four",
+          "transport": null,
+          "evidence": "unverified",
+          "checked_at": null,
+          "age_seconds": null,
+          "outer_probe": null,
+          "active": false
+        }
+      ],
+      "maintenance_interval_seconds": 30
+    }
+  ],
+  "auto_cross_city": false,
+  "backup_policy": "outer-probe-only-until-switch",
+  "updated_at": "2026-01-01T00:00:00Z"
+}

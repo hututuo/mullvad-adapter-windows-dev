@@ -1,0 +1,12 @@
+[package]
+name = "adapter-probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+hickory-proto = { version = "=0.26.3", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+serde_json.workspace = true

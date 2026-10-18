@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "version": "v1.19.31",
+  "repository": "https://github.com/MetaCubeX/mihomo",
+  "source_tag": "https://github.com/MetaCubeX/mihomo/tree/v1.19.31",
+  "license": "GPL-3.0",
+  "license_url": "https://github.com/MetaCubeX/mihomo/blob/v1.19.31/LICENSE",
+  "purpose": "synthetic configuration parser CI only; not bundled or installed",
+  "assets": {
+    "linux": {
+      "name": "mihomo-linux-amd64-compatible-v1.19.31.gz",
+      "bytes": 22821836,
+      "sha256": "04cf9f09671704f839ddbee2e93069dc831a4123a75281e725d1d96ab9ac1afc"
+    },
+    "windows": {
+      "name": "mihomo-windows-amd64-compatible-v1.19.31.zip",
+      "bytes": 22460803,
+      "sha256": "93d14e9a13b49b2f2d256202d02cc8d14a7c4695edf084cae0f941986bc9c218"
+    }
+  }
+}

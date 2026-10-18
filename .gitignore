@@ -1,0 +1,20 @@
+.DS_Store
+__pycache__/
+.build/
+DerivedData/
+*.xcuserstate
+*.log
+runs/
+backups/
+private/
+reports-to-maintainer/
+
+helpers/**/target/
+helpers/**/bin/
+desktop/src-tauri/gen/
+
+# Local maintenance artifacts and credentials
+maintenance-local/
+.env
+.env.*
+!.env.example

@@ -1,0 +1,354 @@
+#!/bin/sh
+#
+# Fail-open watchdog for the Mullvad VPN app on macOS.
+#
+# This process never connects or reconnects Mullvad. It only requests a normal
+# Mullvad disconnect after the daemon has continuously reported an effective
+# traffic-blocking state, or an invalid tunnel status, for the configured
+# threshold.
+
+set -u
+
+watchdog_cli="${MULLVAD_FAIL_OPEN_CLI:-/Applications/Mullvad VPN.app/Contents/Resources/mullvad}"
+if [ -n "${MULLVAD_FAIL_OPEN_JQ:-}" ]; then
+    watchdog_jq=$MULLVAD_FAIL_OPEN_JQ
+else
+    watchdog_jq=$(command -v jq 2>/dev/null || true)
+    watchdog_jq=${watchdog_jq:-/usr/bin/jq}
+fi
+watchdog_poll_seconds="${MULLVAD_FAIL_OPEN_POLL_SECONDS:-5}"
+watchdog_after_seconds="${MULLVAD_FAIL_OPEN_AFTER_SECONDS:-60}"
+watchdog_required_polls="${MULLVAD_FAIL_OPEN_REQUIRED_POLLS:-3}"
+watchdog_retry_seconds="${MULLVAD_FAIL_OPEN_RETRY_SECONDS:-60}"
+watchdog_command_timeout_seconds="${MULLVAD_FAIL_OPEN_COMMAND_TIMEOUT_SECONDS:-15}"
+watchdog_armed="${MULLVAD_FAIL_OPEN_ARMED:-0}"
+watchdog_max_polls="${MULLVAD_FAIL_OPEN_MAX_POLLS:-0}"
+watchdog_no_sleep="${MULLVAD_FAIL_OPEN_NO_SLEEP:-0}"
+watchdog_log_path="${MULLVAD_FAIL_OPEN_LOG_PATH:-$HOME/Library/Logs/MullvadFailOpen/watchdog.log}"
+
+watchdog_log() {
+    watchdog_log_timestamp=$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')
+    /usr/bin/printf '%s %s\n' "$watchdog_log_timestamp" "$*"
+}
+
+watchdog_require_uint() {
+    watchdog_uint_name=$1
+    watchdog_uint_value=$2
+    case "$watchdog_uint_value" in
+        ''|*[!0-9]*)
+            watchdog_log "event=config_error field=$watchdog_uint_name requirement=unsigned_integer"
+            exit 64
+            ;;
+    esac
+}
+
+watchdog_require_positive_uint() {
+    watchdog_require_uint "$1" "$2"
+    if [ "$2" -eq 0 ]; then
+        watchdog_log "event=config_error field=$1 requirement=positive_integer"
+        exit 64
+    fi
+}
+
+watchdog_require_positive_uint "poll_seconds" "$watchdog_poll_seconds"
+watchdog_require_uint "after_seconds" "$watchdog_after_seconds"
+watchdog_require_positive_uint "required_polls" "$watchdog_required_polls"
+watchdog_require_positive_uint "retry_seconds" "$watchdog_retry_seconds"
+watchdog_require_positive_uint "command_timeout_seconds" "$watchdog_command_timeout_seconds"
+watchdog_require_uint "max_polls" "$watchdog_max_polls"
+
+case "$watchdog_armed" in
+    0|1) ;;
+    *)
+        watchdog_log "event=config_error field=armed requirement=zero_or_one"
+        exit 64
+        ;;
+esac
+
+case "$watchdog_no_sleep" in
+    0|1) ;;
+    *)
+        watchdog_log "event=config_error field=no_sleep requirement=zero_or_one"
+        exit 64
+        ;;
+esac
+
+if [ ! -x "$watchdog_cli" ]; then
+    watchdog_log "event=config_error field=cli reason=not_executable"
+    exit 69
+fi
+
+if [ ! -x "$watchdog_jq" ]; then
+    watchdog_log "event=config_error field=jq reason=not_executable"
+    exit 69
+fi
+
+watchdog_run_cli() {
+    /usr/bin/perl -e '
+        my $timeout_seconds = shift @ARGV;
+        $SIG{ALRM} = sub { exit 124 };
+        alarm($timeout_seconds);
+        exec @ARGV;
+        exit 127;
+    ' "$watchdog_command_timeout_seconds" "$watchdog_cli" "$@"
+}
+
+# Sets:
+#   watchdog_state: Mullvad tunnel state
+#   watchdog_reason: normalized, non-sensitive reason class
+#   watchdog_blocking: yes only if Mullvad reports that blocking is effective
+watchdog_read_snapshot() {
+    watchdog_status_json=$(watchdog_run_cli status --json 2>/dev/null) || return 1
+
+    watchdog_snapshot=$(
+        /usr/bin/printf '%s' "$watchdog_status_json" |
+            "$watchdog_jq" -er '
+                def safe_token:
+                    tostring | gsub("[^A-Za-z0-9_.-]"; "_");
+
+                if (.state | type) != "string" then
+                    error("missing tunnel state")
+                elif .state == "error" then
+                    if ((.details | type) != "object")
+                       or ((.details | has("block_failure")) | not)
+                       or ((.details.cause | type) != "object") then
+                        error("incomplete error state")
+                    else
+                        [
+                            "error",
+                            ((.details.cause.reason // "unknown") | safe_token),
+                            (if .details.block_failure == null then "yes" else "no" end)
+                        ] | @tsv
+                    end
+                elif .state == "disconnected" then
+                    if (.details | type) != "object" then
+                        error("incomplete disconnected state")
+                    else
+                        [
+                            "disconnected",
+                            (if .details.locked_down == true then "locked_down" else "none" end),
+                            (if .details.locked_down == true then "yes" else "no" end)
+                        ] | @tsv
+                    end
+                else
+                    [(.state | safe_token), "none", "no"] | @tsv
+                end
+            ' 2>/dev/null
+    ) || return 2
+
+    watchdog_tab=$(/usr/bin/printf '\t')
+    watchdog_old_ifs=$IFS
+    IFS=$watchdog_tab
+    # jq emits exactly three normalized tokens. Avoid a here-document: older
+    # /bin/sh implementations create a temp file for it and can flood stderr
+    # on every poll when the disk is full.
+    set -f
+    set -- $watchdog_snapshot
+    set +f
+    IFS=$watchdog_old_ifs
+    [ "$#" -eq 3 ] || return 2
+    watchdog_state=$1
+    watchdog_reason=$2
+    watchdog_blocking=$3
+
+    [ -n "$watchdog_state" ] || return 2
+    [ -n "$watchdog_reason" ] || return 2
+    case "$watchdog_blocking" in
+        yes|no) ;;
+        *) return 2 ;;
+    esac
+    return 0
+}
+
+watchdog_last_observation=""
+watchdog_blocking_since=0
+watchdog_blocking_polls=0
+watchdog_last_action=0
+watchdog_invalid_since=0
+watchdog_invalid_polls=0
+watchdog_invalid_last_action=0
+watchdog_poll_count=0
+
+watchdog_log \
+    "event=started armed=$watchdog_armed after_seconds=$watchdog_after_seconds required_polls=$watchdog_required_polls poll_seconds=$watchdog_poll_seconds retry_seconds=$watchdog_retry_seconds invalid_status_policy=same_threshold"
+
+while :; do
+    watchdog_poll_count=$((watchdog_poll_count + 1))
+    if [ $((watchdog_poll_count % 60)) -eq 1 ]; then
+        # Copy/truncate keeps launchd's existing stdout descriptor attached.
+        # Keep a bounded recent tail without creating any temporary file.
+        /usr/bin/perl -e '
+            my $path = shift;
+            exit 0 unless -f $path && -s $path > 5 * 1024 * 1024;
+            open(my $fh, "+<", $path) or exit 0;
+            flock($fh, 2) or exit 0;
+            seek($fh, -256 * 1024, 2) or exit 0;
+            read($fh, my $tail, 256 * 1024);
+            $tail =~ s/^[^\n]*\n//;
+            seek($fh, 0, 0); print {$fh} $tail; truncate($fh, tell($fh));
+        ' "$watchdog_log_path" 2>/dev/null
+    fi
+    watchdog_now=$(/bin/date '+%s')
+    watchdog_snapshot_result=0
+    watchdog_read_snapshot || watchdog_snapshot_result=$?
+
+    if [ "$watchdog_snapshot_result" -eq 0 ]; then
+        if [ "$watchdog_blocking" = "yes" ]; then
+            watchdog_observation="$watchdog_state:$watchdog_reason:blocking"
+        elif [ "$watchdog_state" = "error" ]; then
+            watchdog_observation="error:$watchdog_reason:block_failure"
+        else
+            watchdog_observation="state:$watchdog_state"
+        fi
+    elif [ "$watchdog_snapshot_result" -eq 1 ]; then
+        watchdog_observation="status_unavailable"
+    else
+        watchdog_observation="status_invalid"
+    fi
+
+    if [ "$watchdog_observation" != "$watchdog_last_observation" ]; then
+        watchdog_log "event=observation class=$watchdog_observation"
+        watchdog_last_observation=$watchdog_observation
+    fi
+
+    if [ "$watchdog_snapshot_result" -eq 0 ] && [ "$watchdog_blocking" = "yes" ]; then
+        watchdog_invalid_since=0
+        watchdog_invalid_polls=0
+        watchdog_invalid_last_action=0
+        if [ "$watchdog_blocking_since" -eq 0 ]; then
+            watchdog_blocking_since=$watchdog_now
+            watchdog_blocking_polls=1
+            watchdog_log \
+                "event=blocking_started class=$watchdog_state:$watchdog_reason threshold_seconds=$watchdog_after_seconds required_polls=$watchdog_required_polls"
+        else
+            watchdog_blocking_polls=$((watchdog_blocking_polls + 1))
+        fi
+
+        watchdog_blocking_elapsed=$((watchdog_now - watchdog_blocking_since))
+        watchdog_retry_elapsed=$((watchdog_now - watchdog_last_action))
+
+        if [ "$watchdog_blocking_elapsed" -ge "$watchdog_after_seconds" ] &&
+           [ "$watchdog_blocking_polls" -ge "$watchdog_required_polls" ] &&
+           { [ "$watchdog_last_action" -eq 0 ] ||
+             [ "$watchdog_retry_elapsed" -ge "$watchdog_retry_seconds" ]; }; then
+
+            watchdog_confirm_result=0
+            watchdog_read_snapshot || watchdog_confirm_result=$?
+
+            if [ "$watchdog_confirm_result" -eq 0 ] && [ "$watchdog_blocking" = "yes" ]; then
+                watchdog_action_class="$watchdog_state:$watchdog_reason"
+                watchdog_last_action=$watchdog_now
+
+                if [ "$watchdog_armed" -eq 1 ]; then
+                    watchdog_log \
+                        "event=disconnect_requested reason=sustained_blocking class=$watchdog_action_class elapsed_seconds=$watchdog_blocking_elapsed polls=$watchdog_blocking_polls"
+
+                    if watchdog_run_cli disconnect --wait >/dev/null 2>&1; then
+                        watchdog_verify_result=0
+                        watchdog_read_snapshot || watchdog_verify_result=$?
+                        if [ "$watchdog_verify_result" -eq 0 ] &&
+                           [ "$watchdog_state" = "disconnected" ] &&
+                           [ "$watchdog_blocking" = "no" ]; then
+                            watchdog_log "event=fail_open_succeeded state=disconnected"
+                        elif [ "$watchdog_verify_result" -eq 0 ]; then
+                            watchdog_log \
+                                "event=fail_open_unconfirmed observed_state=$watchdog_state observed_blocking=$watchdog_blocking"
+                        else
+                            watchdog_log "event=fail_open_unconfirmed observed_state=unavailable"
+                        fi
+                    else
+                        watchdog_disconnect_result=$?
+                        watchdog_log \
+                            "event=disconnect_failed exit_code=$watchdog_disconnect_result retry_seconds=$watchdog_retry_seconds"
+                    fi
+                else
+                    watchdog_log \
+                        "event=dry_run_would_disconnect class=$watchdog_action_class elapsed_seconds=$watchdog_blocking_elapsed polls=$watchdog_blocking_polls"
+                fi
+            else
+                watchdog_log "event=disconnect_cancelled reason=confirmation_not_blocking"
+                watchdog_blocking_since=0
+                watchdog_blocking_polls=0
+                watchdog_last_action=0
+            fi
+        fi
+    elif [ "$watchdog_snapshot_result" -eq 2 ]; then
+        watchdog_blocking_since=0
+        watchdog_blocking_polls=0
+        watchdog_last_action=0
+
+        if [ "$watchdog_invalid_since" -eq 0 ]; then
+            watchdog_invalid_since=$watchdog_now
+            watchdog_invalid_polls=1
+            watchdog_log \
+                "event=invalid_status_started class=status_invalid threshold_seconds=$watchdog_after_seconds required_polls=$watchdog_required_polls"
+        else
+            watchdog_invalid_polls=$((watchdog_invalid_polls + 1))
+        fi
+
+        watchdog_invalid_elapsed=$((watchdog_now - watchdog_invalid_since))
+        watchdog_invalid_retry_elapsed=$((watchdog_now - watchdog_invalid_last_action))
+
+        if [ "$watchdog_invalid_elapsed" -ge "$watchdog_after_seconds" ] &&
+           [ "$watchdog_invalid_polls" -ge "$watchdog_required_polls" ] &&
+           { [ "$watchdog_invalid_last_action" -eq 0 ] ||
+             [ "$watchdog_invalid_retry_elapsed" -ge "$watchdog_retry_seconds" ]; }; then
+
+            watchdog_confirm_result=0
+            watchdog_read_snapshot || watchdog_confirm_result=$?
+
+            if [ "$watchdog_confirm_result" -eq 2 ]; then
+                watchdog_invalid_last_action=$watchdog_now
+
+                if [ "$watchdog_armed" -eq 1 ]; then
+                    watchdog_log \
+                        "event=disconnect_requested reason=sustained_invalid_status class=status_invalid elapsed_seconds=$watchdog_invalid_elapsed polls=$watchdog_invalid_polls"
+
+                    if watchdog_run_cli disconnect --wait >/dev/null 2>&1; then
+                        watchdog_verify_result=0
+                        watchdog_read_snapshot || watchdog_verify_result=$?
+                        if [ "$watchdog_verify_result" -eq 0 ] &&
+                           [ "$watchdog_state" = "disconnected" ] &&
+                           [ "$watchdog_blocking" = "no" ]; then
+                            watchdog_log "event=fail_open_succeeded state=disconnected"
+                        elif [ "$watchdog_verify_result" -eq 0 ]; then
+                            watchdog_log \
+                                "event=fail_open_unconfirmed observed_state=$watchdog_state observed_blocking=$watchdog_blocking"
+                        else
+                            watchdog_log "event=fail_open_unconfirmed observed_state=invalid"
+                        fi
+                    else
+                        watchdog_disconnect_result=$?
+                        watchdog_log \
+                            "event=disconnect_failed exit_code=$watchdog_disconnect_result retry_seconds=$watchdog_retry_seconds"
+                    fi
+                else
+                    watchdog_log \
+                        "event=dry_run_would_disconnect class=status_invalid elapsed_seconds=$watchdog_invalid_elapsed polls=$watchdog_invalid_polls"
+                fi
+            else
+                watchdog_log "event=disconnect_cancelled reason=confirmation_not_invalid"
+                watchdog_invalid_since=0
+                watchdog_invalid_polls=0
+                watchdog_invalid_last_action=0
+            fi
+        fi
+    else
+        watchdog_blocking_since=0
+        watchdog_blocking_polls=0
+        watchdog_last_action=0
+        watchdog_invalid_since=0
+        watchdog_invalid_polls=0
+        watchdog_invalid_last_action=0
+    fi
+
+    if [ "$watchdog_max_polls" -gt 0 ] &&
+       [ "$watchdog_poll_count" -ge "$watchdog_max_polls" ]; then
+        watchdog_log "event=stopped reason=max_polls polls=$watchdog_poll_count"
+        exit 0
+    fi
+
+    if [ "$watchdog_no_sleep" -ne 1 ]; then
+        /bin/sleep "$watchdog_poll_seconds"
+    fi
+done

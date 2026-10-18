@@ -1,0 +1,322 @@
+[
+  {
+    "ip": false,
+    "dns": false,
+    "https": false,
+    "pq": false,
+    "require_ready": false,
+    "alive": false,
+    "readiness": "data_fail",
+    "accept": false
+  },
+  {
+    "ip": false,
+    "dns": false,
+    "https": false,
+    "pq": false,
+    "require_ready": true,
+    "alive": false,
+    "readiness": "data_fail",
+    "accept": false
+  },
+  {
+    "ip": false,
+    "dns": false,
+    "https": false,
+    "pq": true,
+    "require_ready": false,
+    "alive": false,
+    "readiness": "data_fail",
+    "accept": false
+  },
+  {
+    "ip": false,
+    "dns": false,
+    "https": false,
+    "pq": true,
+    "require_ready": true,
+    "alive": false,
+    "readiness": "data_fail",
+    "accept": false
+  },
+  {
+    "ip": false,
+    "dns": false,
+    "https": true,
+    "pq": false,
+    "require_ready": false,
+    "alive": true,
+    "readiness": "degraded_dns",
+    "accept": true
+  },
+  {
+    "ip": false,
+    "dns": false,
+    "https": true,
+    "pq": false,
+    "require_ready": true,
+    "alive": true,
+    "readiness": "degraded_dns",
+    "accept": false
+  },
+  {
+    "ip": false,
+    "dns": false,
+    "https": true,
+    "pq": true,
+    "require_ready": false,
+    "alive": true,
+    "readiness": "degraded_dns",
+    "accept": false
+  },
+  {
+    "ip": false,
+    "dns": false,
+    "https": true,
+    "pq": true,
+    "require_ready": true,
+    "alive": true,
+    "readiness": "degraded_dns",
+    "accept": false
+  },
+  {
+    "ip": false,
+    "dns": true,
+    "https": false,
+    "pq": false,
+    "require_ready": false,
+    "alive": false,
+    "readiness": "data_fail",
+    "accept": false
+  },
+  {
+    "ip": false,
+    "dns": true,
+    "https": false,
+    "pq": false,
+    "require_ready": true,
+    "alive": false,
+    "readiness": "data_fail",
+    "accept": false
+  },
+  {
+    "ip": false,
+    "dns": true,
+    "https": false,
+    "pq": true,
+    "require_ready": false,
+    "alive": false,
+    "readiness": "data_fail",
+    "accept": false
+  },
+  {
+    "ip": false,
+    "dns": true,
+    "https": false,
+    "pq": true,
+    "require_ready": true,
+    "alive": false,
+    "readiness": "data_fail",
+    "accept": false
+  },
+  {
+    "ip": false,
+    "dns": true,
+    "https": true,
+    "pq": false,
+    "require_ready": false,
+    "alive": true,
+    "readiness": "ready",
+    "accept": true
+  },
+  {
+    "ip": false,
+    "dns": true,
+    "https": true,
+    "pq": false,
+    "require_ready": true,
+    "alive": true,
+    "readiness": "ready",
+    "accept": true
+  },
+  {
+    "ip": false,
+    "dns": true,
+    "https": true,
+    "pq": true,
+    "require_ready": false,
+    "alive": true,
+    "readiness": "ready",
+    "accept": true
+  },
+  {
+    "ip": false,
+    "dns": true,
+    "https": true,
+    "pq": true,
+    "require_ready": true,
+    "alive": true,
+    "readiness": "ready",
+    "accept": true
+  },
+  {
+    "ip": true,
+    "dns": false,
+    "https": false,
+    "pq": false,
+    "require_ready": false,
+    "alive": true,
+    "readiness": "degraded_dns",
+    "accept": true
+  },
+  {
+    "ip": true,
+    "dns": false,
+    "https": false,
+    "pq": false,
+    "require_ready": true,
+    "alive": true,
+    "readiness": "degraded_dns",
+    "accept": false
+  },
+  {
+    "ip": true,
+    "dns": false,
+    "https": false,
+    "pq": true,
+    "require_ready": false,
+    "alive": true,
+    "readiness": "degraded_dns",
+    "accept": false
+  },
+  {
+    "ip": true,
+    "dns": false,
+    "https": false,
+    "pq": true,
+    "require_ready": true,
+    "alive": true,
+    "readiness": "degraded_dns",
+    "accept": false
+  },
+  {
+    "ip": true,
+    "dns": false,
+    "https": true,
+    "pq": false,
+    "require_ready": false,
+    "alive": true,
+    "readiness": "degraded_dns",
+    "accept": true
+  },
+  {
+    "ip": true,
+    "dns": false,
+    "https": true,
+    "pq": false,
+    "require_ready": true,
+    "alive": true,
+    "readiness": "degraded_dns",
+    "accept": false
+  },
+  {
+    "ip": true,
+    "dns": false,
+    "https": true,
+    "pq": true,
+    "require_ready": false,
+    "alive": true,
+    "readiness": "degraded_dns",
+    "accept": false
+  },
+  {
+    "ip": true,
+    "dns": false,
+    "https": true,
+    "pq": true,
+    "require_ready": true,
+    "alive": true,
+    "readiness": "degraded_dns",
+    "accept": false
+  },
+  {
+    "ip": true,
+    "dns": true,
+    "https": false,
+    "pq": false,
+    "require_ready": false,
+    "alive": true,
+    "readiness": "degraded_service",
+    "accept": true
+  },
+  {
+    "ip": true,
+    "dns": true,
+    "https": false,
+    "pq": false,
+    "require_ready": true,
+    "alive": true,
+    "readiness": "degraded_service",
+    "accept": false
+  },
+  {
+    "ip": true,
+    "dns": true,
+    "https": false,
+    "pq": true,
+    "require_ready": false,
+    "alive": true,
+    "readiness": "degraded_service",
+    "accept": false
+  },
+  {
+    "ip": true,
+    "dns": true,
+    "https": false,
+    "pq": true,
+    "require_ready": true,
+    "alive": true,
+    "readiness": "degraded_service",
+    "accept": false
+  },
+  {
+    "ip": true,
+    "dns": true,
+    "https": true,
+    "pq": false,
+    "require_ready": false,
+    "alive": true,
+    "readiness": "ready",
+    "accept": true
+  },
+  {
+    "ip": true,
+    "dns": true,
+    "https": true,
+    "pq": false,
+    "require_ready": true,
+    "alive": true,
+    "readiness": "ready",
+    "accept": true
+  },
+  {
+    "ip": true,
+    "dns": true,
+    "https": true,
+    "pq": true,
+    "require_ready": false,
+    "alive": true,
+    "readiness": "ready",
+    "accept": true
+  },
+  {
+    "ip": true,
+    "dns": true,
+    "https": true,
+    "pq": true,
+    "require_ready": true,
+    "alive": true,
+    "readiness": "ready",
+    "accept": true
+  }
+]

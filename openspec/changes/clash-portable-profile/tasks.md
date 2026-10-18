@@ -1,0 +1,9 @@
+- [x] Verify dynamic API vs protocol constants and product transport path.
+- [x] Confirm domestic DIRECT and independently selectable AI/ordinary policy.
+- [x] Implement native independent profile generator and secret-free summary.
+- [x] Implement durable official protocol import and explicit registration readback.
+- [x] Add direct HTTPS API path, idle NAT keepalive and failed-health retry floor.
+- [x] Pass portable generation/service/API/config/frontend regression.
+- [x] Windows cross-target typecheck and isolated official engine validation (not a Windows runtime acceptance).
+- [ ] Real client import/readback/selection/egress without disrupting current use.
+- [ ] Complete candidate, install acceptance, remote source/private evidence sync.

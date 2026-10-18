@@ -1,0 +1,265 @@
+{
+  "schema": 1,
+  "description": "Synthetic public summary DTOs only; no saved history or live observations.",
+  "cases": [
+    {
+      "name": "zero_unknown",
+      "id": "us-aaa-wg-001|ss",
+      "summary": {
+        "relay": "us-aaa-wg-001",
+        "transport_mode": "ss",
+        "samples": 0,
+        "relay_pass_samples": 0,
+        "ready_samples": 0,
+        "failed_samples": 0,
+        "consecutive_failures": 0,
+        "latency_samples": 0,
+        "latency_ewma_ms": null,
+        "best_delay_ms": null,
+        "worst_delay_ms": null,
+        "last_delay_ms": null,
+        "first_tested_at": null,
+        "last_tested_at": null,
+        "last_success_at": null,
+        "last_failure_at": null,
+        "source_counts": {},
+        "readiness_rate": null
+      },
+      "expected_rate": null,
+      "expected_effective_rate": 0.0,
+      "expected_score": -1.0
+    },
+    {
+      "name": "one_success",
+      "id": "us-aaa-wg-002|ss",
+      "summary": {
+        "relay": "us-aaa-wg-002",
+        "transport_mode": "ss",
+        "samples": 1,
+        "relay_pass_samples": 1,
+        "ready_samples": 1,
+        "failed_samples": 0,
+        "consecutive_failures": 0,
+        "latency_samples": 1,
+        "latency_ewma_ms": 80.0,
+        "best_delay_ms": 75,
+        "worst_delay_ms": 90,
+        "last_delay_ms": 80,
+        "first_tested_at": "2026-01-01T00:00:00Z",
+        "last_tested_at": "2026-01-01T00:10:00Z",
+        "last_success_at": "2026-01-01T00:09:00Z",
+        "last_failure_at": null,
+        "source_counts": {
+          "synthetic": 1
+        },
+        "readiness_rate": 1.0
+      },
+      "expected_rate": 1.0,
+      "expected_effective_rate": 1.0,
+      "expected_score": 0.20654329147389294
+    },
+    {
+      "name": "stable_twenty",
+      "id": "us-aaa-wg-003|ss",
+      "summary": {
+        "relay": "us-aaa-wg-003",
+        "transport_mode": "ss",
+        "samples": 20,
+        "relay_pass_samples": 20,
+        "ready_samples": 20,
+        "failed_samples": 0,
+        "consecutive_failures": 0,
+        "latency_samples": 20,
+        "latency_ewma_ms": 90.25,
+        "best_delay_ms": 85,
+        "worst_delay_ms": 100,
+        "last_delay_ms": 90,
+        "first_tested_at": "2026-01-01T00:00:00Z",
+        "last_tested_at": "2026-01-01T00:10:00Z",
+        "last_success_at": "2026-01-01T00:09:00Z",
+        "last_failure_at": null,
+        "source_counts": {
+          "synthetic": 20
+        },
+        "readiness_rate": 1.0
+      },
+      "expected_rate": 1.0,
+      "expected_effective_rate": 1.0,
+      "expected_score": 0.8388698745050667
+    },
+    {
+      "name": "partial_one_failure",
+      "id": "us-aaa-wg-003|ipv4",
+      "summary": {
+        "relay": "us-aaa-wg-003",
+        "transport_mode": "ipv4",
+        "samples": 20,
+        "relay_pass_samples": 19,
+        "ready_samples": 18,
+        "failed_samples": 2,
+        "consecutive_failures": 1,
+        "latency_samples": 20,
+        "latency_ewma_ms": 100.0,
+        "best_delay_ms": 95,
+        "worst_delay_ms": 110,
+        "last_delay_ms": 100,
+        "first_tested_at": "2026-01-01T00:00:00Z",
+        "last_tested_at": "2026-01-01T00:10:00Z",
+        "last_success_at": "2026-01-01T00:09:00Z",
+        "last_failure_at": "2026-01-01T00:08:00Z",
+        "source_counts": {
+          "synthetic": 20
+        },
+        "readiness_rate": 0.9
+      },
+      "expected_rate": 0.9,
+      "expected_effective_rate": 0.9,
+      "expected_score": 0.6589617935882066
+    },
+    {
+      "name": "three_failures",
+      "id": "us-aaa-wg-003|ipv6",
+      "summary": {
+        "relay": "us-aaa-wg-003",
+        "transport_mode": "ipv6",
+        "samples": 20,
+        "relay_pass_samples": 18,
+        "ready_samples": 15,
+        "failed_samples": 5,
+        "consecutive_failures": 3,
+        "latency_samples": 20,
+        "latency_ewma_ms": 110.5,
+        "best_delay_ms": 105,
+        "worst_delay_ms": 120,
+        "last_delay_ms": 110,
+        "first_tested_at": "2026-01-01T00:00:00Z",
+        "last_tested_at": "2026-01-01T00:10:00Z",
+        "last_success_at": "2026-01-01T00:09:00Z",
+        "last_failure_at": "2026-01-01T00:08:00Z",
+        "source_counts": {
+          "synthetic": 20
+        },
+        "readiness_rate": 0.75
+      },
+      "expected_rate": 0.75,
+      "expected_effective_rate": 0.75,
+      "expected_score": 0.4112949900419365
+    },
+    {
+      "name": "five_failures",
+      "id": "us-aaa-wg-004|ss",
+      "summary": {
+        "relay": "us-aaa-wg-004",
+        "transport_mode": "ss",
+        "samples": 20,
+        "relay_pass_samples": 18,
+        "ready_samples": 15,
+        "failed_samples": 5,
+        "consecutive_failures": 5,
+        "latency_samples": 20,
+        "latency_ewma_ms": 110.5,
+        "best_delay_ms": 105,
+        "worst_delay_ms": 120,
+        "last_delay_ms": 110,
+        "first_tested_at": "2026-01-01T00:00:00Z",
+        "last_tested_at": "2026-01-01T00:10:00Z",
+        "last_success_at": "2026-01-01T00:09:00Z",
+        "last_failure_at": "2026-01-01T00:08:00Z",
+        "source_counts": {
+          "synthetic": 20
+        },
+        "readiness_rate": 0.75
+      },
+      "expected_rate": 0.75,
+      "expected_effective_rate": 0.75,
+      "expected_score": 0.4112949900419365
+    },
+    {
+      "name": "all_failed",
+      "id": "us-aaa-wg-005|ss",
+      "summary": {
+        "relay": "us-aaa-wg-005",
+        "transport_mode": "ss",
+        "samples": 20,
+        "relay_pass_samples": 0,
+        "ready_samples": 0,
+        "failed_samples": 20,
+        "consecutive_failures": 20,
+        "latency_samples": 0,
+        "latency_ewma_ms": null,
+        "best_delay_ms": null,
+        "worst_delay_ms": null,
+        "last_delay_ms": null,
+        "first_tested_at": "2026-01-01T00:00:00Z",
+        "last_tested_at": "2026-01-01T00:10:00Z",
+        "last_success_at": null,
+        "last_failure_at": "2026-01-01T00:08:00Z",
+        "source_counts": {
+          "unknown": 20
+        },
+        "readiness_rate": 0.0
+      },
+      "expected_rate": 0.0,
+      "expected_effective_rate": 0.0,
+      "expected_score": -0.12
+    },
+    {
+      "name": "relay_alive_service_unready",
+      "id": "us-aaa-wg-006|ipv4",
+      "summary": {
+        "relay": "us-aaa-wg-006",
+        "transport_mode": "ipv4",
+        "samples": 3,
+        "relay_pass_samples": 3,
+        "ready_samples": 0,
+        "failed_samples": 3,
+        "consecutive_failures": 3,
+        "latency_samples": 3,
+        "latency_ewma_ms": 150.0,
+        "best_delay_ms": 145,
+        "worst_delay_ms": 160,
+        "last_delay_ms": 150,
+        "first_tested_at": "2026-01-01T00:00:00Z",
+        "last_tested_at": "2026-01-01T00:10:00Z",
+        "last_success_at": null,
+        "last_failure_at": "2026-01-01T00:08:00Z",
+        "source_counts": {
+          "synthetic": 3
+        },
+        "readiness_rate": 0.0
+      },
+      "expected_rate": 0.0,
+      "expected_effective_rate": 0.0,
+      "expected_score": -0.12
+    },
+    {
+      "name": "missing_reported_rate",
+      "id": "us-aaa-wg-007|ipv6",
+      "summary": {
+        "relay": "us-aaa-wg-007",
+        "transport_mode": "ipv6",
+        "samples": 5,
+        "relay_pass_samples": 4,
+        "ready_samples": 3,
+        "failed_samples": 2,
+        "consecutive_failures": 1,
+        "latency_samples": 0,
+        "latency_ewma_ms": null,
+        "best_delay_ms": null,
+        "worst_delay_ms": null,
+        "last_delay_ms": null,
+        "first_tested_at": "2026-01-01T00:00:00Z",
+        "last_tested_at": "2026-01-01T00:10:00Z",
+        "last_success_at": "2026-01-01T00:09:00Z",
+        "last_failure_at": "2026-01-01T00:08:00Z",
+        "source_counts": {
+          "synthetic": 5
+        },
+        "readiness_rate": null
+      },
+      "expected_rate": 0.6,
+      "expected_effective_rate": 0.6,
+      "expected_score": 0.190719932208837
+    }
+  ]
+}

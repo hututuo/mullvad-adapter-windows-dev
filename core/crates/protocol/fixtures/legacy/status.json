@@ -1,0 +1,145 @@
+{
+  "status": "ready",
+  "build_id": "20261005-local-network-recovery-1",
+  "source_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "generation": 1,
+  "local_network": {
+    "status": "unknown",
+    "paused": false,
+    "recovery_pending": false,
+    "epoch": 0,
+    "source": "not-observed",
+    "checked_at": null,
+    "detail": "本机链路尚未检查"
+  },
+  "active_slot": "a",
+  "active_relay": "one",
+  "active_transport": "ss",
+  "active_transport_mode": "ss",
+  "transport_preference": "ss",
+  "relay_liveness": "pass",
+  "service_readiness": "ready",
+  "metadata": {
+    "live": false,
+    "cache": false,
+    "source": "none",
+    "age_seconds": null,
+    "error": null,
+    "fetched_at": null,
+    "validation_warnings": [
+
+    ]
+  },
+  "health": {
+    "interval_seconds": 30,
+    "fail_threshold": 2,
+    "consecutive_wg_failures": 0,
+    "consecutive_dns_failures": 0,
+    "last_check_at": null,
+    "last_recovery_at": null
+  },
+  "front": {
+    "mixed_port": 17890,
+    "controller_port": 17892,
+    "ready": false,
+    "data_path": {
+      "status": "unknown",
+      "detail": "not checked",
+      "checked_at": null
+    }
+  },
+  "api": {
+    "host": "127.0.0.1",
+    "port": 17891
+  },
+  "persistence": {
+    "status": "ok",
+    "relay": "ok",
+    "transport_preference": "ok",
+    "cities": "ok",
+    "last_error": null,
+    "last_error_at": null
+  },
+  "routing_policy": {
+    "owner": "adapter",
+    "ingress_owner": "main-clash",
+    "ingress_target": "Mullvad节点 -> Mullvad-本地适配器",
+    "new_connections": "adapter-front-active-worker",
+    "established_connections": "graceful-drain",
+    "failed_path_connections": "retire-after-replacement-ready",
+    "repeat_switch": "preempt-oldest-drain",
+    "max_draining_workers": 1,
+    "last_event": "switch-committed",
+    "last_event_at": "2026-01-01T00:00:00Z",
+    "last_preempted_connections": 0,
+    "last_event_relay": "one",
+    "last_event_reason": "startup",
+    "last_event_detail": "slot=a transport=ss endpoint=192.0.2.2 entry=none multihop=false",
+    "pending_action": null,
+    "quarantined_relays": [
+
+    ]
+  },
+  "workers": {
+    "a": {
+      "relay": "one",
+      "multihop": false,
+      "entry_relay": null,
+      "entry_city": null,
+      "post_quantum": false,
+      "pq_helper_sha256": null,
+      "daita": false,
+      "transport": "ss",
+      "transport_mode": "ss",
+      "endpoint": "192.0.2.2",
+      "endpoint_port": null,
+      "endpoint_kind": null,
+      "interface": null,
+      "mixed_port": 17910,
+      "started_at": "2026-01-01T00:00:00Z",
+      "front_connection_count": 0,
+      "state": "active"
+    }
+  },
+  "dns": {
+    "bootstrap": {
+      "status": "unknown",
+      "detail": "not checked"
+    },
+    "inner": {
+      "status": "pass"
+    },
+    "clash_global": {
+      "status": "external",
+      "detail": "owned by main Clash; adapter does not replace it"
+    },
+    "inner_breaker": {
+      "status": "closed",
+      "observed_relays": [
+
+      ],
+      "threshold": 2,
+      "until": null,
+      "detail": "no common inner-DNS failure detected"
+    }
+  },
+  "last_canary": {
+    "at": "2026-01-01T00:00:00Z",
+    "duration_ms": 1,
+    "ip_data": {
+      "status": "pass"
+    },
+    "inner_dns": {
+      "status": "pass"
+    },
+    "https_data": {
+      "status": "pass"
+    }
+  },
+  "last_error": null,
+  "updated_at": "2026-01-01T00:00:00Z",
+  "selected_city": "us-sjc",
+  "switched_at": "2026-01-01T00:00:00Z",
+  "switch_reason": "startup",
+  "operation": null
+}

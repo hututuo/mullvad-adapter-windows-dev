@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "repository": "https://github.com/hututuo/mullvad-adapter-windows-dev",
+  "version": "0.1.0",
+  "platform": "Windows 11 x64",
+  "software_source_sha": "a90c22123c8578871614febee1ce5ee9f4d2db89",
+  "imported_documentation_source_sha": "e7763b42ed95553d6f104589a18cabbda981ba8b",
+  "history": "independent public source snapshot; no original private history",
+  "runtime_recompiled_for_publication": false,
+  "public_changes": "independent maintenance snapshot; developer entrypoints replace recipient-only documents; production code unchanged",
+  "installer": {
+    "filename": "MullvadAdapter_0.1.0_windows-x64_setup.exe",
+    "size": 236585097,
+    "sha256": "00a057df93b4837f3dc045724f8d084a436503adbe98a94279d251f3c6cf3b90",
+    "signing": "unsigned",
+    "original_build_filename": "Mullvad Adapter_0.1.0_x64-setup.exe"
+  },
+  "verified_baseline": "existing Windows install, account/device list, SS/WG connection and Clash split egress; not recipient network acceptance",
+  "not_run": [
+    "recipient installation/network",
+    "clean OS without WebView2",
+    "current TUN fault recovery and long-term stability",
+    "code signing"
+  ],
+  "imported_public_snapshot_sha": "7e7acf58855cc77280bd440a9e2c8c22d2179b18",
+  "imported_public_snapshot_repository": "https://github.com/hututuo/mullvad-adapter-windows",
+  "distribution_repository": "https://github.com/hututuo/mullvad-adapter-windows",
+  "release_tag_is_in_distribution_repository": "v0.1.0-preview.1",
+  "repository_role": "public Windows development and maintenance; not recipient onboarding"
+}

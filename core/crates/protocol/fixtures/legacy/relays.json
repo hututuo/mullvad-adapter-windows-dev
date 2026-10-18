@@ -1,0 +1,152 @@
+[
+  {
+    "hostname": "one",
+    "location": "us-sjc",
+    "country_code": "us",
+    "city_code": "sjc",
+    "country": null,
+    "city": null,
+    "provider": null,
+    "owned": null,
+    "extra_ss_ipv4": 2,
+    "transports": [
+      "ss",
+      "ipv6",
+      "ipv4"
+    ],
+    "quick_ping": {
+      "ss": {
+        "target": "192.0.2.2",
+        "kind": "shadowsocks-extra-ipv4"
+      },
+      "ipv4": {
+        "target": "192.0.2.1",
+        "kind": "wireguard-ipv4"
+      },
+      "ipv6": {
+        "target": "2001:db8::1",
+        "kind": "wireguard-ipv6"
+      }
+    }
+  },
+  {
+    "hostname": "two",
+    "location": "us-sjc",
+    "country_code": "us",
+    "city_code": "sjc",
+    "country": null,
+    "city": null,
+    "provider": null,
+    "owned": null,
+    "extra_ss_ipv4": 2,
+    "transports": [
+      "ss",
+      "ipv6",
+      "ipv4"
+    ],
+    "quick_ping": {
+      "ss": {
+        "target": "192.0.2.2",
+        "kind": "shadowsocks-extra-ipv4"
+      },
+      "ipv4": {
+        "target": "192.0.2.1",
+        "kind": "wireguard-ipv4"
+      },
+      "ipv6": {
+        "target": "2001:db8::1",
+        "kind": "wireguard-ipv6"
+      }
+    }
+  },
+  {
+    "hostname": "three",
+    "location": "us-sjc",
+    "country_code": "us",
+    "city_code": "sjc",
+    "country": null,
+    "city": null,
+    "provider": null,
+    "owned": null,
+    "extra_ss_ipv4": 2,
+    "transports": [
+      "ss",
+      "ipv6",
+      "ipv4"
+    ],
+    "quick_ping": {
+      "ss": {
+        "target": "192.0.2.2",
+        "kind": "shadowsocks-extra-ipv4"
+      },
+      "ipv4": {
+        "target": "192.0.2.1",
+        "kind": "wireguard-ipv4"
+      },
+      "ipv6": {
+        "target": "2001:db8::1",
+        "kind": "wireguard-ipv6"
+      }
+    }
+  },
+  {
+    "hostname": "four",
+    "location": "us-sjc",
+    "country_code": "us",
+    "city_code": "sjc",
+    "country": null,
+    "city": null,
+    "provider": null,
+    "owned": null,
+    "extra_ss_ipv4": 2,
+    "transports": [
+      "ss",
+      "ipv6",
+      "ipv4"
+    ],
+    "quick_ping": {
+      "ss": {
+        "target": "192.0.2.2",
+        "kind": "shadowsocks-extra-ipv4"
+      },
+      "ipv4": {
+        "target": "192.0.2.1",
+        "kind": "wireguard-ipv4"
+      },
+      "ipv6": {
+        "target": "2001:db8::1",
+        "kind": "wireguard-ipv6"
+      }
+    }
+  },
+  {
+    "hostname": "five",
+    "location": "us-sjc",
+    "country_code": "us",
+    "city_code": "sjc",
+    "country": null,
+    "city": null,
+    "provider": null,
+    "owned": null,
+    "extra_ss_ipv4": 2,
+    "transports": [
+      "ss",
+      "ipv6",
+      "ipv4"
+    ],
+    "quick_ping": {
+      "ss": {
+        "target": "192.0.2.2",
+        "kind": "shadowsocks-extra-ipv4"
+      },
+      "ipv4": {
+        "target": "192.0.2.1",
+        "kind": "wireguard-ipv4"
+      },
+      "ipv6": {
+        "target": "2001:db8::1",
+        "kind": "wireguard-ipv6"
+      }
+    }
+  }
+]

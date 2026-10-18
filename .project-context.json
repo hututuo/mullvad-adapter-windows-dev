@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "project_key": "hututuo--mullvad-adapter-windows-dev",
+  "source_repository": "https://github.com/hututuo/mullvad-adapter-windows-dev",
+  "repository_role": "public_development_maintenance",
+  "distribution_repository": "https://github.com/hututuo/mullvad-adapter-windows",
+  "public_documents": [
+    "README.md",
+    "AGENTS.md",
+    "SOURCE_BASELINE.json",
+    "docs/development.md",
+    "docs/architecture.md",
+    "docs/windows-maintenance.md",
+    "docs/network-capabilities.md",
+    "docs/spec-development.md",
+    "packaging/windows/README.md"
+  ],
+  "handoff_mode": "direct_source_maintenance_and_verification"
+}

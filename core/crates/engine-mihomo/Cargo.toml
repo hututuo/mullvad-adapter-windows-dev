@@ -1,0 +1,30 @@
+[package]
+name = "adapter-engine-mihomo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+windows-api-check = ["adapter-platform/windows-api-check"]
+
+[dependencies]
+adapter-control.workspace = true
+adapter-domain.workspace = true
+adapter-probe = { path = "../probe" }
+getrandom = "=0.4.3"
+adapter-platform.workspace = true
+ureq = { version = "=3.4.2", default-features = false, features = ["json", "rustls"] }
+serde.workspace = true
+serde_json.workspace = true
+zeroize = "=1.8.2"
+
+rustls = { version = "=0.23.45", default-features = false, features = ["std", "ring", "tls12"] }
+
+base64 = "=0.23.1"
+sha2 = "=0.10.9"
+x25519-dalek = { version = "=2.0.1", default-features = false, features = ["static_secrets", "zeroize"] }
+
+[dev-dependencies]
+
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring"] }

@@ -1,0 +1,49 @@
+[package]
+name = "adapter-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+adapter-domain.workspace = true
+adapter-protocol.workspace = true
+adapter-control.workspace = true
+serde_json.workspace = true
+adapter-platform.workspace = true
+
+[features]
+windows-api-check = ["adapter-platform/windows-api-check", "adapter-control/windows-api-check", "adapter-engine-mihomo/windows-api-check"]
+
+[dependencies.adapter-engine-mihomo]
+path = "../engine-mihomo"
+
+[dependencies.adapter-catalogue]
+path = "../catalogue"
+
+[dependencies.adapter-mullvad-api]
+path = "../mullvad-api"
+
+[dependencies.serde]
+workspace = true
+
+[dependencies.zeroize]
+version = "=1.8.2"
+
+[dependencies.sha2]
+version = "=0.10.9"
+
+[dependencies.base64]
+version = "=0.23.1"
+
+[dependencies.x25519-dalek]
+version = "=2.0.1"
+default-features = false
+features = ["static_secrets", "zeroize"]
+
+[dependencies.getrandom]
+version = "=0.4.3"
+
+[dependencies.windows-sys]
+version = "=0.59.0"
+features = ["Win32_Foundation", "Win32_Storage_FileSystem"]

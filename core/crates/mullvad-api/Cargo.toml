@@ -1,0 +1,13 @@
+[package]
+name = "adapter-mullvad-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+ureq = { version = "=3.4.2", default-features = false, features = ["json", "rustls"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "=0.10.9"
+zeroize = "=1.8.2"
