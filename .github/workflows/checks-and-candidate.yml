@@ -1,0 +1,128 @@
+name: checks-and-candidate
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'chore/cloud-handoff-*'
+      - 'codex/**'
+
+permissions:
+  contents: read
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_15.4.app/Contents/Developer
+  MT_NO_PLUGINS: '1'
+
+jobs:
+  checks:
+    name: checks
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3.11'
+      - name: Record toolchain
+        run: |
+          ruby -v
+          swift --version
+          xcodebuild -version
+      - name: Ruby syntax and tests
+        run: |
+          gem install minitest --version 5.27.0 --no-document
+          ruby -c daemon/mullvad_adapter.rb
+          ruby -I . -I daemon -e 'gem "minitest", "= 5.27.0"; ARGV.each { |f| require File.expand_path(f) }' daemon/test_*.rb
+      - name: Build and check official PQ component
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          export PQ_CARGO_BIN="$HOME/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo"
+          export RUSTC="$HOME/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustc"
+          scripts/build-pq-helper.sh
+          test "$(lipo -archs helpers/pq-negotiator/bin/mullvad-pq-negotiator)" = arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pq-component-${{ github.sha }}
+          path: helpers/pq-negotiator/bin/mullvad-pq-negotiator
+          if-no-files-found: error
+          retention-days: 14
+      - name: Swift tests
+        working-directory: ui
+        run: swift test -c release
+
+  candidate-build:
+    name: candidate build
+    needs: checks
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3.11'
+      - name: Install test dependency for payload self-check
+        run: gem install minitest --version 5.27.0 --no-document
+      - uses: actions/download-artifact@v4
+        with:
+          name: pq-component-${{ github.sha }}
+          path: helpers/pq-negotiator/bin
+      - name: Build app
+        working-directory: ui
+        run: swift build -c release --arch arm64
+      - name: Assemble candidate
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/mullvad-adapter-candidate"
+          rm -rf "$OUT"
+          mkdir -p "$OUT/payload/Mullvad Adapter.app/Contents/MacOS" "$OUT/payload/daemon"
+          BIN="$(cd ui && swift build -c release --arch arm64 --show-bin-path)/MullvadAdapterUI"
+          cp "$BIN" "$OUT/payload/Mullvad Adapter.app/Contents/MacOS/MullvadAdapterUI"
+          cp ui/Info.plist "$OUT/payload/Mullvad Adapter.app/Contents/Info.plist"
+          ruby scripts/stage-daemon-payload.rb "$OUT/payload"
+          cp install-daemon.rb verify-candidate.rb "$OUT/payload/"
+          test -f "$OUT/payload/daemon/mullvad_adapter.rb"
+          ruby -c "$OUT/payload/install-daemon.rb"
+          ruby -c "$OUT/payload/verify-candidate.rb"
+          mkdir -p "$OUT/payload/helpers/pq-negotiator/bin"
+          cp helpers/pq-negotiator/bin/mullvad-pq-negotiator "$OUT/payload/helpers/pq-negotiator/bin/"
+          chmod 755 "$OUT/payload/helpers/pq-negotiator/bin/mullvad-pq-negotiator"
+          test "$(lipo -archs "$OUT/payload/helpers/pq-negotiator/bin/mullvad-pq-negotiator")" = arm64
+          cp helpers/pq-negotiator/Cargo.toml helpers/pq-negotiator/Cargo.lock helpers/pq-negotiator/LICENSE.md helpers/pq-negotiator/README.md "$OUT/payload/helpers/pq-negotiator/"
+          cp -R helpers/pq-negotiator/src "$OUT/payload/helpers/pq-negotiator/"
+          ARCH="$(lipo -archs "$BIN")"
+          test "$ARCH" = arm64
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$OUT/payload/Mullvad Adapter.app/Contents/Info.plist")"
+          cat > "$OUT/payload/install.sh" <<'INSTALL'
+          #!/bin/sh
+          set -eu
+          ROOT=$(CDPATH= cd -- "$(dirname -- "$0")")
+          mkdir -p "$HOME/Applications"
+          rm -rf "$HOME/Applications/Mullvad Adapter.app"
+          cp -R "$ROOT/Mullvad Adapter.app" "$HOME/Applications/Mullvad Adapter.app"
+          echo "App copied to $HOME/Applications/Mullvad Adapter.app"
+          echo "See INSTALL.md before running the daemon installer; existing network configuration is required."
+          INSTALL
+          chmod +x "$OUT/payload/install.sh"
+          cp docs/candidate-install.md "$OUT/payload/INSTALL.md"
+          ditto -c -k --sequesterRsrc --keepParent "$OUT/payload" "$OUT/Mullvad-Adapter-macos-$ARCH.zip"
+          CANDIDATE_VERSION="$VERSION" CANDIDATE_ARCH="$ARCH" python3 - "$OUT" "$SOURCE_SHA" "$RUN_NUMBER" <<'PY'
+          import hashlib, json, os, pathlib, platform, sys
+          out = pathlib.Path(sys.argv[1]); sha = sys.argv[2]; run = sys.argv[3]
+          files = []
+          for p in sorted(out.glob('Mullvad-Adapter-macos-*.zip')):
+              data = p.read_bytes(); files.append({'name': p.name, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+          version = os.environ.get('CANDIDATE_VERSION', 'unknown')
+          manifest = {'project':os.environ['GITHUB_REPOSITORY'],'version':version + '-candidate', 'source_sha':sha, 'workflow_run':run, 'platform':'macOS', 'architecture':os.environ['CANDIDATE_ARCH'], 'toolchain':{'xcode':'15.4','ruby':'3.3.11','rust':'1.97.1','protoc':'36.2'}, 'pq_helper':{'upstream_sha':'19fb87407f4b81fe15372c2c7f8a20e7ab4eb220','sha256':hashlib.sha256((out/'payload/helpers/pq-negotiator/bin/mullvad-pq-negotiator').read_bytes()).hexdigest()}, 'files':files, 'signed':False, 'tests':'checks job passed before candidate build', 'production_install':'NOT_RUN', 'live_failover':'NOT_RUN', 'clean_install':'NOT_RUN', 'runtime_requirements':'existing configured Ruby 3.0+, Clash Verge/Mihomo, WireGuard template and launchd service; see INSTALL.md'}
+          (out/'manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
+          PY
+          cp "$OUT"/Mullvad-Adapter-macos-*.zip "$OUT/manifest.json" "$RUNNER_TEMP/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mullvad-adapter-macos-candidate-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/Mullvad-Adapter-macos-*.zip
+            ${{ runner.temp }}/manifest.json
+          if-no-files-found: error
+          retention-days: 14

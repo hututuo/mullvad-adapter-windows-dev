@@ -47,6 +47,8 @@ class MullvadProtectionTest < Minitest::Test
     descriptor = @adapter.send(:endpoint_candidates_for_transport, relay, 'ss').first
     config, info = @adapter.send(:worker_tunnel_config, { mixed: 18000, controller: 18001 }, relay, 'ss', descriptor)
     ss, entry, exit_node = config['proxies']
+    assert_operator entry.fetch('mtu'), :>=, 1280
+    assert_operator exit_node.fetch('mtu'), :>=, 1280
     assert_equal 'SS-INLET', ss['name']
     assert_equal 'SS-INLET', entry['dialer-proxy']
     assert_equal ['192.0.2.1/32'], entry['allowed-ips']
@@ -72,9 +74,26 @@ class MullvadProtectionTest < Minitest::Test
       candidate = @adapter.send(:endpoint_candidates_for_transport, relay, mode).first
       config, = @adapter.send(:worker_tunnel_config, { mixed: 18000, controller: 18001 }, relay, mode, candidate)
       entry, exit_node = config['proxies']
+      assert_operator entry.fetch('mtu'), :>=, 1280
+      assert_operator exit_node.fetch('mtu'), :>=, 1280
       assert_equal 'en0', entry['interface-name']
       assert_equal 'WG-ENTRY', exit_node['dialer-proxy']
       assert_equal 51_820, exit_node['port']
+    end
+    assert_equal template, Marshal.dump(@adapter.instance_variable_get(:@template))
+  end
+
+  def test_single_hop_dual_stack_mtu_is_valid_without_rewriting_saved_identity
+    @adapter.define_singleton_method(:physical_interface) { |_ip| 'en0' }
+    @adapter.instance_variable_get(:@template).merge!('ipv6' => '2001:db8::2', 'mtu' => 1200)
+    template = Marshal.dump(@adapter.instance_variable_get(:@template))
+    relay = @adapter.send(:find_relay, 'one')
+    %w[ss ipv4 ipv6].each do |mode|
+      candidate = @adapter.send(:endpoint_candidates_for_transport, relay, mode).first
+      config, = @adapter.send(:worker_tunnel_config, { mixed: 18000, controller: 18001 }, relay, mode, candidate)
+      wg = config['proxies'].find { |node| node['type'] == 'wireguard' }
+      assert_equal '2001:db8::2', wg['ipv6']
+      assert_operator wg.fetch('mtu'), :>=, 1280
     end
     assert_equal template, Marshal.dump(@adapter.instance_variable_get(:@template))
   end

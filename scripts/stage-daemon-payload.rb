@@ -15,6 +15,8 @@ abort 'no daemon regression tests found' if tests.empty?
 
 files = [
   'daemon/mullvad_adapter.rb',
+  'daemon/dns_registry_test_support.rb',
+  'daemon/minitest_dependencies.rb',
   'mullvad-fail-open-watchdog', # test_watchdog.rb invokes it with a fake CLI, disarmed.
   'core/crates/probe/fixtures/dns-canary.json',
   'core/crates/catalogue/fixtures/relay-contract.json',

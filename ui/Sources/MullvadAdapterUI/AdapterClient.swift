@@ -25,9 +25,37 @@ struct AdapterClient: Sendable {
         return try decode(try await data(for: request), path: "account")
     }
 
-    func createDevice(publicKey: String) async throws -> CreatedAccountDevice {
-        let request = try accountRequest("devices/create", payload: ["public_key": publicKey, "confirm": true])
+    func createDevice(publicKey: String, accountFingerprint: String) async throws -> CreatedAccountDevice {
+        let request = try accountRequest("devices/create", payload: ["public_key": publicKey, "confirm": true, "account_fingerprint": accountFingerprint])
         return try decode(try await data(for: request), path: "account/devices/create")
+    }
+
+    func reconcileDevice(publicKey: String, accountFingerprint: String) async throws -> AccountDevice {
+        let request = try accountRequest("devices/reconcile", payload: ["public_key": publicKey, "account_fingerprint": accountFingerprint])
+        return try decode(try await data(for: request), path: "account/devices/reconcile")
+    }
+
+    func installIdentity(draft: AccountDeviceDraft) async throws -> AccountSnapshot {
+        guard draft.stage == .created, let device = draft.device else { throw DraftError.corrupt }
+        return try await account("identity/install", payload: ["confirm": true,
+            "account_fingerprint": draft.accountFingerprint, "device_id": device.id, "public_key": draft.publicKey,
+            "ipv4_address": device.ipv4Address, "ipv6_address": device.ipv6Address,
+            "private_key": draft.privateKey.base64EncodedString()])
+    }
+
+    func abandonIdentity(accountFingerprint: String, pending: PendingIdentityInstallation) async throws -> AccountSnapshot {
+        try await account("identity/abandon", payload: ["confirm": true, "account_fingerprint": accountFingerprint,
+            "expected_installation_account_fingerprint": pending.accountFingerprint, "expected_metadata_sha256": pending.metadataSHA256])
+    }
+
+    func abandonmentReceipt(accountFingerprint: String, publicKey: String, deviceID: String,
+                            installationAccountFingerprint: String? = nil, metadataSHA256: String? = nil) async throws -> AbandonedIdentityReceipt? {
+        var payload: [String: Any] = ["account_fingerprint": accountFingerprint, "public_key": publicKey, "device_id": deviceID]
+        if let installationAccountFingerprint { payload["installation_account_fingerprint"] = installationAccountFingerprint }
+        if let metadataSHA256 { payload["expected_metadata_sha256"] = metadataSHA256 }
+        let request = try accountRequest("identity/abandonment-status", payload: payload)
+        let result: AbandonmentStatus = try decode(try await data(for: request), path: "account/identity/abandonment-status")
+        return result.receipt
     }
 
     func revealPrivateKey() async throws -> String {

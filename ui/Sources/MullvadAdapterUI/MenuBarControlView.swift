@@ -57,6 +57,7 @@ struct MenuBarStatusLabel: View {
 struct MenuBarControlView: View {
     @ObservedObject var model: AdapterViewModel
     @ObservedObject var loginLaunch: LoginLaunchController
+    let dockPresence: MainWindowDockPresence
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -160,12 +161,11 @@ struct MenuBarControlView: View {
     }
 
     private func showMainWindow() {
+        dockPresence.prepareToShowMainWindow()
         openWindow(id: "main")
         NSApp.activate(ignoringOtherApps: true)
-        DispatchQueue.main.async {
-            NSApp.windows
-                .filter { $0.canBecomeKey }
-                .forEach { $0.makeKeyAndOrderFront(nil) }
-        }
+        // SwiftUI opens and raises this scene. Raising every key-capable
+        // NSApp window can resurrect the menu's transparent hosting window
+        // after dismissal, leaving an invisible surface above other apps.
     }
 }

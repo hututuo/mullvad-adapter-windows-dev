@@ -1,5 +1,5 @@
 # frozen_string_literal: true
-require 'minitest/autorun'
+require_relative 'minitest_dependencies'
 require 'json'
 require_relative 'mullvad_adapter'
 

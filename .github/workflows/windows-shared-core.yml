@@ -64,6 +64,8 @@ jobs:
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.3.11'
+      - name: Install pinned Mac regression dependency
+        run: gem install minitest --version 5.27.0 --no-document
       - run: ruby -c daemon/mullvad_adapter.rb
       - run: ruby -I . -I daemon -e 'ARGV.each { |f| require File.expand_path(f) }' daemon/test_*.rb
       - run: ruby scripts/test-shared-contract.rb

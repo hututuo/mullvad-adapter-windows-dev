@@ -1,10 +1,12 @@
 # frozen_string_literal: true
-require 'minitest/autorun'
+require_relative 'minitest_dependencies'
 require 'json'
 require 'socket'
 require_relative 'mullvad_adapter'
+require_relative 'dns_registry_test_support'
 
 class DnsSharedContractTest < Minitest::Test
+  include DnsRegistryTestSupport
   CASES = JSON.parse(File.read(File.expand_path('../core/crates/probe/fixtures/dns-canary.json', __dir__)))
 
   def test_shared_wire_contract_against_ruby_decoder
@@ -48,7 +50,7 @@ class DnsSharedContractTest < Minitest::Test
   end
   def test_svcb_https_unknown_parameters_do_not_grow_global_classes_or_constants
     before = [Resolv::DNS::SvcParam::ClassHash.size, Resolv::DNS::SvcParam::Generic.constants.size,
-              Resolv::DNS::Resource::ClassHash.size]
+              resource_registry_snapshot]
     [64, 65].each do |type|
       100.times do |i|
         packet = [CASES.first.fetch('hex')].pack('H*')
@@ -60,7 +62,7 @@ class DnsSharedContractTest < Minitest::Test
       end
     end
     assert_equal before, [Resolv::DNS::SvcParam::ClassHash.size, Resolv::DNS::SvcParam::Generic.constants.size,
-                         Resolv::DNS::Resource::ClassHash.size]
+                         resource_registry_snapshot]
   end
 
 end

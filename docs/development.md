@@ -1,4 +1,8 @@
-# Windows 开发、检查与候选构建
+# macOS / Windows 开发入口
+
+Mac的SwiftUI、Ruby、PQ helper及arm64候选见[Mac维护与构建](mac-development.md)。下文是Windows工具链与候选流程；不要用Windows依赖替换Mac工具链，也不要为了同步Mac而覆盖更新的Rust/Tauri实现。双端合同改动检查对应实现和fixture；双端源码同库不表示功能已全部接通。
+
+## Windows 开发、检查与候选构建
 
 这是维护端流程：直接修源码、补测试和构建候选，不要求先完成朋友侧接收或报告发回。目录/通道详解见[Windows维护参考](windows-maintenance.md)，行为变更见[规格流程](spec-development.md)。
 

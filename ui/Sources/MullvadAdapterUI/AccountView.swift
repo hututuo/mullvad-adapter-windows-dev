@@ -12,6 +12,8 @@ struct AccountView: View {
     @State private var confirmingVoucher = false
     @State private var confirmingCreate = false
     @State private var confirmingDraftKey = false
+    @State private var confirmingInstall = false
+    @State private var confirmingAbandonInstall = false
 
     init(model: AdapterViewModel) {
         self.model = model
@@ -70,11 +72,27 @@ struct AccountView: View {
         .alert("创建本机设备？", isPresented: $confirmingCreate) {
             Button("取消", role: .cancel) {}
             Button("创建设备") { Task { await account.createDevice() } }
-        } message: { Text("会在当前账号下新增设备，占用一个设备名额。密钥先保存在本机钥匙串，只向官方发送公钥；当前连接保留原身份。") }
+        } message: { Text("会在当前账号下新增设备，占用一个设备名额。密钥先保存在本机钥匙串，只向官方发送公钥。这不会安装或更换隧道身份。") }
+        .alert("启用此设备作为本机身份？", isPresented: $confirmingInstall) {
+            Button("取消", role: .cancel) {}
+            Button("安装本机身份") {
+                Task { await account.installDraft(); await model.refreshStatusOnly() }
+            }
+        } message: {
+            Text("将本机钥匙串中的密钥与官方分配的地址安装到适配器。仅适用于尚未配置身份的本机，不会替换已有身份。完成后再到城市页选择城市并连接。")
+        }
+        .alert("放弃未完成的本机安装？", isPresented: $confirmingAbandonInstall) {
+            Button("取消", role: .cancel) {}
+            Button("保留密钥并放弃安装", role: .destructive) {
+                Task { await account.abandonPendingInstallation(); await model.refreshStatusOnly() }
+            }
+        } message: {
+            Text("只释放本机未完成安装的占位，原安装资料和密钥会保留。不会撤销官方设备、释放设备名额或更换当前身份。完成后可明确创建或安装另一设备。")
+        }
         .alert("显示新设备私钥？", isPresented: $confirmingDraftKey) {
             Button("取消", role: .cancel) {}
             Button("显示新设备私钥") { account.revealDraftKey() }
-        } message: { Text("这是本机生成的新设备密钥，当前隧道仍使用原身份。请勿发给别人或写入诊断报告。") }
+        } message: { Text("此操作显示钥匙串中的本机新设备密钥，不会安装或更换隧道身份。请勿发给别人或写入诊断报告。") }
         .alert("兑换到当前账号？", isPresented: $confirmingVoucher) {
             Button("取消", role: .cancel) {}
             Button("确认兑换") { let code = voucher; voucher = ""; Task { await account.voucher(code) } }
@@ -89,6 +107,9 @@ struct AccountView: View {
                     AdapterStatusBadge(rawStatus: model.displayedStatus)
                     Text(model.status?.activeRelay ?? "尚无活动节点").font(.callout.monospaced())
                     Text("隧道状态独立于账号 API 是否可达。").font(.caption).foregroundStyle(.secondary)
+                    if account.snapshot?.hasLocalIdentity == false {
+                        InlineNotice(text: "隧道尚未初始化。请登录账号、创建设备并安装本机身份，然后到城市页连接。", kind: .warning)
+                    }
                     Button("重连当前节点", systemImage: "bolt.horizontal.circle") { model.reconnect() }
                         .disabled(model.isBusy || model.status?.activeRelay == nil || model.isPreview)
                 }.frame(maxWidth: .infinity, alignment: .leading)
@@ -103,6 +124,9 @@ struct AccountView: View {
                         }
                         Text(data.checkedAt.map { "官方核实：\($0)" } ?? "尚未核实官方状态")
                             .font(.caption).foregroundStyle(.secondary)
+                        if data.deviceSource == "official_api" {
+                            Text("设备名称与公钥：官方账号 API").font(.caption).foregroundStyle(.secondary)
+                        }
                     } else {
                         Text("登录 Mullvad 账号").font(.headline)
                         SecureField("16 位账号，可粘贴空格分组", text: $number).textFieldStyle(.roundedBorder)
@@ -110,6 +134,10 @@ struct AccountView: View {
                             let value = number
                             Task { await account.login(value); if account.snapshot?.signedIn == true && !account.hasError { number = "" } }
                         }.disabled(number.isEmpty || account.busy || model.isPreview)
+                    }
+                    if let data = account.snapshot, let route = data.apiRoute {
+                        Text(route == "system_https" ? "账号接口：系统路由 HTTPS" : (data.apiRouteSource == "legacy_local_default" ? "账号接口：沿用旧版本机引导代理" : "账号接口：已配置的本机引导代理"))
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                 }.frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -120,17 +148,21 @@ struct AccountView: View {
         AppCard("本机设备与密钥") {
             if let data = account.snapshot {
                 KeyValueRow(label: "Mullvad 设备名称", value: data.currentDevice?.name ?? "尚未匹配")
-                if data.deviceMatch == "unmatched" {
+                if !data.hasLocalIdentity {
+                    Text("尚未安装本机 WireGuard 身份，列表中的设备均不标记为当前隧道设备。")
+                        .font(.callout).foregroundStyle(.secondary)
+                } else if data.deviceMatch == "unmatched" {
                     InlineNotice(text: "账号已验证，但此账号中没有当前公钥。当前隧道仍使用原身份；请确认账号是否正确。这里不会自动注册或更换密钥。", kind: .warning)
                 } else if data.deviceMatch == "unknown" {
                     Text("登录并刷新后，将按当前公钥匹配官方设备名称。").foregroundStyle(.secondary)
                 }
-                KeyValueRow(label: "WireGuard 公钥", value: data.publicKey, monospaced: true)
+                KeyValueRow(label: "WireGuard 公钥", value: data.publicKey.isEmpty ? "尚未配置" : data.publicKey, monospaced: true)
                 HStack {
                     Button("复制公钥", systemImage: "doc.on.doc") { copyPublicKey(data.publicKey) }
-                    Button(account.privateKey == nil ? "查看本机私钥…" : "隐藏私钥", systemImage: "key") {
-                        if account.privateKey == nil { confirmingKey = true } else { account.hideKey() }
-                    }.disabled(account.busy || model.isPreview)
+                        .disabled(!data.hasLocalIdentity)
+                    Button(account.privateKey == nil || account.privateKeyIsDraft ? "查看本机私钥…" : "隐藏私钥", systemImage: "key") {
+                        if account.privateKey == nil || account.privateKeyIsDraft { confirmingKey = true } else { account.hideKey() }
+                    }.disabled(account.busy || model.isPreview || !data.hasLocalIdentity)
                 }
                 if let key = account.privateKey, !account.privateKeyIsDraft { KeyValueRow(label: "本机私钥", value: key, monospaced: true) }
             } else {
@@ -144,18 +176,50 @@ struct AccountView: View {
             if account.snapshot?.verified != true {
                 Text("登录或刷新后显示真实设备列表。").foregroundStyle(.secondary)
             }
+            if let pending = account.snapshot?.pendingIdentityInstallation,
+               account.snapshot?.hasLocalIdentity == false, !pending.cancellationComplete {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(pending.cancellationPending ? "正在恢复本机安装取消记录" : "有一份未完成的本机身份安装").font(.headline)
+                    Text("若已不再使用这次安装，可保留资料并释放本机占位，再继续安装其他设备。官方设备和名额保持不变。")
+                        .font(.callout).foregroundStyle(.secondary)
+                    DisclosureGroup("查看未完成安装的公钥") {
+                        KeyValueRow(label: "公钥", value: pending.publicKey, monospaced: true)
+                        KeyValueRow(label: "设备 ID", value: pending.deviceID, monospaced: true)
+                        Text(pending.accountFingerprint == account.snapshot?.accountFingerprint ? "属于当前管理账号" : "属于之前登录的另一账号")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Button(pending.cancellationPending ? "继续完成本机取消…" : "保留密钥并放弃安装…") { confirmingAbandonInstall = true }
+                        .disabled(account.busy || model.isPreview || account.snapshot?.signedIn != true || account.snapshot?.identityAbandonmentSupported != true)
+                }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+            }
             HStack {
                 Button("为本机创建新设备…") { confirmingCreate = true }
-                    .disabled(account.busy || account.snapshot?.verified != true || model.isPreview || (account.deviceDraft != nil && account.deviceDraft?.stage != .prepared) || account.snapshot?.accountFingerprint == nil)
+                    .disabled(account.busy || account.snapshot?.verified != true || model.isPreview || !canCreateDraft || account.snapshot?.accountFingerprint == nil)
                 Text("官方只提供公钥，其他电脑的私钥不能从服务端取回。").font(.caption).foregroundStyle(.secondary)
             }
             if let draft = account.deviceDraft {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text(draft.device?.name ?? "待核实的新设备").font(.headline)
+                    Text(draft.deviceName ?? "待核实的新设备").font(.headline)
                     KeyValueRow(label: "新设备公钥", value: draft.publicKey, monospaced: true)
-                    Text(draft.stage == .created ? "注册成功，私钥已存入本机钥匙串。当前隧道保留原身份。" : "注册结果待核实，密钥已保留；请刷新设备列表核对，不要重复创建。")
+                    Text(draftStatus(draft))
                         .font(.caption).foregroundStyle(.secondary)
-                    Button("查看新设备私钥…") { confirmingDraftKey = true }.disabled(account.busy || model.isPreview)
+                    if !draft.registrationConfirmed {
+                        Button("核对官方登记结果", systemImage: "checkmark.shield") { Task { await account.reconcileDraft() } }
+                            .disabled(account.busy || model.isPreview)
+                    }
+                    if draft.stage == .created {
+                        if account.snapshot?.hasLocalIdentity == false {
+                            Button("安装为本机身份…", systemImage: "checkmark.shield") { confirmingInstall = true }
+                                .disabled(account.busy || account.snapshot?.verified != true || model.isPreview || account.snapshot?.pendingIdentityInstallation?.cancellationPending == true)
+                        } else {
+                            Text("本机已有隧道身份。新设备密钥已保留，此处不会覆盖现有身份。")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    Button(account.privateKeyIsDraft ? "隐藏新设备私钥" : "查看新设备私钥…") {
+                        if account.privateKeyIsDraft { account.hideKey() } else { confirmingDraftKey = true }
+                    }.disabled(account.busy || model.isPreview)
                     if let key = account.privateKey, account.privateKeyIsDraft { KeyValueRow(label: "新设备私钥 · 本机临时显示", value: key, monospaced: true) }
                 }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
                   .background(Color.secondary.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
@@ -200,6 +264,29 @@ struct AccountView: View {
                     .disabled(voucher.isEmpty || account.snapshot?.signedIn != true || account.busy || model.isPreview)
             }
             Text("此页面接入官方账号接口。系统流量入口、DNS 与隧道仍由 Clash 和本适配器管理。").font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private var canCreateDraft: Bool {
+        if let pending = account.snapshot?.pendingIdentityInstallation, !pending.cancellationComplete { return false }
+        guard let draft = account.deviceDraft else { return true }
+        return draft.stage == .prepared || draft.stage == .activated || draft.stage == .abandoned
+    }
+
+    private func draftStatus(_ draft: AccountDeviceDraft) -> String {
+        switch draft.stage {
+        case .prepared:
+            return "本机密钥已保存，尚未确认登记。确认创建时会继续使用此密钥。"
+        case .submitted:
+            return "注册结果待核实，密钥已保留；请核对官方登记结果，避免重复创建。"
+        case .registered:
+            return "官方已确认登记，私钥已保留；缺少官方分配的隧道地址，暂不能安装。"
+        case .created:
+            return "注册成功，官方已分配隧道地址。密钥保存在本机钥匙串，等待安装。"
+        case .activated:
+            return "已安装为本机身份。可到城市页连接；安装成功不代表隧道已连通。"
+        case .abandoned:
+            return "已放弃这次本机安装，旧密钥与资料已保留；官方设备仍在。可明确创建下一设备，原设备仍占用名额。"
         }
     }
 

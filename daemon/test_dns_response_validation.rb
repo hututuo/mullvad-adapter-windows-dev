@@ -1,10 +1,12 @@
 # frozen_string_literal: true
-require 'minitest/autorun'
+require_relative 'minitest_dependencies'
 require 'resolv'
 require 'socket'
 require_relative 'mullvad_adapter'
+require_relative 'dns_registry_test_support'
 
 class DnsResponseValidationTest < Minitest::Test
+  include DnsRegistryTestSupport
   QUERY = 'www.gstatic.com'
   A = Resolv::DNS::Resource::IN::A
   CNAME = Resolv::DNS::Resource::IN::CNAME
@@ -158,7 +160,7 @@ class DnsResponseValidationTest < Minitest::Test
   end
 
   def test_unknown_resource_types_are_bounded_opaque_data_without_global_class_growth
-    before = Resolv::DNS::Resource::ClassHash.size
+    before = resource_registry_snapshot
     16.times do |n|
       result = probe do |id|
         packet = valid_message(id).encode
@@ -167,14 +169,14 @@ class DnsResponseValidationTest < Minitest::Test
       end
       assert_equal 'pass', result[:status]
     end
-    assert_equal before, Resolv::DNS::Resource::ClassHash.size
+    assert_equal before, resource_registry_snapshot
     result = probe { |id| valid_message(id).encode.tap { |p| p[29, 4] = [60_100, 60_100].pack('nn') } }
     assert_equal 'fail', result[:status]
-    assert_equal before, Resolv::DNS::Resource::ClassHash.size
+    assert_equal before, resource_registry_snapshot
   end
 
   def test_valid_ad_cd_opt_and_nested_ns_authority_remain_accepted
-    before = Resolv::DNS::Resource::ClassHash.size
+    before = resource_registry_snapshot
     result = probe do |id|
       message = valid_message(id)
       message.add_authority('gstatic.com.', 30,
@@ -186,7 +188,7 @@ class DnsResponseValidationTest < Minitest::Test
     end
     assert_equal 'pass', result[:status]
     assert_equal 1, result[:answers]
-    assert_equal before, Resolv::DNS::Resource::ClassHash.size
+    assert_equal before, resource_registry_snapshot
   end
 
 end

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative 'test_reliability'
+require 'minitest/mock'
 
 class MullvadProtectionTransactionTest < Minitest::Test
   PLAIN = { multihop: false, entry_city: nil, post_quantum: false }.freeze

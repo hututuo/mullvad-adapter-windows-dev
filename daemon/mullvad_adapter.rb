@@ -26,6 +26,15 @@ class MullvadAdapter
   # Local decoder only: never monkey-patch Resolv or allocate globally cached
   # resource classes from response-controlled type/class numbers.
   class DnsCanaryDecoder < Resolv::DNS::Message::MessageDecoder
+    # Resolv 0.7 replaced ClassHash with a write-only Module. get_class is
+    # unsuitable here: unknown wire values permanently allocate global classes.
+    # Capture only the known IN decoders, without consulting a mutable registry.
+    RESOURCE_DECODERS = %i[A AAAA CNAME NS SOA MX PTR SRV TXT HINFO MINFO LOC WKS CAA].each_with_object({}) do |name, decoders|
+      next unless Resolv::DNS::Resource::IN.const_defined?(name, false)
+      resource = Resolv::DNS::Resource::IN.const_get(name, false)
+      decoders[[resource::TypeValue, resource::ClassValue].freeze] = resource
+    end.freeze
+
     def get_label
       label = super
       raise Resolv::DNS::DecodeError, 'invalid DNS label length' unless label.to_s.bytesize.between?(1, 63)
@@ -49,7 +58,7 @@ class MullvadAdapter
     def get_rr
       owner = get_name
       type, klass, ttl = get_unpack('nnN')
-      typeclass = Resolv::DNS::Resource::ClassHash[[type, klass]]
+      typeclass = RESOURCE_DECODERS[[type, klass]]
       resource = get_length16 do |length|
         if type == 41
           # OPT options have a bounded code/length/value framing (RFC6891).
@@ -115,15 +124,15 @@ class MullvadAdapter
 
   DEFAULTS = {
     state_dir: File.expand_path('~/Library/Application Support/MullvadLocalAdapter'),
-    profile: File.expand_path('~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/profiles/iKuuuV2Stable.yaml'),
+    profile: nil, # Import a legacy profile only when explicitly configured.
     core: '/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo',
     pq_helper: File.basename(__FILE__) == 'mullvad-local-adapter' ? File.join(__dir__, 'mullvad-pq-negotiator') : File.expand_path('../helpers/pq-negotiator/bin/mullvad-pq-negotiator', __dir__),
     api_host: '127.0.0.1',
     api_port: 17_891,
     front_mixed: 17_890,
     front_controller: 17_892,
-    bootstrap_proxy: 'http://127.0.0.1:17893',
-    default_relay: 'us-sea-wg-401',
+    bootstrap_proxy: nil, # Verified HTTPS via the system route; never infer a local listener.
+    default_relay: nil, # A saved or explicitly selected city/relay supplies the destination.
     drain_timeout: 1_800,
     metadata_ttl: 21_600,
     health_interval: 30,
@@ -145,6 +154,26 @@ class MullvadAdapter
 
   def initialize(options)
     @options = DEFAULTS.merge(options)
+    # Preserve the historical implicit route for an already installed template.
+    # Clean first-run state never inherits developer-machine endpoints. Explicit
+    # options (including an empty proxy for system HTTPS) always take priority.
+    legacy_identity = File.file?(File.join(@options[:state_dir], 'wireguard-template.json'))
+    defaults_path = File.join(@options[:state_dir], 'bootstrap-defaults.json')
+    @bootstrap_defaults_source = legacy_identity ? 'legacy_local_default' : 'system_default'
+    if File.file?(defaults_path)
+      assert_private_directory!(@options[:state_dir])
+      recover_private_identity_link(defaults_path)
+      defaults = JSON.parse(read_private_identity_file(defaults_path))
+      unless defaults.is_a?(Hash) && defaults['schema'] == 1 && %w[legacy_local_default system_default].include?(defaults['source'])
+        raise '本机引导默认值记录无效；未切换代理或节点，请检查配置'
+      end
+      @bootstrap_defaults_source = defaults['source']
+    end
+    if @bootstrap_defaults_source == 'legacy_local_default'
+      @options[:bootstrap_proxy] = 'http://127.0.0.1:17893' unless options.key?(:bootstrap_proxy)
+      @options[:default_relay] = 'us-sea-wg-401' unless options.key?(:default_relay)
+    end
+    @api_route_source = options.key?(:bootstrap_proxy) ? 'explicit_option' : @bootstrap_defaults_source
     @slot_config = if @options[:worker_port_base]
                      base = Integer(@options[:worker_port_base])
                      { 'a' => { mixed: base, controller: base + 1 }, 'b' => { mixed: base + 10, controller: base + 11 } }
@@ -296,13 +325,26 @@ class MullvadAdapter
     prepare_state_dir
     load_relay_history
     load_ss_endpoint_history
+    defaults_path = File.join(@state_dir, 'bootstrap-defaults.json')
+    write_private_identity_once(defaults_path, JSON.generate(schema: 1, source: @bootstrap_defaults_source))
     load_template
     load_account_manager
+    @account_only_mode = @template.nil?
+    trap_signals
+    start_api_server
+    unless @template
+      # First-run account access must not depend on a developer's Clash profile,
+      # core installation or pre-existing WireGuard identity. No engine or
+      # recovery thread runs in this mode; installing an identity is separate.
+      @account_only_mode = true
+      @state[:status] = @state[:service_readiness] = 'needs_setup'
+      @state[:last_error] = '隧道尚未初始化：可管理账号与本机设备；尚未安装 WireGuard 身份。'
+      sleep 0.2 until @stop_requested || !@account_only_mode
+      return if @stop_requested
+    end
     load_cached_metadata
     load_city_workspace
     load_protection_profile
-    trap_signals
-    start_api_server
     begin
       ensure_front
     rescue StandardError => e
@@ -316,8 +358,10 @@ class MullvadAdapter
     start_city_maintenance
     Thread.new do
       begin
+        next if @stop_requested
         next if local_network_paused?
         refresh_metadata unless @metadata
+        next if @first_identity_installed # Selection and tunnel validation remain explicit.
         startup_relay = load_persisted_relay || @options[:default_relay]
         startup_transport = load_persisted_transport_preference || DEFAULT_TRANSPORT_PREFERENCE
         activate_startup_with_fallback(startup_relay, startup_transport, reason: 'startup')
@@ -334,17 +378,17 @@ class MullvadAdapter
   private
 
   def prepare_state_dir
-    FileUtils.mkdir_p(@state_dir)
-    File.chmod(0o700, @state_dir)
+    FileUtils.mkdir_p(@state_dir, mode: 0o700) unless File.exist?(@state_dir) || File.symlink?(@state_dir)
+    assert_private_directory!(@state_dir)
     %w[front slots].each do |name|
       path = File.join(@state_dir, name)
-      FileUtils.mkdir_p(path)
-      File.chmod(0o700, path)
+      Dir.mkdir(path, 0o700) unless File.exist?(path) || File.symlink?(path)
+      assert_private_directory!(path)
     end
     @slot_config.keys.each do |slot|
       path = slot_dir(slot)
-      FileUtils.mkdir_p(path)
-      File.chmod(0o700, path)
+      Dir.mkdir(path, 0o700) unless File.exist?(path) || File.symlink?(path)
+      assert_private_directory!(path)
     end
   end
 
@@ -353,9 +397,11 @@ class MullvadAdapter
   end
 
   def load_template
-    if File.file?(template_path)
-      @template = JSON.parse(File.read(template_path))
+    if File.exist?(template_path) || File.symlink?(template_path)
+      recover_private_identity_link(template_path)
+      @template = JSON.parse(read_private_identity_file(template_path))
     else
+      return unless @options[:profile]
       doc = YAML.load_file(@options[:profile]) || {}
       proxies = Array(doc['proxies'])
       candidate = proxies.find do |proxy|
@@ -365,12 +411,551 @@ class MullvadAdapter
 
       keep = %w[ip ipv6 private-key pre-shared-key allowed-ips reserved udp]
       @template = candidate.select { |key, _| keep.include?(key.to_s) }
-      write_json_private(template_path, @template, secret: true)
+      write_private_identity_once(template_path, JSON.generate(@template))
     end
 
     raise 'WireGuard template has no private-key' if @template['private-key'].to_s.empty?
     raise 'WireGuard template has no tunnel ip' if @template['ip'].to_s.empty?
     @template['allowed-ips'] = ['0.0.0.0/0'] if Array(@template['allowed-ips']).empty?
+  end
+
+  def assert_private_directory!(path)
+    stat = File.lstat(path)
+    raise '本机身份目录不安全，未修改身份' unless stat.directory? && stat.uid == Process.uid && (stat.mode & 0o077).zero?
+  end
+
+  def read_private_identity_file(path, links: 1)
+    stat = File.lstat(path)
+    unless stat.file? && stat.uid == Process.uid && (stat.mode & 0o077).zero? && stat.nlink == links && stat.size <= 16_384
+      raise '本机身份记录不安全，未修改身份'
+    end
+    File.open(path, File::RDONLY | File::NOFOLLOW) do |file|
+      actual = file.stat
+      raise '本机身份记录已变化' unless [actual.dev, actual.ino, actual.size, actual.nlink, actual.uid, actual.mode] == [stat.dev, stat.ino, stat.size, links, stat.uid, stat.mode]
+      file.read
+    end
+  end
+
+  def sync_identity_directory(path)
+    File.open(File.dirname(path), File::RDONLY) { |directory| directory.fsync }
+  rescue Errno::EINVAL, Errno::ENOTSUP
+    # Some filesystems cannot fsync directories; file fsync still applies.
+  end
+
+  def recover_private_identity_link(path)
+    pending = path + '.pending'
+    return unless File.exist?(pending) || File.symlink?(pending)
+    target_stat, pending_stat = File.lstat(path), File.lstat(pending)
+    unless target_stat.dev == pending_stat.dev && target_stat.ino == pending_stat.ino && target_stat.nlink == 2 && pending_stat.nlink == 2
+      raise '本机身份暂存记录冲突，已保留原记录'
+    end
+    read_private_identity_file(path, links: 2)
+    read_private_identity_file(pending, links: 2)
+    File.unlink(pending)
+    sync_identity_directory(path)
+  end
+
+  # Atomic no-replace commit. A crash leaves either no target or the complete
+  # fsynced target. Only our exact two-link pending/target pair is recoverable;
+  # unrelated symlinks/hardlinks/owners or conflicting bytes always block.
+  def write_private_identity_once(path, content)
+    assert_private_directory!(File.dirname(path))
+    pending = path + '.pending'
+    if File.exist?(path) || File.symlink?(path)
+      recover_private_identity_link(path)
+      raise '本机身份记录已存在且不匹配，未覆盖' unless read_private_identity_file(path) == content
+      return
+    end
+    if File.exist?(pending) || File.symlink?(pending)
+      raise '本机身份暂存记录不匹配，已保留' unless read_private_identity_file(pending) == content
+    else
+      File.open(pending, File::WRONLY | File::CREAT | File::EXCL | File::NOFOLLOW, 0o600) do |file|
+        file.write(content)
+        file.flush
+        file.fsync
+      end
+      sync_identity_directory(pending)
+    end
+    raise '本机身份暂存读回失败' unless read_private_identity_file(pending) == content
+    File.link(pending, path)
+    sync_identity_directory(path)
+    recover_private_identity_link(path)
+    raise '本机身份提交读回失败' unless read_private_identity_file(path) == content
+  end
+
+  def registration_receipt_path(binding, pubkey)
+    File.join(@state_dir, 'device-registrations', binding, Digest::SHA256.hexdigest(pubkey) + '.json')
+  end
+
+  def registration_receipt(binding, pubkey)
+    path = registration_receipt_path(binding, pubkey)
+    return nil unless File.exist?(path) || File.symlink?(path)
+    assert_private_directory!(File.dirname(File.dirname(path)))
+    assert_private_directory!(File.dirname(path))
+    recover_private_identity_link(path)
+    value = JSON.parse(read_private_identity_file(path))
+    raise '本机官方登记回执无效' unless value['schema'] == 1 && value['account_fingerprint'] == binding && value.dig('device', 'pubkey') == pubkey && valid_device_registration?(value['device'])
+    value['device']
+  end
+
+  def valid_device_registration?(device)
+    device.is_a?(Hash) && device['id'].to_s.match?(/\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z/i) &&
+      valid_account_public_key?(device['pubkey']) && device['name'].is_a?(String) && !device['name'].empty? &&
+      device['name'].bytesize <= 256 && !device['name'].match?(/[[:cntrl:]]/) &&
+      device['ipv4_address'].to_s.end_with?('/32') && IPAddr.new(device['ipv4_address']).ipv4? &&
+      device['ipv6_address'].to_s.end_with?('/128') && IPAddr.new(device['ipv6_address']).ipv6?
+  rescue IPAddr::InvalidAddressError
+    false
+  end
+
+  def save_registration_receipt(device)
+    binding = Digest::SHA256.hexdigest(@account_number)
+    path = registration_receipt_path(binding, device.fetch('pubkey'))
+    [File.dirname(File.dirname(path)), File.dirname(path)].each do |directory|
+      Dir.mkdir(directory, 0o700) unless File.exist?(directory) || File.symlink?(directory)
+      assert_private_directory!(directory)
+    end
+    safe = device.select { |key, _| %w[id name pubkey created ipv4_address ipv6_address].include?(key) }
+    write_private_identity_once(path, JSON.generate(schema: 1, account_fingerprint: binding, device: safe))
+    safe
+  end
+
+  def installed_draft_match(pubkey, devices)
+    return {} unless @template && @account_number && @account_data
+    path = File.join(@state_dir, 'identity-installation.json')
+    return {} unless File.exist?(path) || File.symlink?(path)
+    recover_private_identity_link(path)
+    receipt = JSON.parse(read_private_identity_file(path))
+    binding = Digest::SHA256.hexdigest(@account_number)
+    return {} unless receipt['schema'] == 1 && receipt['account_fingerprint'] == binding && receipt['public_key'] == pubkey &&
+      receipt['template_sha256'] == Digest::SHA256.hexdigest(read_private_identity_file(template_path)) &&
+      devices.count { |device| device[:id] == receipt['device_id'] && device[:pubkey] == pubkey && device[:current] } == 1
+    official = registration_receipt(binding, pubkey)
+    return {} unless official && official['id'] == receipt['device_id'] &&
+      @template['ip'] == official['ipv4_address'].sub(%r{/32\z}, '') && @template['ipv6'] == official['ipv6_address'].sub(%r{/128\z}, '')
+    { activated_draft_public_key: pubkey, activated_draft_device_id: receipt['device_id'] }
+  end
+
+  def reserve_identity_install_ports
+    ports = [@options[:front_mixed], @options[:front_controller], *@slot_config.values.flat_map { |slot| slot.values }].uniq
+    listeners = []
+    begin
+      ports.each { |port| listeners << TCPServer.new('127.0.0.1', port) }
+      yield
+    rescue Errno::EADDRINUSE, Errno::EACCES
+      raise AccountError.new('engine_running', '网络引擎端口仍被占用，未安装或更换身份')
+    ensure
+      listeners.reverse_each(&:close)
+    end
+  end
+
+  ABANDON_SOURCE_ARCHIVES = {
+    'identity-installation.json' => 'metadata.json',
+    'identity-installation.json.pending' => 'metadata-pending.json',
+    'wireguard-template.json.pending' => 'template-pending.json'
+  }.freeze
+  IDENTITY_RECORD_LIMIT = 64
+
+  def identity_path_exists?(path)
+    File.exist?(path) || File.symlink?(path)
+  end
+
+  # Read a crash-pending pair without deleting either original. Cancellation
+  # archives all original bytes before it is allowed to unlink an occupant.
+  def read_identity_pair(path)
+    pending = path + '.pending'
+    paths = [path, pending].select { |candidate| identity_path_exists?(candidate) }
+    return nil if paths.empty?
+    if paths.length == 2
+      left, right = paths.map { |candidate| File.lstat(candidate) }
+      raise '本机身份记录冲突' unless [left.dev, left.ino, left.nlink] == [right.dev, right.ino, 2] && left.nlink == 2
+    end
+    bytes = paths.map { |candidate| read_private_identity_file(candidate, links: paths.length) }
+    raise '本机身份记录冲突' unless bytes.uniq.length == 1
+    { bytes: bytes.first, paths: paths }
+  end
+
+  # Cancellation records use unique, bounded staging names. A killed writer
+  # may leave a partial staging file, but never a partial canonical record.
+  # Retain such orphans; only remove an exact, private two-link commit pair.
+  def abandonment_staging_files(path, create: false)
+    directory = File.join(@state_dir, 'identity-abandonment-staging')
+    if create && !identity_path_exists?(directory)
+      Dir.mkdir(directory, 0o700)
+      sync_identity_directory(directory)
+    end
+    return [] unless identity_path_exists?(directory)
+    assert_private_directory!(directory)
+    names = Dir.children(directory)
+    raise '本机取消暂存路径或数量无效' unless names.length <= IDENTITY_RECORD_LIMIT && names.all? { |name| name.match?(/\A[0-9a-f]{64}-[0-9a-f]{16}\z/) }
+    names.each do |name|
+      stat = File.lstat(File.join(directory, name))
+      raise '本机取消暂存记录不安全' unless stat.file? && stat.uid == Process.uid && (stat.mode & 0o077).zero? && stat.nlink.between?(1, 2) && stat.size <= 16_384
+    end
+    prefix = Digest::SHA256.hexdigest(path) + '-'
+    names.select { |name| name.start_with?(prefix) }.map { |name| File.join(directory, name) }
+  end
+
+  def read_abandonment_record(path)
+    stages = abandonment_staging_files(path)
+    return nil unless identity_path_exists?(path)
+    stat = File.lstat(path)
+    links = stages.select do |stage|
+      candidate = File.lstat(stage)
+      [candidate.dev, candidate.ino] == [stat.dev, stat.ino]
+    end
+    raise '本机取消暂存包含未知链接' if stages.any? { |stage| File.lstat(stage).nlink != 1 && !links.include?(stage) }
+    raise '本机取消提交链接冲突' unless (stat.nlink == 1 && links.empty?) || (stat.nlink == 2 && links.length == 1)
+    bytes = read_private_identity_file(path, links: stat.nlink)
+    links.each { |stage| raise '本机取消提交字节冲突' unless read_private_identity_file(stage, links: 2) == bytes }
+    { bytes: bytes, stages: links }
+  end
+
+  def write_abandonment_record_once(path, content)
+    assert_private_directory!(File.dirname(path))
+    raise '本机取消记录超限' unless content.bytesize <= 16_384
+    record = read_abandonment_record(path)
+    if record
+      raise '本机取消记录已存在且不匹配' unless record[:bytes] == content
+      record[:stages].each do |stage|
+        # Recheck inode, owner, permissions and bytes immediately before unlink.
+        actual = read_abandonment_record(path)
+        raise '本机取消暂存链接已变化' unless actual[:bytes] == content && actual[:stages] == [stage]
+        File.unlink(stage)
+        sync_identity_directory(stage)
+      end
+      return
+    end
+    stages = abandonment_staging_files(path, create: true)
+    stage = stages.find { |candidate| read_private_identity_file(candidate) == content }
+    unless stage
+      directory = File.join(@state_dir, 'identity-abandonment-staging')
+      raise '本机取消暂存已达上限，原资料保留' if Dir.children(directory).length >= IDENTITY_RECORD_LIMIT
+      stage = File.join(directory, Digest::SHA256.hexdigest(path) + '-' + SecureRandom.hex(8))
+      File.open(stage, File::WRONLY | File::CREAT | File::EXCL | File::NOFOLLOW, 0o600) do |file|
+        file.write(content)
+        file.flush
+        file.fsync
+      end
+      sync_identity_directory(stage)
+    end
+    raise '本机取消暂存读回失败' unless read_private_identity_file(stage) == content
+    File.link(stage, path)
+    sync_identity_directory(path)
+    write_abandonment_record_once(path, content)
+    raise '本机取消提交读回失败' unless read_private_identity_file(path) == content
+  end
+
+  def identity_abandonment_archive(hash, create: false)
+    raise '放弃安装摘要无效' unless hash.to_s.match?(/\A[0-9a-f]{64}\z/)
+    root = File.join(@state_dir, 'retired-installations')
+    if create && !identity_path_exists?(root)
+      Dir.mkdir(root, 0o700)
+      sync_identity_directory(root)
+    end
+    assert_private_directory!(root)
+    entries = Dir.children(root)
+    raise '本机安装归档数量或路径无效' unless entries.length <= IDENTITY_RECORD_LIMIT && entries.all? { |entry| entry.match?(/\A[0-9a-f]{64}\z/) }
+    path = File.join(root, hash)
+    if create && !identity_path_exists?(path)
+      raise '本机安装归档已达上限，未删除旧资料' if entries.length >= IDENTITY_RECORD_LIMIT
+      Dir.mkdir(path, 0o700)
+      sync_identity_directory(path)
+    end
+    assert_private_directory!(path)
+    allowed = ABANDON_SOURCE_ARCHIVES.values + %w[plan.json completed.json]
+    names = Dir.children(path)
+    raise '本机安装归档包含未知记录' unless names.length <= allowed.length && names.all? { |name| allowed.include?(name) }
+    names.each { |name| read_abandonment_record(File.join(path, name)) }
+    path
+  end
+
+  def valid_installation_metadata?(value)
+    value.is_a?(Hash) && value['schema'] == 1 && %w[account_fingerprint template_sha256].all? { |key| value[key].to_s.match?(/\A[0-9a-f]{64}\z/) } &&
+      value['device_id'].to_s.match?(/\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z/i) && valid_account_public_key?(value['public_key'])
+  end
+
+  def validate_abandonment_plan!(plan)
+    raise '放弃安装记录无效' unless valid_installation_metadata?(plan) && plan['metadata_sha256'].to_s.match?(/\A[0-9a-f]{64}\z/) &&
+      plan['cancelled_by_fingerprint'].to_s.match?(/\A[0-9a-f]{64}\z/) && plan['artifacts'].is_a?(Array) && plan['artifacts'].length.between?(1, 3)
+    artifacts = plan['artifacts']
+    raise '放弃安装路径无效' unless artifacts.map { |item| item['source'] }.uniq.length == artifacts.length &&
+      artifacts.any? { |item| item['source'].start_with?('identity-installation.json') } && artifacts.all? do |item|
+        item.is_a?(Hash) && ABANDON_SOURCE_ARCHIVES[item['source']] == item['archive'] && item['sha256'].to_s.match?(/\A[0-9a-f]{64}\z/) &&
+          %w[dev ino size links].all? { |key| item[key].is_a?(Integer) && item[key] >= 0 } && item['size'] <= 16_384 && item['links'].between?(1, 2)
+      end
+    plan
+  end
+
+  def active_identity_abandonment
+    record = read_abandonment_record(File.join(@state_dir, 'identity-abandonment.json'))
+    return nil unless record
+    plan = validate_abandonment_plan!(JSON.parse(record[:bytes]))
+    { plan: plan, bytes: record[:bytes] }
+  end
+
+  def capture_identity_abandonment
+    record = read_identity_pair(File.join(@state_dir, 'identity-installation.json'))
+    return nil unless record
+    metadata = JSON.parse(record[:bytes])
+    raise '未完成安装记录无效' unless valid_installation_metadata?(metadata)
+    paths = record[:paths]
+    pending = File.join(@state_dir, 'wireguard-template.json.pending')
+    if identity_path_exists?(pending)
+      bytes = read_private_identity_file(pending)
+      candidate = JSON.parse(bytes)
+      raise '待安装密钥与原记录不匹配，未清理' unless Digest::SHA256.hexdigest(bytes) == metadata['template_sha256'] &&
+        candidate.is_a?(Hash) && template_public_key(candidate.fetch('private-key')) == metadata['public_key']
+      paths << pending
+    end
+    artifacts = paths.map do |path|
+      stat = File.lstat(path)
+      bytes = read_private_identity_file(path, links: stat.nlink)
+      name = File.basename(path)
+      { 'source' => name, 'archive' => ABANDON_SOURCE_ARCHIVES.fetch(name), 'sha256' => Digest::SHA256.hexdigest(bytes),
+        'dev' => stat.dev, 'ino' => stat.ino, 'size' => stat.size, 'links' => stat.nlink }
+    end
+    plan = metadata.merge('metadata_sha256' => Digest::SHA256.hexdigest(record[:bytes]),
+      'cancelled_by_fingerprint' => @account_number ? Digest::SHA256.hexdigest(@account_number) : ('0' * 64), 'artifacts' => artifacts)
+    { plan: validate_abandonment_plan!(plan), bytes: JSON.generate(plan) }
+  end
+
+  def verify_abandonment_archives!(plan, plan_bytes)
+    directory = identity_abandonment_archive(plan.fetch('metadata_sha256'))
+    stored = read_abandonment_record(File.join(directory, 'plan.json'))
+    raise '安装归档计划未确认' unless stored && stored[:bytes] == plan_bytes
+    plan['artifacts'].each do |item|
+      record = read_abandonment_record(File.join(directory, item.fetch('archive')))
+      raise '安装归档读回不匹配' unless record && record[:bytes].bytesize == item['size'] && Digest::SHA256.hexdigest(record[:bytes]) == item['sha256']
+    end
+    directory
+  end
+
+  def assert_identity_abandonment_idle!
+    raise AccountError.new('identity_exists', '已有已提交模板，不能放弃或清理身份') if @template || identity_path_exists?(template_path)
+    unless @account_only_mode && !@stop_requested && @front_pid.nil? && @workers.empty? && @state[:workers].empty? && @state[:active_slot].nil? && !action_pending?
+      raise AccountError.new('engine_running', '只能在无模板、无网络引擎的首次设置状态放弃安装')
+    end
+    assert_private_directory!(@state_dir)
+  end
+
+  def check_abandonment_sources!(plan)
+    assert_identity_abandonment_idle!
+    expected = plan['artifacts'].map { |item| item['source'] }
+    ABANDON_SOURCE_ARCHIVES.each_key do |name|
+      raise '安装占位出现未知新记录，未清理' if identity_path_exists?(File.join(@state_dir, name)) && !expected.include?(name)
+    end
+    plan['artifacts'].each do |item|
+      path = File.join(@state_dir, item['source'])
+      next unless identity_path_exists?(path)
+      remaining_links = plan['artifacts'].count { |other| other['dev'] == item['dev'] && other['ino'] == item['ino'] && identity_path_exists?(File.join(@state_dir, other['source'])) }
+      stat = File.lstat(path)
+      raise '安装占位已变化，未清理' unless [stat.dev, stat.ino, stat.size, stat.nlink] == [item['dev'], item['ino'], item['size'], remaining_links]
+      raise '安装占位字节已变化，未清理' unless Digest::SHA256.hexdigest(read_private_identity_file(path, links: remaining_links)) == item['sha256']
+    end
+  end
+
+  def abandonment_completion_bytes(plan, plan_bytes)
+    JSON.generate(schema: 1, account_fingerprint: plan['account_fingerprint'], device_id: plan['device_id'], public_key: plan['public_key'],
+      metadata_sha256: plan['metadata_sha256'], plan_sha256: Digest::SHA256.hexdigest(plan_bytes))
+  end
+
+  def abandonment_index_path(binding, pubkey, create: false)
+    root = File.join(@state_dir, 'abandoned-device-drafts')
+    directory = File.join(root, binding)
+    [root, directory].each do |path|
+      if create && !identity_path_exists?(path)
+        parent = File.dirname(path)
+        raise '本机放弃回执已达上限' if path == directory && Dir.children(parent).length >= IDENTITY_RECORD_LIMIT
+        Dir.mkdir(path, 0o700)
+        sync_identity_directory(path)
+      end
+      return nil unless identity_path_exists?(path)
+      assert_private_directory!(path)
+      names = Dir.children(path)
+      allowed = path == root ? names.all? { |name| name.match?(/\A[0-9a-f]{64}\z/) } : names.all? { |name| name.match?(/\A[0-9a-f]{64}\.json\z/) }
+      raise '本机放弃回执路径或数量无效' unless allowed && names.length <= IDENTITY_RECORD_LIMIT
+    end
+    destination = File.join(directory, Digest::SHA256.hexdigest(pubkey) + '.json')
+    if create && !identity_path_exists?(destination) && Dir.children(directory).length >= IDENTITY_RECORD_LIMIT
+      raise '本机放弃回执数量超限，未清理原安装记录'
+    end
+    destination
+  end
+
+  def verified_abandonment_receipt(binding, pubkey, device_id)
+    path = abandonment_index_path(binding, pubkey)
+    record = path && read_abandonment_record(path)
+    active = active_identity_abandonment
+    if !record && active && active[:plan].values_at('account_fingerprint', 'public_key', 'device_id') == [binding, pubkey, device_id]
+      directory = identity_abandonment_archive(active[:plan]['metadata_sha256'])
+      record = read_abandonment_record(File.join(directory, 'completed.json'))
+    end
+    return nil unless record
+    completion = JSON.parse(record[:bytes])
+    raise '放弃安装回执绑定无效' unless completion.values_at('schema', 'account_fingerprint', 'public_key', 'device_id') == [1, binding, pubkey, device_id]
+    directory = identity_abandonment_archive(completion['metadata_sha256'])
+    stored = read_abandonment_record(File.join(directory, 'plan.json'))
+    raise '放弃安装计划缺失' unless stored
+    plan = validate_abandonment_plan!(JSON.parse(stored[:bytes]))
+    verify_abandonment_archives!(plan, stored[:bytes])
+    expected = abandonment_completion_bytes(plan, stored[:bytes])
+    completed = read_abandonment_record(File.join(directory, 'completed.json'))
+    raise '放弃安装完成回执不一致' unless completed && completed[:bytes] == expected && record[:bytes] == expected
+    { account_fingerprint: binding, device_id: device_id, public_key: pubkey, metadata_sha256: completion['metadata_sha256'], receipt_sha256: Digest::SHA256.hexdigest(expected) }
+  end
+
+  def pending_identity_installation
+    return nil if @template || identity_path_exists?(template_path)
+    record = active_identity_abandonment || capture_identity_abandonment
+    return nil unless record
+    plan = record[:plan]
+    proof = verified_abandonment_receipt(plan['account_fingerprint'], plan['public_key'], plan['device_id'])
+    { account_fingerprint: plan['account_fingerprint'], device_id: plan['device_id'], public_key: plan['public_key'],
+      metadata_sha256: plan['metadata_sha256'], has_pending_template: plan['artifacts'].any? { |item| item['source'] == 'wireguard-template.json.pending' },
+      cancellation_pending: !active_identity_abandonment.nil?,
+      cancellation_complete: proof && proof[:metadata_sha256] == plan['metadata_sha256'] ? true : false }
+  end
+
+  def abandon_identity_installation(payload)
+    verify_account_binding!(payload)
+    raise AccountError.new('confirmation_required', '请确认仅放弃本机未完成安装；官方设备和密钥不会撤销') unless payload['confirm'] == true
+    raise AccountError.new('identity_busy', '连接操作尚未结束') unless @switch_mutex.try_lock
+    begin
+      assert_identity_abandonment_idle!
+      current = active_identity_abandonment || capture_identity_abandonment
+      unless current
+        directory = identity_abandonment_archive(payload['expected_metadata_sha256'])
+        stored = read_abandonment_record(File.join(directory, 'plan.json'))
+        plan = stored && validate_abandonment_plan!(JSON.parse(stored[:bytes]))
+        if plan && plan['account_fingerprint'] == payload['expected_installation_account_fingerprint'] &&
+            verified_abandonment_receipt(plan['account_fingerprint'], plan['public_key'], plan['device_id'])
+          return account_snapshot
+        end
+        raise AccountError.new('no_pending_installation', '没有可放弃的未完成安装')
+      end
+      plan = current[:plan]
+      unless plan['metadata_sha256'] == payload['expected_metadata_sha256'] && plan['account_fingerprint'] == payload['expected_installation_account_fingerprint']
+        raise AccountError.new('installation_changed', '未完成安装已变化；请刷新后重新确认')
+      end
+      reserve_identity_install_ports do
+        assert_identity_abandonment_idle!
+        directory = identity_abandonment_archive(plan['metadata_sha256'], create: true)
+        index = abandonment_index_path(plan['account_fingerprint'], plan['public_key'], create: true)
+        existing = read_abandonment_record(File.join(directory, 'plan.json'))
+        if existing
+          archived = validate_abandonment_plan!(JSON.parse(existing[:bytes]))
+          raise '原安装归档与占位不匹配' unless archived.reject { |key, _| key == 'cancelled_by_fingerprint' } == plan.reject { |key, _| key == 'cancelled_by_fingerprint' }
+          plan, current = archived, { plan: archived, bytes: existing[:bytes] }
+        end
+        unless active_identity_abandonment
+          plan['artifacts'].each do |item|
+            path = File.join(@state_dir, item['source'])
+            bytes = read_private_identity_file(path, links: File.lstat(path).nlink)
+            raise '待归档安装字节已变化' unless Digest::SHA256.hexdigest(bytes) == item['sha256']
+            write_abandonment_record_once(File.join(directory, item['archive']), bytes)
+          end
+          write_abandonment_record_once(File.join(directory, 'plan.json'), current[:bytes])
+        end
+        verify_abandonment_archives!(plan, current[:bytes])
+        write_abandonment_record_once(File.join(@state_dir, 'identity-abandonment.json'), current[:bytes])
+        check_abandonment_sources!(plan)
+        plan['artifacts'].sort_by { |item| item['source'].end_with?('.pending') ? 0 : 1 }.each do |item|
+          check_abandonment_sources!(plan)
+          path = File.join(@state_dir, item['source'])
+          next unless identity_path_exists?(path)
+          File.unlink(path)
+          sync_identity_directory(path)
+        end
+        check_abandonment_sources!(plan)
+        completion = abandonment_completion_bytes(plan, current[:bytes])
+        write_abandonment_record_once(File.join(directory, 'completed.json'), completion)
+        write_abandonment_record_once(index, completion)
+        verified_abandonment_receipt(plan['account_fingerprint'], plan['public_key'], plan['device_id']) || raise('放弃安装完成记录未确认')
+        assert_identity_abandonment_idle!
+        journal = File.join(@state_dir, 'identity-abandonment.json')
+        raise '取消记录发生变化' unless read_private_identity_file(journal) == current[:bytes]
+        File.unlink(journal)
+        sync_identity_directory(journal)
+      end
+      account_snapshot
+    ensure
+      @switch_mutex.unlock
+    end
+  rescue AccountError
+    raise
+  rescue StandardError
+    raise AccountError.new('identity_abandonment_unknown', '放弃安装未确认完成；原密钥和记录保留。请只读刷新核对，不要重复注册设备')
+  end
+
+  def install_first_identity(payload)
+    verify_account_binding!(payload)
+    raise AccountError.new('confirmation_required', '请确认首次安装本机身份') unless payload['confirm'] == true
+    raise AccountError.new('identity_busy', '连接操作尚未结束，未修改身份') unless @switch_mutex.try_lock
+    begin
+      assert_private_directory!(@state_dir)
+      raise AccountError.new('identity_abandonment_pending', '放弃安装尚未收尾，请先完成原取消事务') if active_identity_abandonment
+      if @template && template_public_key != payload['public_key']
+        raise AccountError.new('identity_replacement_unsupported', '现有身份不能在此替换；已保留当前模板')
+      end
+      unless @template || (@account_only_mode && !@stop_requested && @front_pid.nil? && @workers.empty? && @state[:workers].empty? && @state[:active_slot].nil? && !action_pending?)
+        raise AccountError.new('engine_running', '必须在无现有身份且无引擎运行的首次设置状态安装')
+      end
+      binding, pubkey = payload['account_fingerprint'], payload['public_key']
+      official = valid_account_public_key?(pubkey) && registration_receipt(binding, pubkey)
+      unless official && %w[id pubkey ipv4_address ipv6_address].all? { |key| official[key] == payload[{ 'id' => 'device_id', 'pubkey' => 'public_key' }.fetch(key, key)] }
+        raise AccountError.new('registration_receipt_required', '缺少匹配账号、设备、公钥与官方地址的本机登记回执；未安装身份')
+      end
+      if verified_abandonment_receipt(binding, pubkey, official['id'])
+        raise AccountError.new('identity_abandoned', '此旧安装已安全放弃，不能自动恢复；请显式创建新本机设备')
+      end
+      key = payload['private_key'].to_s
+      begin
+        private_bytes = Base64.strict_decode64(key)
+        raise ArgumentError unless private_bytes.bytesize == 32 && Base64.strict_encode64(private_bytes) == key
+      rescue ArgumentError
+        raise AccountError.new('invalid_key', '本机私钥格式无效')
+      end
+      raise AccountError.new('invalid_key', '本机密钥与官方登记公钥不匹配') unless template_public_key(key) == pubkey
+      @account_data = account_refresh
+      unless @account_data[:devices].count { |device| device['id'] == official['id'] && device['pubkey'] == pubkey } == 1
+        raise AccountError.new('registered_device_missing', '官方列表未唯一确认此设备归属；未安装身份')
+      end
+      template = { 'private-key' => key, 'ip' => official['ipv4_address'].sub(%r{/32\z}, ''),
+        'ipv6' => official['ipv6_address'].sub(%r{/128\z}, ''), 'allowed-ips' => ['0.0.0.0/0', '::/0'], 'udp' => true }
+      bytes = JSON.generate(template)
+      installation = JSON.generate(schema: 1, account_fingerprint: binding, device_id: official['id'], public_key: pubkey, template_sha256: Digest::SHA256.hexdigest(bytes))
+      if @template
+        unless @template == template && read_private_identity_file(template_path) == bytes &&
+            read_private_identity_file(File.join(@state_dir, 'identity-installation.json')) == installation
+          raise AccountError.new('identity_replacement_unsupported', '现有模板与已确认安装记录不一致，未覆盖身份')
+        end
+        return account_snapshot
+      end
+      if File.exist?(template_path) || File.symlink?(template_path)
+        recover_private_identity_link(template_path)
+        unless read_private_identity_file(template_path) == bytes
+          raise AccountError.new('identity_replacement_unsupported', '模板路径已有不同身份，未覆盖原文件')
+        end
+      end
+      reserve_identity_install_ports do
+        write_private_identity_once(File.join(@state_dir, 'bootstrap-defaults.json'), JSON.generate(schema: 1, source: @bootstrap_defaults_source))
+        write_private_identity_once(File.join(@state_dir, 'identity-installation.json'), installation)
+        write_private_identity_once(template_path, bytes)
+      end
+      @template = template
+      @first_identity_installed = true
+      @state[:status] = @state[:service_readiness] = 'identity_configured'
+      @state[:last_error] = nil
+      @account_only_mode = false
+      account_snapshot
+    ensure
+      @switch_mutex.unlock
+    end
+  rescue AccountError
+    raise
+  rescue StandardError
+    raise AccountError.new('identity_install_unknown', '身份安装未确认完成；已保留本机记录。请刷新状态核对，不要更换密钥或覆盖模板')
   end
 
   # Account management is independent of the tunnel lifecycle. Verifying an
@@ -449,25 +1034,47 @@ class MullvadAdapter
   end
 
   def account_snapshot
-    pubkey = template_public_key
+    pubkey = @template ? template_public_key : ''
     data = @account_data || {}
     devices = Array(data[:devices]).map do |device|
       { id: device['id'], name: device['name'], pubkey: device['pubkey'], created: device['created'],
-        current: device['pubkey'] == pubkey }
+        current: !pubkey.empty? && device['pubkey'] == pubkey }
     end
     { signed_in: !@account_number.nil?, verified: !@account_data.nil?,
       account_suffix: @account_number&.slice(-4, 4), expiry: data[:expiry],
       checked_at: data[:checked_at], public_key: pubkey,
-      device_match: @account_data.nil? ? 'unknown' : (devices.any? { |d| d[:current] } ? 'matched' : 'unmatched'),
-      devices: devices, account_fingerprint: @account_number && Digest::SHA256.hexdigest(@account_number) }
+      device_match: pubkey.empty? ? 'unconfigured' : (@account_data.nil? ? 'unknown' : (devices.any? { |d| d[:current] } ? 'matched' : 'unmatched')),
+      devices: devices, account_fingerprint: @account_number && Digest::SHA256.hexdigest(@account_number),
+      identity_configured: !pubkey.empty?, api_route: @options[:bootstrap_proxy].to_s.empty? ? 'system_https' : 'configured_proxy',
+      api_route_source: @api_route_source, device_source: @account_data ? 'official_api' : 'not_verified',
+      identity_abandonment_supported: true, pending_identity_installation: pending_identity_installation }.merge(installed_draft_match(pubkey, devices))
+  end
+
+  def verify_account_binding!(payload)
+    raise AccountError.new('not_signed_in', '请先登录账号') unless @account_number
+    expected = Digest::SHA256.hexdigest(@account_number)
+    unless payload['account_fingerprint'] == expected
+      raise AccountError.new('account_changed', '账号已变化或客户端未绑定账号；请刷新后重新确认操作')
+    end
+  end
+
+  def valid_account_public_key?(key)
+    return false unless key.is_a?(String)
+    bytes = Base64.strict_decode64(key)
+    bytes.bytesize == 32 && Base64.strict_encode64(bytes) == key && bytes.bytes.any? { |b| b != 0 }
+  rescue ArgumentError
+    false
   end
 
   def account_refresh(number = @account_number)
     raise AccountError.new('not_signed_in', '请先输入 Mullvad 账号') unless number
     account = account_api('GET', 'accounts/v1/accounts/me', number: number)
     devices = account_api('GET', 'accounts/v1/devices', number: number)
-    unless account.is_a?(Hash) && account['expiry'].is_a?(String) && devices.is_a?(Array) &&
-           devices.all? { |d| d.is_a?(Hash) && d['id'].is_a?(String) && d['name'].is_a?(String) && d['pubkey'].is_a?(String) }
+    unless account.is_a?(Hash) && account['expiry'].is_a?(String) && devices.is_a?(Array) && devices.length <= 64 &&
+           devices.all? { |d| d.is_a?(Hash) && d['id'].to_s.match?(/\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z/i) &&
+             d['name'].is_a?(String) && !d['name'].empty? && d['name'].bytesize <= 256 && !d['name'].match?(/[[:cntrl:]]/) &&
+             valid_account_public_key?(d['pubkey']) } && devices.map { |d| d['id'] }.uniq.length == devices.length &&
+           devices.map { |d| d['pubkey'] }.uniq.length == devices.length
       raise AccountError.new('invalid_response', '官方账号接口格式已变化；未保存新登录')
     end
     { expiry: account['expiry'], devices: devices, checked_at: Time.now.iso8601 }
@@ -551,23 +1158,50 @@ class MullvadAdapter
         @account_data = account_refresh
         respond(sock, 200, account_snapshot)
       when ['POST', '/account/logout']
+        verify_account_binding!(payload)
         account_path = File.join(@state_dir, 'account.json')
         File.unlink(account_path) if File.exist?(account_path)
         @account_number = @account_data = @account_token = nil
         respond(sock, 200, account_snapshot)
+      when ['POST', '/account/identity/install']
+        respond(sock, 200, install_first_identity(payload))
+      when ['POST', '/account/identity/abandon']
+        respond(sock, 200, abandon_identity_installation(payload))
+      when ['POST', '/account/identity/abandonment-status']
+        verify_account_binding!(payload)
+        pubkey, id = payload['public_key'], payload['device_id']
+        installation_binding = payload['installation_account_fingerprint'] || payload['account_fingerprint']
+        raise AccountError.new('invalid_account', '原安装账号绑定无效') unless installation_binding.to_s.match?(/\A[0-9a-f]{64}\z/)
+        raise AccountError.new('invalid_key', '公钥无效') unless valid_account_public_key?(pubkey)
+        raise AccountError.new('invalid_device', '设备ID无效') unless id.to_s.match?(/\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z/i)
+        receipt = verified_abandonment_receipt(installation_binding, pubkey, id)
+        if receipt && payload['expected_metadata_sha256'] && receipt[:metadata_sha256] != payload['expected_metadata_sha256']
+          raise AccountError.new('installation_changed', '原安装回执已变化')
+        end
+        respond(sock, 200, { receipt: receipt })
       when ['POST', '/account/key']
         raise AccountError.new('confirmation_required', '请主动确认查看本机私钥') unless payload['reveal'] == true
+        raise AccountError.new('identity_not_configured', '尚未安装隧道身份；新设备密钥保存在本机钥匙串') unless @template
         respond(sock, 200, { private_key: @template.fetch('private-key') })
+      when ['POST', '/account/devices/reconcile']
+        verify_account_binding!(payload)
+        pubkey = payload['public_key']
+        raise AccountError.new('invalid_key', '公钥格式无效') unless valid_account_public_key?(pubkey)
+        @account_data = account_refresh
+        device = account_snapshot[:devices].find { |d| d[:pubkey] == pubkey }
+        unless device
+          raise AccountError.new('draft_not_found', '官方列表尚未找到本机待注册公钥；密钥保留，未重复注册。请稍后再次核对')
+        end
+        # Listing proves registration only. It does not invent assigned tunnel
+        # addresses or install this identity into the running template.
+        saved = registration_receipt(payload['account_fingerprint'], pubkey)
+        device = device.merge(registration: saved) if saved && saved['id'] == device[:id]
+        respond(sock, 200, device)
       when ['POST', '/account/devices/create']
         raise AccountError.new('confirmation_required', '请确认创建本机设备') unless payload['confirm'] == true
-        raise AccountError.new('not_signed_in', '请先登录账号') unless @account_number
+        verify_account_binding!(payload)
         pubkey = payload['public_key'].to_s
-        begin
-          bytes = Base64.strict_decode64(pubkey)
-          raise ArgumentError unless bytes.bytesize == 32 && Base64.strict_encode64(bytes) == pubkey && bytes.bytes.any? { |b| b != 0 }
-        rescue ArgumentError
-          raise AccountError.new('invalid_key', '公钥格式无效，未提交注册')
-        end
+        raise AccountError.new('invalid_key', '公钥格式无效，未提交注册') unless valid_account_public_key?(pubkey)
         begin
           device = account_api('POST', 'accounts/v1/devices', number: @account_number,
             payload: { pubkey: pubkey, hijack_dns: false }, expected_status: 201)
@@ -578,8 +1212,9 @@ class MullvadAdapter
                  device['ipv6_address'].to_s.end_with?('/128') && IPAddr.new(device['ipv6_address']).ipv6?
             raise AccountError.new('mutation_outcome_unknown', '设备注册响应未通过验证；请核实官方设备列表，密钥保留在本机')
           end
+          safe_device = save_registration_receipt(device)
           @account_data = nil
-          respond(sock, 200, device.select { |key, _| %w[id name pubkey created ipv4_address ipv6_address].include?(key) })
+          respond(sock, 200, safe_device)
         rescue AccountError => e
           if %w[api_unreachable invalid_response mutation_outcome_unknown].include?(e.code) || e.code.match?(/\Ahttp_[235]/) || e.code == 'http_408'
             raise AccountError.new('mutation_outcome_unknown', '注册是否完成尚未确认；密钥已保留。请刷新设备列表核实，不要重复创建')
@@ -590,6 +1225,7 @@ class MullvadAdapter
         end
       when ['POST', '/account/devices/remove']
         raise AccountError.new('confirmation_required', '请确认撤销此设备') unless payload['confirm'] == true
+        verify_account_binding!(payload)
         id = payload['device_id'].to_s
         raise AccountError.new('invalid_device', '设备 ID 无效') unless id.match?(/\A[0-9a-f-]{36}\z/i)
         # Always refresh the match immediately before deletion, rather than
@@ -603,7 +1239,7 @@ class MullvadAdapter
         @account_data = account_refresh
         respond(sock, 200, account_snapshot)
       when ['POST', '/account/voucher']
-        raise AccountError.new('not_signed_in', '请先登录账号') unless @account_number
+        verify_account_binding!(payload)
         code = payload['voucher_code'].to_s.delete(' -')
         raise AccountError.new('invalid_voucher', '请输入有效兑换码') unless code.match?(/\A[A-Za-z0-9]{8,32}\z/)
         account_api('POST', 'app/v1/submit-voucher', number: @account_number, payload: { voucher_code: code })
@@ -730,6 +1366,10 @@ class MullvadAdapter
     path, query = raw_path.to_s.split('?', 2)
     if path.start_with?('/account')
       handle_account_http(sock, method, path, headers, body)
+      return
+    end
+    if @account_only_mode && method == 'POST'
+      respond(sock, 409, { code: 'identity_not_configured', error: '隧道尚未初始化；当前仅开放账号与设备管理，未启动网络引擎' })
       return
     end
     if method == 'GET' && path.start_with?('/operations/')
@@ -2631,7 +3271,7 @@ class MullvadAdapter
 
   def bootstrap_proxy_args
     raw = @options[:bootstrap_proxy].to_s
-    raise 'bootstrap proxy is required; system DNS fallback is disabled' if raw.empty?
+    return ['--proxy', '', '--noproxy', '*'] if raw.empty?
     uri = URI(raw)
     raise 'bootstrap proxy must use local http:// listener' unless uri.scheme == 'http' && uri.host && uri.port
     address = IPAddr.new(uri.host)
@@ -2830,9 +3470,10 @@ class MullvadAdapter
       @metadata_fetched_at = Time.now
       write_json_private(metadata_cache_path, parsed, secret: false)
       @mutex.synchronize { @metrics[:metadata_refreshes] += 1 }
-      set_metadata_state(live: true, cache: true, source: 'bootstrap-proxy', error: nil, fetched_at: @metadata_fetched_at)
-      record_metadata_validation_warnings('bootstrap-proxy')
-      set_dns_status(:bootstrap, 'pass', 'Mullvad API fetched via dedicated main-Clash control listener')
+      route = @options[:bootstrap_proxy].to_s.empty? ? 'system-https' : 'bootstrap-proxy'
+      set_metadata_state(live: true, cache: true, source: route, error: nil, fetched_at: @metadata_fetched_at)
+      record_metadata_validation_warnings(route)
+      set_dns_status(:bootstrap, 'pass', "Mullvad API fetched via #{route}")
       check_clash_global_path
       parsed
     end
@@ -2847,6 +3488,10 @@ class MullvadAdapter
 
 
   def check_clash_global_path
+    if @options[:bootstrap_proxy].to_s.empty?
+      set_dns_status(:clash_global, 'external', '未配置 Clash 引导代理；系统路由 HTTPS 不证明 Clash 入口可用')
+      return
+    end
     proxy_args = bootstrap_proxy_args
     stdout, stderr, status = Open3.capture3('curl', '-q', '-sS', '--noproxy', '', '--max-time', '5', *proxy_args, '-o', '/dev/null', '-w', '%{http_code}', HOST_CANARY)
     if status.success? && stdout.to_i == 204
@@ -3773,6 +4418,7 @@ class MullvadAdapter
     previous_network_epoch = Thread.current[:adapter_network_epoch]
     previous_profile = Thread.current[:adapter_protection_profile]
     previous_attempt = Thread.current[:adapter_attempt_id]
+    raise '隧道尚未初始化；请先安装本机 WireGuard 身份' if @account_only_mode
     return false if local_network_paused?
     Thread.current[:adapter_network_epoch] = network_epoch
     queued_at = monotonic_now
@@ -4256,6 +4902,7 @@ class MullvadAdapter
   end
 
   def start_worker(slot, relay, transport_mode: 'ss', ss_candidate: nil)
+    raise '隧道尚未初始化；请先安装本机 WireGuard 身份' if @account_only_mode
     raise 'shutdown requested' if @stop_requested
     raise LocalNetworkInterrupted unless network_attempt_current?
     raise @protection_error if @protection_error && !Thread.current[:adapter_protection_profile]
@@ -4447,7 +5094,9 @@ class MullvadAdapter
         'server' => '127.0.0.1',
         'port' => 51_820,
         'dialer-proxy' => inlet_name,
-        'mtu' => 1265
+        # A dual-stack userspace WG interface must satisfy IPv6's minimum MTU,
+        # even when its outer SS transport uses IPv4.
+        'mtu' => 1280
       )
       transport_name = 'wireguard-over-shadowsocks'
     when 'ipv4'
@@ -4494,7 +5143,7 @@ class MullvadAdapter
         'public-key' => exit_relay['public_key'] || exit_relay['pubkey'],
         'dialer-proxy' => 'WG-ENTRY', 'allowed-ips' => ['0.0.0.0/0', '::/0'],
         'persistent-keepalive' => 25, 'remote-dns-resolve' => true,
-        'dns' => ['tcp://10.64.0.1'], 'udp' => true, 'mtu' => 1200)
+        'dns' => ['tcp://10.64.0.1'], 'udp' => true, 'mtu' => 1280)
       proxies << exit_wg
       transport_name = 'multihop-' + transport_name
     else

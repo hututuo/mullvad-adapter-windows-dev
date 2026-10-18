@@ -1,15 +1,25 @@
 import AppKit
 import SwiftUI
 
+@MainActor
 final class MullvadAdapterAppDelegate: NSObject, NSApplicationDelegate {
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
+    let dockPresence = MainWindowDockPresence()
 
-        if ProcessInfo.processInfo.arguments.contains("--background-login") {
-            DispatchQueue.main.async {
-                NSApp.windows.forEach { $0.orderOut(nil) }
-            }
-        }
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        dockPresence.launchDidFinish()
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        dockPresence.reopenMainWindow()
+        return true
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        dockPresence.stopObserving()
     }
 }
 
@@ -20,14 +30,15 @@ struct MullvadAdapterUIApp: App {
     @StateObject private var loginLaunch = LoginLaunchController()
 
     var body: some Scene {
-        WindowGroup(model.isPreview ? "Mullvad 设计预览" : "Mullvad 本地适配器", id: "main") {
+        Window(model.isPreview ? "Mullvad 设计预览" : "Mullvad 本地适配器", id: "main") {
             ContentView(model: model)
+                .background(MainWindowDockObserver(presence: appDelegate.dockPresence).frame(width: 0, height: 0))
         }
         .windowStyle(.automatic)
         .defaultSize(width: 1280, height: 820)
 
         MenuBarExtra {
-            MenuBarControlView(model: model, loginLaunch: loginLaunch)
+            MenuBarControlView(model: model, loginLaunch: loginLaunch, dockPresence: appDelegate.dockPresence)
         } label: {
             MenuBarStatusLabel(model: model)
         }

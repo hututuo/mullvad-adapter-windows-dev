@@ -13,7 +13,16 @@
     "docs/windows-maintenance.md",
     "docs/network-capabilities.md",
     "docs/spec-development.md",
-    "packaging/windows/README.md"
+    "packaging/windows/README.md",
+    "docs/mac-development.md",
+    "docs/mac-parity.md",
+    "docs/account-devices.md",
+    "docs/tunnel-protection.md",
+    "docs/candidate-install.md"
   ],
-  "handoff_mode": "direct_source_maintenance_and_verification"
+  "handoff_mode": "direct_source_maintenance_and_verification",
+  "platforms": [
+    "macOS",
+    "Windows"
+  ]
 }

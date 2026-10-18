@@ -6,7 +6,7 @@ macOS SwiftUI client for the local Mullvad Adapter control API.
 - Stable ingress: `socks5://127.0.0.1:17890`
 - Main Clash only decides whether a request enters `Mullvad节点`; Relay / SS inlet / transport failover is owned by the Adapter.
 - The UI does not rewrite or reload the production Clash profile.
-- The installed app is a menu-bar utility (`LSUIElement`), hides its Dock icon, and may start at login without opening a window.
+- The installed app can run in menu-bar mode and may start at login without opening a window. Opening the main window enables Dock presence; closing it returns to menu-bar-only mode. See [Mac maintenance](../docs/mac-development.md).
 
 ## Development
 
@@ -58,7 +58,7 @@ ruby install-daemon.rb --rollback LOCAL_BACKUP_DIRECTORY
 
 ```bash
 # 从本目录运行 UI 测试（包含 release 构建）
-xcrun swift test -c release
+xcrun swift test -c release --skip MainWindowDockPresenceTests
 # 从源码根目录运行后端与 watchdog 回归
 ruby -I . -I daemon -e 'ARGV.each { |f| require File.expand_path(f) }' daemon/test_*.rb
 ```
@@ -70,6 +70,8 @@ ruby -I . -I daemon -e 'ARGV.each { |f| require File.expand_path(f) }' daemon/te
 快速测速的目标地址、目标类型和传输方式由 daemon `/relays` 的已校验快测字段提供，SwiftUI 不再直接读取本地 `relays-cache.json`。当前节点在自动模式下优先使用实际 worker 入口，并绑定活动 worker 的物理接口，避免探测包被系统路由送进 Clash TUN。每条结果保留目标 IP、目标类型、接口、耗时、Ping 退出码及命令输出；右下角“详情”显示最近一轮逐节点结果并可复制。没有 ICMP 回复只表示该地址未回应 Ping，不表示节点连接不可用。完整测速仍按安全顺序逐个验证；切换节点继续完整验证。
 
 1.5.2（build 8）扩大国家、城市整行及常用操作控件的矩形点击区域；快速 Ping 的城市统计明确显示 ICMP 回复数，和完整可用性结果分开。
+
+AppKit窗口排序测试MainWindowDockPresenceTests只在隔离GUI/CI环境运行，不能在用户工作桌面循环打开/关闭窗口；本地跳过项单独记NOT_RUN。
 
 ## 1.6 城市维护
 

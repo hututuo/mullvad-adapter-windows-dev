@@ -167,6 +167,8 @@ func localizedAdapterStatus(_ rawStatus: String?) -> String {
     case "switching": return "切换中"
     case "reconnecting": return "重连中"
     case "waiting_network": return "等待本机网络"
+    case "needs_setup": return "隧道尚未初始化"
+    case "identity_configured": return "身份已配置，待连接"
     case "network_recovering": return "恢复原连接中"
     case "candidate": return "正在试连"
     case "draining": return "旧连接收尾中"

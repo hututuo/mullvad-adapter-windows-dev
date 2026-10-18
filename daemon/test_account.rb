@@ -1,5 +1,5 @@
 # frozen_string_literal: true
-require 'minitest/autorun'
+require_relative 'minitest_dependencies'
 require 'tmpdir'
 require 'stringio'
 require_relative 'mullvad_adapter'
@@ -28,7 +28,7 @@ class MullvadAccountTest < Minitest::Test
     @adapter.instance_variable_set(:@template, { 'private-key' => Base64.strict_encode64([PRIVATE].pack('H*')), 'ip' => '10.0.0.2' })
     @adapter.send(:load_account_manager)
     @calls = []
-    @devices = [device(CURRENT, Base64.strict_encode64([PUBLIC].pack('H*'))), device(OTHER, 'another-test-public-key')]
+    @devices = [device(CURRENT, Base64.strict_encode64([PUBLIC].pack('H*'))), device(OTHER, Base64.strict_encode64(['de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f'].pack('H*')))]
     devices, calls = @devices, @calls
     @adapter.define_singleton_method(:account_request) do |method, path, **args|
       calls << [method, path, args]
@@ -53,7 +53,10 @@ class MullvadAccountTest < Minitest::Test
     { 'id' => id, 'pubkey' => pubkey, 'name' => 'example animal', 'created' => '2020-01-01T00:00:00Z' }
   end
 
-  def request(path, payload = nil, authorized: true, origin: nil)
+  def request(path, payload = nil, authorized: true, origin: nil, bound: true)
+    if payload && bound && @adapter.instance_variable_get(:@account_number)
+      payload = { account_fingerprint: Digest::SHA256.hexdigest(@adapter.instance_variable_get(:@account_number)) }.merge(payload)
+    end
     method = payload.nil? ? 'GET' : 'POST'
     body = payload ? JSON.generate(payload) : ''
     headers = authorized ? "Authorization: Bearer #{@adapter.instance_variable_get(:@account_capability)}\r\n" : ''
@@ -103,6 +106,82 @@ class MullvadAccountTest < Minitest::Test
     assert_equal 200, code
     assert_equal 'unmatched', snapshot['device_match']
     refute snapshot['devices'].any? { |d| d['current'] }
+  end
+
+  def test_first_run_account_login_needs_no_template_and_never_fabricates_current_device
+    @adapter.instance_variable_set(:@template, nil)
+    code, snapshot = login
+    assert_equal 200, code
+    assert_equal false, snapshot['identity_configured']
+    assert_equal 'unconfigured', snapshot['device_match']
+    assert_equal '', snapshot['public_key']
+    refute snapshot['devices'].any? { |d| d['current'] }
+    assert_equal 'official_api', snapshot['device_source']
+    assert_equal 'system_https', snapshot['api_route']
+    assert_equal 'identity_not_configured', request('/account/key', { reveal: true })[1]['code']
+    refute File.exist?(@adapter.send(:template_path))
+  end
+
+  def test_account_only_mode_rejects_non_account_mutations_before_starting_engines
+    @adapter.instance_variable_set(:@account_only_mode, true)
+    @adapter.instance_variable_set(:@template, nil)
+    %w[/repair /diagnose /cities/select /speedtest/start /reconnect /protection].each do |path|
+      code, data = request(path, {})
+      assert_equal 409, code
+      assert_equal 'identity_not_configured', data['code']
+    end
+    assert_empty @calls
+    assert_empty @adapter.instance_variable_get(:@workers)
+    assert_nil @adapter.instance_variable_get(:@front_pid)
+  end
+
+  def test_sensitive_actions_reject_missing_or_changed_account_binding_before_network
+    login
+    @calls.clear
+    paths = {
+      '/account/logout' => {}, '/account/voucher' => { voucher_code: 'EXAMPLE123' },
+      '/account/devices/create' => { confirm: true, public_key: Base64.strict_encode64([PUBLIC].pack('H*')) },
+      '/account/devices/remove' => { confirm: true, device_id: OTHER },
+      '/account/devices/reconcile' => { public_key: Base64.strict_encode64([PUBLIC].pack('H*')) }
+    }
+    paths.each do |path, payload|
+      assert_equal 'account_changed', request(path, payload, bound: false)[1]['code']
+      assert_equal 'account_changed', request(path, payload.merge(account_fingerprint: 'b' * 64))[1]['code']
+    end
+    assert_empty @calls
+    assert_equal NUMBER, @adapter.instance_variable_get(:@account_number)
+  end
+
+  def test_reconcile_uses_only_fresh_official_reads_and_returns_no_invented_addresses
+    login
+    @calls.clear
+    code, data = request('/account/devices/reconcile', { public_key: @devices.last['pubkey'] })
+    assert_equal 200, code
+    assert_equal OTHER, data['id']
+    assert_equal false, data['current']
+    refute data.key?('ipv4_address')
+    refute data.key?('private_key')
+    assert_equal ['GET', 'GET'], @calls.map(&:first)
+    assert_equal %w[accounts/v1/accounts/me accounts/v1/devices], @calls.map { |c| c[1] }
+  end
+
+  def test_reconcile_missing_key_does_not_submit_registration
+    login
+    @devices.pop
+    @calls.clear
+    key = Base64.strict_encode64(['de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f'].pack('H*'))
+    code, data = request('/account/devices/reconcile', { public_key: key })
+    assert_equal 422, code
+    assert_equal 'draft_not_found', data['code']
+    assert @calls.all? { |c| c.first == 'GET' }
+  end
+
+  def test_invalid_or_duplicate_official_device_identity_is_not_trusted
+    @devices.last['pubkey'] = @devices.first['pubkey']
+    assert_equal 'invalid_response', login[1]['code']
+    @devices.last['pubkey'] = 'not-a-key'
+    assert_equal 'invalid_response', login[1]['code']
+    assert_nil @adapter.instance_variable_get(:@account_number)
   end
 
   def test_failed_login_preserves_prior_account_and_persisted_credentials

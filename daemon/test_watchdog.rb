@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-require 'minitest/autorun'
+require_relative 'minitest_dependencies'
 require 'tmpdir'
 require 'fileutils'
 require 'open3'

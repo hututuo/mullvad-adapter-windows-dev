@@ -8,7 +8,10 @@
 - `ui/Sources/MullvadAdapterUI`: SwiftUI app and menu-bar controls. `AdapterClient` talks to the local API; `AdapterViewModel` maps status/operations into UI state; `QuickPing` performs bounded ICMP checks using daemon-provided targets; diagnostic export redacts sensitive fields.
 - `ui/Tests`: model, quick-ping, operation, and diagnostic redaction tests.
 - `helpers/pq-negotiator`: bounded Rust process using a pinned official configuration client. It negotiates ephemeral PQ secrets through a candidate worker and does not own the operating-system network path.
-- `.github/workflows/windows-shared-core.yml`: shared checks and optional unsigned Windows candidate. The original macOS candidate workflow is omitted from this Windows public snapshot.
+- `.github/workflows/windows-shared-core.yml`: shared checks and optional unsigned Windows candidate.
+- `.github/workflows/checks-and-candidate.yml`: Mac checks and arm64 candidate assembly; no signing, publish or deployment.
+
+Mac components are synced from the 1.9.1/build13 source, not merely retained migration examples. Account-only first run, retained device drafts, explicit first identity install and main-window Dock presence are part of that implementation. Mac independent Clash-profile integration still has gaps documented in [mac-parity.md](mac-parity.md); its Windows counterpart is not evidence of Mac support. The [Mac maintenance entry](mac-development.md) separates source checks from installation and real egress.
 
 ## Current process and ownership map
 
