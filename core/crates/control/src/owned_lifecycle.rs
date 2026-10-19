@@ -333,9 +333,19 @@ impl ResourceOwner {
                 && op.worker_instance == ticket.worker_instance
                 && op.token == ticket.token
                 && Arc::ptr_eq(&op.cancel.0, &ticket.monitor.cancel.0)
-                && self.state().current(&op.token)
+                && {
+                    // A confirmed physical outage changes epoch, but does not
+                    // revoke the user's intent. Identity/user preemption changes
+                    // generation/operation and must never qualify here.
+                    let mut current = self.state().token();
+                    if self.state().paused {
+                        current.epoch = op.token.epoch;
+                    }
+                    current == op.token
+                }
                 && self.observation.now() < op.deadline
-                && self.observation.binding_evidence().as_ref() != Some(&op.binding)
+                && (self.state().paused
+                    || self.observation.binding_evidence().as_ref() != Some(&op.binding))
         })
     }
     pub fn is_operation_current(&self, ticket: &OperationTicket) -> bool {
@@ -1622,9 +1632,16 @@ mod tests {
             assert!(!owner.is_operation_current(&ticket));
             assert_eq!(
                 owner.operation_binding_changed(&ticket),
-                change == 2,
+                change == 1 || change == 2,
                 "only still-owned network invalidation may retain the candidate"
             );
+            if change == 1 {
+                owner.state_mut().manual_preempt();
+                assert!(
+                    !owner.operation_binding_changed(&ticket),
+                    "user cancellation while offline revokes intent"
+                );
+            }
             owner.poll();
             assert!(network.is_cancelled());
             assert!(owner.begin_operation(binding, 3, None).is_err());
