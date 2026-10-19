@@ -90,6 +90,39 @@ impl Connections {
     pub(crate) fn recheck_soon(&mut self) {
         self.next_health = Instant::now();
     }
+    fn finish_recovery(
+        &mut self,
+        owner: &mut ResourceOwner,
+        dashboard: &mut Dashboard,
+        code: &'static str,
+    ) {
+        debug_assert!(self.pending.is_none());
+        self.recovering = None;
+        self.manual_candidates = None;
+        self.deferred = None;
+        let retained_worker = dashboard.active_relay.as_deref().is_some_and(|relay| {
+            owner
+                .state()
+                .path
+                .as_ref()
+                .is_some_and(|path| path.relay == relay)
+        });
+        owner.state_mut().finish_recovery(retained_worker);
+        if retained_worker {
+            self.next_health = Instant::now();
+        }
+        dashboard.status = if owner.state().paused {
+            "waiting_network"
+        } else if retained_worker {
+            "blocked"
+        } else {
+            "disconnected"
+        }
+        .into();
+        dashboard.readiness = None;
+        dashboard.last_error = Some(code.into());
+        let _ = self.logs.event("connection", code);
+    }
     /// Called only for an accepted user intent, never for scheduler retries.
     pub(crate) fn begin_user_selection(&mut self) {
         self.manual_candidates = None;
@@ -510,6 +543,13 @@ impl Connections {
                 if let Some((deadline, _)) = &mut self.recovering {
                     *deadline =
                         Instant::now() + Duration::from_millis(adapter_domain::RECOVERY_BUDGET_MS);
+                }
+            } else if self.manual_candidates.is_none() {
+                // Only a confirmed offline->stable-online Effect::Verify gets
+                // here, never a binding hint. A prior exhausted round must not
+                // prevent this new physical-network recovery of the old path.
+                if let Some(catalogue) = catalogue {
+                    self.recovery(owner, dashboard, catalogue);
                 }
             }
         }
@@ -1052,8 +1092,7 @@ impl Connections {
             if Instant::now() >= *deadline
                 || dashboard.settings.selected_city.as_ref() != Some(city)
             {
-                self.manual_candidates = None;
-                dashboard.last_error = Some("same_city_recovery_exhausted".into());
+                self.finish_recovery(owner, dashboard, "same_city_recovery_exhausted");
                 return;
             }
             if let (Some(identity), Some(catalogue)) = (identity, catalogue) {
@@ -1071,24 +1110,21 @@ impl Connections {
                         dashboard.last_error = Some(code.into());
                     }
                 } else {
-                    self.manual_candidates = None;
-                    dashboard.last_error = Some("same_city_recovery_exhausted".into());
+                    self.finish_recovery(owner, dashboard, "same_city_recovery_exhausted");
                 }
             }
             return;
         }
         if let Some((deadline, relays)) = &mut self.recovering {
             if Instant::now() >= *deadline {
-                self.recovering = None;
-                dashboard.last_error = Some("recovery_budget_exhausted".into());
+                self.finish_recovery(owner, dashboard, "recovery_budget_exhausted");
                 return;
             }
             if self.deferred.is_none() {
                 self.deferred = relays.pop_front();
             }
             if self.deferred.is_none() {
-                self.recovering = None;
-                dashboard.last_error = Some("same_city_recovery_exhausted".into());
+                self.finish_recovery(owner, dashboard, "same_city_recovery_exhausted");
                 return;
             }
         }

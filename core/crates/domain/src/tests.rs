@@ -67,6 +67,69 @@ fn seeded() -> State {
     state
 }
 #[test]
+fn terminal_recovery_preserves_intent_and_budget_until_a_real_new_outage() {
+    let mut state = seeded();
+    state.observe(Attachment::Available, 0);
+    state.request_original_rebuild(100).unwrap();
+    let attempt = state
+        .begin_original_rebuild(path("one", "us-sjc", 2), 101)
+        .unwrap();
+    let committed = state.path.clone();
+    let token = state.token();
+    let budget = state.recovery_started;
+    state.finish_recovery(false);
+    assert_eq!(state.stage, Stage::Disconnected);
+    assert_eq!(state.path, committed);
+    assert_eq!(state.city.as_deref(), Some("us-sjc"));
+    assert_eq!(state.token(), token);
+    assert_eq!(state.recovery_started, budget);
+    assert!(!state.candidate_is_current(&attempt, 102));
+    assert!(state.deferred_until.is_none() && state.deferred_stage.is_none());
+    let later = 100 + RECOVERY_BUDGET_MS;
+    for attachment in [Attachment::Unknown, Attachment::Available] {
+        state.observe(attachment, later);
+        assert_eq!(state.tick(later + SETTLE_MS), None);
+        assert_eq!(state.stage, Stage::Disconnected);
+        assert_eq!(state.recovery_started, budget);
+    }
+    state.observe(Attachment::Unavailable, later + SETTLE_MS + 1);
+    state.observe(Attachment::Available, later + SETTLE_MS + 2);
+    let resumed = later + 2 * SETTLE_MS + 2;
+    assert!(matches!(state.tick(resumed), Some(Effect::Verify(_, _))));
+    assert_eq!(state.recovery_started, Some(resumed));
+    assert_eq!(state.tick(resumed + SETTLE_MS), None);
+    assert_eq!(state.path, committed);
+}
+#[test]
+fn retained_worker_requires_fresh_health_before_an_independent_new_budget() {
+    let mut state = seeded();
+    state.observe(Attachment::Available, 0);
+    state.request_original_rebuild(100).unwrap();
+    let expired = 100 + RECOVERY_BUDGET_MS;
+    state.finish_recovery(true);
+    let token = state.token();
+    assert_eq!(state.stage, Stage::VerifyOriginal);
+    assert_eq!(state.readiness, None);
+    assert_eq!(
+        state.request_original_rebuild(expired),
+        Err("recovery_budget_exhausted")
+    );
+    assert_eq!(state.token(), token);
+    assert_eq!(state.recovery_started, Some(100));
+    assert_eq!(
+        state.original_verified(&token, canary(true, true, true), 100, expired, true),
+        Effect::Stale
+    );
+    assert_eq!(state.stage, Stage::VerifyOriginal);
+    assert_eq!(
+        state.original_verified(&token, canary(true, true, true), expired, expired, true),
+        Effect::Preserved(Readiness::Ready)
+    );
+    let later_failure = expired + RECOVERY_BUDGET_MS;
+    state.request_original_rebuild(later_failure).unwrap();
+    assert_eq!(state.recovery_started, Some(later_failure));
+}
+#[test]
 fn later_active_path_failure_gets_a_fresh_recovery_budget() {
     let mut state = seeded();
     state.observe(Attachment::Available, 0);

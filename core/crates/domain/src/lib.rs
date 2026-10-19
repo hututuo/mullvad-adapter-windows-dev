@@ -289,6 +289,9 @@ impl State {
         if !matches!(self.stage, Stage::Idle | Stage::VerifyOriginal) {
             return Err("recovery_busy");
         }
+        if self.stage == Stage::VerifyOriginal && self.budget_expired(now) {
+            return Err("recovery_budget_exhausted");
+        }
         self.operation += 1;
         if self.stage == Stage::Idle {
             // A later, independent outage gets its own budget. Do not inherit
@@ -532,6 +535,24 @@ impl State {
         self.stage = Stage::Idle;
         self.readiness = Some(Readiness::Ready);
         Ok(())
+    }
+    /// The host calls this only after its current I/O operation has drained.
+    /// Preserve the last committed path and exhausted budget as recovery facts;
+    /// a notification alone must not turn this terminal state into fresh work.
+    pub fn finish_recovery(&mut self, retained_worker: bool) {
+        self.candidate = None;
+        self.deferred_until = None;
+        self.deferred_stage = None;
+        self.readiness = None;
+        self.stage = if self.paused {
+            Stage::Waiting
+        } else if retained_worker && self.path.is_some() {
+            // This only permits a new, owned health measurement. It does not
+            // grant readiness or renew the exhausted rebuild budget.
+            Stage::VerifyOriginal
+        } else {
+            Stage::Disconnected
+        };
     }
     pub fn manual_preempt(&mut self) {
         self.operation += 1;

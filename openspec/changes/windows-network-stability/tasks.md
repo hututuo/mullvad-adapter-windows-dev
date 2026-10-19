@@ -8,5 +8,6 @@
 
 - [x] NS-4 official address discovery/cache, DPAPI persistence and credential-free route selection implementation; scoped API/cache tests.
 - [x] NS-5 health classification implementation and domain failure regression.
+- [x] NS-6 terminal recovery retires deferred scheduler work, preserves exhausted budget/original intent, and does not project historical paths as active verification. A confirmed new physical outage may start a new bounded round.
 - [ ] Native Windows new-source runtime/API/Clash and full installer acceptance.
 - [ ] Alternative TCP transport implementation and original Wi-Fi acceptance (requires that network; not implied by SS/UDP hotspot success).

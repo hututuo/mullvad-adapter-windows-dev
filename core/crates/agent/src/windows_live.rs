@@ -646,7 +646,8 @@ pub fn serve(scope: &str) -> io::Result<()> {
             owner.state().attachment,
             owner.state().paused,
             &dashboard.status,
-            owner.state().path.is_some(),
+            owner.state().path.is_some()
+                && owner.state().stage != adapter_domain::Stage::Disconnected,
             binding_changed,
         ) {
             dashboard.status = status.into();
