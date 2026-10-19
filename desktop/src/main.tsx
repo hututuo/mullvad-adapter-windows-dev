@@ -1025,7 +1025,7 @@ function App() {
                     <span>网络恢复后先验证原连接，再按需要同城恢复</span>
                   </label>
                   <p className="hint">
-                    留空时通过系统网络访问官方 HTTPS 接口，不读取环境代理；受限网络可填独立代理。Clash 的 API 路由不能指回本适配器入口。
+                    优先尝试本机已验证地址和官方引导；失败后可用此独立代理，隧道健康时也可辅助访问 API。保留域名和证书校验。Clash 的 API 出口不能指回本适配器。
                   </p>
                   <button className="primary" disabled={busy}>
                     保存设置

@@ -15,6 +15,7 @@ pub enum RecordKind {
     Connection = 4,
     DeviceDraft = 5,
     IdentityBackup = 6,
+    ApiAddresses = 7,
 }
 impl RecordKind {
     pub fn filename(self) -> &'static str {
@@ -25,6 +26,7 @@ impl RecordKind {
             Self::Connection => "connection.dpapi",
             Self::DeviceDraft => "device-draft.dpapi",
             Self::IdentityBackup => "identity-backup.dpapi",
+            Self::ApiAddresses => "api-addresses.dpapi",
         }
     }
 }
@@ -138,6 +140,7 @@ mod tests {
             RecordKind::Connection,
             RecordKind::DeviceDraft,
             RecordKind::IdentityBackup,
+            RecordKind::ApiAddresses,
         ] {
             let valid = encode(kind, b"value").unwrap();
             let borrowed = decode(kind, valid.expose()).unwrap();

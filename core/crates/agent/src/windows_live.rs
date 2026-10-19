@@ -12,8 +12,8 @@ use adapter_engine_mihomo::connection_lifecycle::{
     self, ConnectionResource, FrontConfig, FrontStatus,
 };
 use adapter_mullvad_api::{
-    AccountNumber, AccountSession, AccountSnapshot, BootstrapProxy, DeviceId, MullvadClient,
-    VoucherCode,
+    AccountNumber, AccountSession, AccountSnapshot, ApiAccessRoute, ApiAddressCache,
+    BootstrapProxy, DeviceId, MullvadClient, VoucherCode,
 };
 use adapter_platform::windows_icmp::PingResult;
 use adapter_platform::{
@@ -130,6 +130,7 @@ enum WorkCommand {
 struct ApiJob {
     id: String,
     proxy: u16,
+    healthy_front: u16,
     public_key: Option<String>,
     command: WorkCommand,
 }
@@ -151,12 +152,18 @@ enum ApiValue {
 fn api_worker(
     store: PrivateStore,
     report_root: PathBuf,
+    logs: LogClient,
 ) -> io::Result<(mpsc::SyncSender<ApiJob>, mpsc::Receiver<ApiDone>)> {
     let (send, receive) = mpsc::sync_channel::<ApiJob>(1);
     let (done, results) = mpsc::sync_channel(1);
     thread::Builder::new()
         .name("account-metadata-io".into())
         .spawn(move || {
+            let mut address_cache = store
+                .load(RecordKind::ApiAddresses)
+                .ok()
+                .and_then(|data| ApiAddressCache::decode(data.expose()).ok())
+                .unwrap_or_default();
             let mut session: Option<AccountSession> = None;
             let mut uncertain_mutation = false;
             while let Ok(job) = receive.recv() {
@@ -181,15 +188,37 @@ fn api_worker(
                         uncertain_mutation = false;
                         return Ok(ApiValue::Logout);
                     }
-                    let client = if job.proxy == 0 {
-                        MullvadClient::direct()
-                    } else {
-                        BootstrapProxy::new(
-                            SocketAddrV4::new(Ipv4Addr::LOCALHOST, job.proxy).into(),
-                        )
-                        .and_then(MullvadClient::new)
-                    }
+                    let proxy = |port| {
+                        if port == 0 {
+                            Ok(None)
+                        } else {
+                            BootstrapProxy::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into())
+                                .map(Some)
+                        }
+                    };
+                    let access = MullvadClient::bootstrap(
+                        &address_cache,
+                        proxy(job.proxy).map_err(|e| e.code())?,
+                        proxy(job.healthy_front).map_err(|e| e.code())?,
+                    )
                     .map_err(|e| e.code())?;
+                    address_cache = access.cache;
+                    let _ = logs.event(
+                        "api_access",
+                        match access.route {
+                            ApiAccessRoute::Direct => "direct_verified",
+                            ApiAccessRoute::IndependentProxy => "independent_proxy_verified",
+                            ApiAccessRoute::HealthyTunnel => "healthy_tunnel_verified",
+                        },
+                    );
+                    let persisted = address_cache
+                        .encode()
+                        .map_err(|_| io::Error::other("api_cache_invalid"))
+                        .and_then(|data| store.prepare(RecordKind::ApiAddresses, &data)?.commit());
+                    if persisted.is_err() {
+                        let _ = logs.event("api_access", "cache_write_failed");
+                    }
+                    let client = access.client;
                     match command {
                         AppCommand::RefreshCatalogue => {
                             let bytes = client.fetch_relays().map_err(|e| e.code())?;
@@ -438,8 +467,8 @@ pub fn serve(scope: &str) -> io::Result<()> {
     let observer = ObservedOwner::windows(State::new(boot.clone()))?;
     let mut owner = ResourceOwner::new(observer);
     let commands = ipc_worker(pipe_identity, boot.clone())?;
-    let (api, api_results) = api_worker(store.clone(), root.path().to_owned())?;
     let logs = LogClient::start(root.path().to_owned())?;
+    let (api, api_results) = api_worker(store.clone(), root.path().to_owned(), logs.clone())?;
     logs.event("start", "agent_started")?;
     let mut dashboard = Dashboard {
         sequence: 0,
@@ -908,6 +937,7 @@ pub fn serve(scope: &str) -> io::Result<()> {
                                 let job = ApiJob {
                                     id: operation_id.clone(),
                                     proxy: 0,
+                                    healthy_front: 0,
                                     public_key: None,
                                     command: WorkCommand::Report(Box::new(dashboard.clone())),
                                 };
@@ -984,6 +1014,7 @@ pub fn serve(scope: &str) -> io::Result<()> {
                                 let job = ApiJob {
                                     id: operation_id.clone(),
                                     proxy: 0,
+                                    healthy_front: 0,
                                     public_key: None,
                                     command: WorkCommand::Save(settings),
                                 };
@@ -1008,6 +1039,7 @@ pub fn serve(scope: &str) -> io::Result<()> {
                                 let job = ApiJob {
                                     id: operation_id.clone(),
                                     proxy: 0,
+                                    healthy_front: 0,
                                     public_key: None,
                                     command: WorkCommand::Save(settings),
                                 };
@@ -1269,6 +1301,15 @@ pub fn serve(scope: &str) -> io::Result<()> {
                                 let job = ApiJob {
                                     id: operation_id.clone(),
                                     proxy: dashboard.settings.bootstrap_port.unwrap_or(0),
+                                    healthy_front: if dashboard.front_ready
+                                        && dashboard.readiness.as_deref() == Some("ready")
+                                        && dashboard.active_relay.is_some()
+                                        && dashboard.front_selected != "reject"
+                                    {
+                                        dashboard.settings.front_port
+                                    } else {
+                                        0
+                                    },
                                     public_key: dashboard.public_key.clone(),
                                     command: WorkCommand::Api(command),
                                 };

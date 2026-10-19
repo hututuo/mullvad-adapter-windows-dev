@@ -10,3 +10,9 @@ WHEN a still-owned candidate is cancelled by binding change without a failed rea
 WHEN no explicit bootstrap proxy is configured, THEN connect to the upstream-versioned official API seed with the original HTTPS hostname and normal certificate verification. Do not resolve arbitrary authorities with that seed. Explicit proxy failure never falls back, and mutations are not replayed.
 
 An accepted explicit user intent may wait for physical connectivity until cancelled, disconnected or superseded; it must remain visible and cancellable. The 45-second candidate budget begins only when work starts. A second binding check racing the first must requeue the same accepted relay. An exact relay retries network/stale interruptions only; measured or terminal start failures stop it rather than creating a rapid retry loop.
+
+## NS-4 Verified API address cache and explicit fallback
+WHEN official TLS discovery succeeds, THEN persist a bounded validated address list locally and prioritize the last successful direct address on the next operation. Preserve the official seed. After bounded direct failures, try the explicitly selected independent Clash proxy, then a previously healthy front; bootstrap must never depend on an unestablished tunnel. Cache update/preflight use no credentials. Send the account/device operation only on the selected route and never replay mutations.
+
+## NS-5 Classify health failures
+WHEN IP or HTTPS still succeeds but DNS or a service check fails, THEN preserve the original path with degradation. Local probe errors or stale evidence do not prove a bad relay. Recheck locally; repeated local failure may rebuild the original path, but must not fabricate negative canary evidence or consume another city candidate. Fresh all-data failure may start original-path recovery. Physical binding change requires rebinding the original path. An expired negative candidate result is retried on the same relay within the original budget.

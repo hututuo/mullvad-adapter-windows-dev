@@ -8,6 +8,8 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
+mod bootstrap;
+pub use bootstrap::{ApiAccessRoute, ApiAddressCache, ApiBootstrap};
 
 const ROOT: &str = "https://api.mullvad.net/";
 const DEADLINE: Duration = Duration::from_secs(12);
@@ -397,7 +399,7 @@ struct HttpTransport {
 // Resolve only this exact HTTPS authority. URI, SNI, Host and certificate
 // validation remain api.mullvad.net; no DNS query or mutation replay is needed.
 #[derive(Debug)]
-struct OfficialApiResolver;
+struct OfficialApiResolver(SocketAddr);
 impl ureq::unversioned::resolver::Resolver for OfficialApiResolver {
     fn resolve(
         &self,
@@ -406,7 +408,8 @@ impl ureq::unversioned::resolver::Resolver for OfficialApiResolver {
         _: ureq::unversioned::transport::NextTimeout,
     ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
         let mut addresses = self.empty();
-        addresses.push(official_api_address(uri)?);
+        official_api_address(uri)?;
+        addresses.push(self.0);
         Ok(addresses)
     }
 }
@@ -425,6 +428,15 @@ impl HttpTransport {
         Self::with_proxy(Some(proxy))
     }
     fn with_proxy(proxy: Option<BootstrapProxy>) -> Result<Self, Error> {
+        Self::with_proxy_address(proxy, SocketAddr::from(([45, 83, 223, 196], 443)))
+    }
+    fn with_address(address: SocketAddr) -> Result<Self, Error> {
+        Self::with_proxy_address(None, address)
+    }
+    fn with_proxy_address(
+        proxy: Option<BootstrapProxy>,
+        address: SocketAddr,
+    ) -> Result<Self, Error> {
         let direct = proxy.is_none();
         let proxy = proxy
             .map(|proxy| {
@@ -450,7 +462,7 @@ impl HttpTransport {
                 ureq::Agent::with_parts(
                     config,
                     ureq::unversioned::transport::DefaultConnector::default(),
-                    OfficialApiResolver,
+                    OfficialApiResolver(address),
                 )
             } else {
                 config.new_agent()

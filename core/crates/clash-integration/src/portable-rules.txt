@@ -1,4 +1,5 @@
 DOMAIN,api.mullvad.net,DIRECT
+PROCESS-NAME,adapter-agent.exe,账号与目录出口
 IP-CIDR,45.83.223.196/32,DIRECT,no-resolve
 PROCESS-NAME,tailscaled,远程控制出口
 PROCESS-NAME,tailscaled.exe,远程控制出口

@@ -57,6 +57,7 @@ pub enum Reply {
     Verified { id: u64, proof: Arc<BoundReport> },
     Stopped { id: u64 },
     Unready { id: u64, proof: UnreadyReport },
+    ActiveUnready { id: u64, proof: UnreadyReport },
     Lost { instance: u64 },
     Failed { id: u64, code: &'static str },
 }
@@ -339,13 +340,26 @@ impl Manager {
                         code: "active_worker_missing",
                     });
                 };
-                let proof = held.worker.probe_bound_on(&network);
-                match proof {
+                if !network.is_cancelled() && held.worker.binding() != network.binding() {
+                    return Ok(Reply::Failed {
+                        id,
+                        code: "active_binding_changed",
+                    });
+                }
+                match held.worker.assess_on(&network) {
                     Err(crate::canary_batch::BatchError::Stale) => Ok(Reply::Failed {
                         id,
                         code: "active_evidence_stale",
                     }),
-                    Ok(proof)
+                    Err(crate::canary_batch::BatchError::Cancelled) => Ok(Reply::Failed {
+                        id,
+                        code: "active_probe_cancelled",
+                    }),
+                    Err(crate::canary_batch::BatchError::LocalFailure) => Ok(Reply::Failed {
+                        id,
+                        code: "active_probe_local_failure",
+                    }),
+                    Ok(Assessment::Bound(proof))
                         if !network.is_cancelled() && held.worker.verify_bound_report(&proof) =>
                     {
                         Ok(Reply::Verified {
@@ -353,9 +367,12 @@ impl Manager {
                             proof: Arc::new(proof),
                         })
                     }
+                    Ok(Assessment::Unready(proof)) if !network.is_cancelled() => {
+                        Ok(Reply::ActiveUnready { id, proof })
+                    }
                     _ => Ok(Reply::Failed {
                         id,
-                        code: "active_probe_failed",
+                        code: "active_probe_local_failure",
                     }),
                 }
             }

@@ -33,6 +33,7 @@ pub(crate) struct Connections {
     pending: Option<Pending>,
     next_instance: u64,
     next_health: Instant,
+    local_probe_failures: u8,
     recovering: Option<(Instant, VecDeque<String>)>,
     manual_candidates: Option<(Instant, String, VecDeque<String>, bool)>,
     deferred: Option<String>,
@@ -56,6 +57,7 @@ impl Connections {
                 pending: None,
                 next_instance: 0,
                 next_health: Instant::now(),
+                local_probe_failures: 0,
                 recovering: None,
                 manual_candidates: None,
                 deferred: None,
@@ -283,6 +285,7 @@ impl Connections {
             https: None,
             probes: None,
         });
+        self.local_probe_failures = 0;
         self.pending = Some(Pending {
             ticket,
             attempt: Some(attempt),
@@ -551,7 +554,8 @@ impl Connections {
                 | Reply::Verified { id, .. }
                 | Reply::Stopped { id }
                 | Reply::Failed { id, .. }
-                | Reply::Unready { id, .. } => *id,
+                | Reply::Unready { id, .. }
+                | Reply::ActiveUnready { id, .. } => *id,
                 Reply::Lost { .. } => unreachable!(),
             };
             if id == 0 && matches!(reply, Reply::Stopped { .. }) {
@@ -714,6 +718,7 @@ impl Connections {
                         self.next_health = Instant::now() + Duration::from_secs(3);
                         continue;
                     }
+                    self.local_probe_failures = 0;
                     let ready = owner.is_operation_current(&p.ticket)
                         && proof.fresh_canary().is_some_and(|c| c.alive());
                     let p = self.pending.take().unwrap();
@@ -778,13 +783,54 @@ impl Connections {
                         }
                     }
                 }
+                Reply::ActiveUnready { proof, .. } => {
+                    let current = owner.is_operation_current(&p.ticket);
+                    let canary = proof.failed_canary();
+                    let p = self.pending.take().unwrap();
+                    owner.finish_operation(&p.ticket);
+                    dashboard.operation = None;
+                    dashboard.readiness = None;
+                    if current && canary.is_some() {
+                        self.record(dashboard, "active_data_failed", "failed", canary);
+                        dashboard.last_error = Some("active_data_failed".into());
+                        self.next_health = Instant::now() + Duration::from_secs(15);
+                        if let Some(c) = catalogue {
+                            self.recovery(owner, dashboard, c);
+                        }
+                    } else {
+                        dashboard.last_error = Some("active_evidence_stale".into());
+                        self.next_health = Instant::now() + Duration::from_secs(3);
+                    }
+                }
                 Reply::Unready { proof, .. } => {
-                    self.record(
-                        dashboard,
-                        "candidate_not_ready",
-                        "failed",
-                        proof.failed_canary(),
-                    );
+                    let negative = proof.failed_canary();
+                    if negative.is_none() {
+                        let current = owner.is_operation_current(&p.ticket);
+                        let p = self.pending.take().unwrap();
+                        owner.finish_operation(&p.ticket);
+                        if current {
+                            if let Some(attempt) = &p.attempt {
+                                if automatic {
+                                    self.defer_stale_candidate(attempt.path.relay.clone());
+                                } else {
+                                    self.retry_manual_candidate(attempt.path.relay.clone(), true);
+                                }
+                            }
+                        }
+                        dashboard.operation = None;
+                        dashboard.front_selected = "reject".into();
+                        dashboard.readiness = None;
+                        dashboard.status = if owner.state().paused {
+                            "waiting_network"
+                        } else {
+                            "disconnected"
+                        }
+                        .into();
+                        dashboard.last_error = Some("candidate_evidence_stale".into());
+                        self.record(dashboard, "candidate_evidence_stale", "failed", None);
+                        continue;
+                    }
+                    self.record(dashboard, "candidate_not_ready", "failed", negative);
                     use adapter_control::candidate_evidence::MeasuredEvidence;
                     let now = owner.now();
                     let measured =
@@ -793,7 +839,7 @@ impl Connections {
                     let p = self.pending.take().unwrap();
                     if current {
                         if let (Some(attempt), Some(at), Some(canary)) =
-                            (&p.attempt, measured, proof.failed_canary())
+                            (&p.attempt, measured, negative)
                         {
                             if owner.state().stage == adapter_domain::Stage::RebuildOriginal {
                                 let _ = owner.state_mut().original_rebuilt(
@@ -831,8 +877,12 @@ impl Connections {
                     // recovery/rebind can still explicitly recheck immediately.
                     self.next_health = Instant::now() + Duration::from_secs(15);
                     self.record(dashboard, code, "failed", None);
-                    if code == "active_evidence_stale"
-                        && p.attempt.is_none()
+                    if matches!(
+                        code,
+                        "active_evidence_stale"
+                            | "active_probe_local_failure"
+                            | "active_probe_cancelled"
+                    ) && p.attempt.is_none()
                         && owner.is_operation_current(&p.ticket)
                     {
                         let p = self.pending.take().unwrap();
@@ -843,6 +893,19 @@ impl Connections {
                         // Local evidence expiry proves no relay failure. Keep
                         // the selected worker and retry its measurement only.
                         self.next_health = Instant::now() + Duration::from_secs(3);
+                        if code == "active_probe_local_failure" {
+                            self.local_probe_failures = self.local_probe_failures.saturating_add(1);
+                            if self.local_probe_failures >= 2 {
+                                // DHCP/source/gateway changes can invalidate the
+                                // carrier without changing LUID/index. Rebuild
+                                // the same path, never fabricate relay failure.
+                                self.local_probe_failures = 0;
+                                let _ = self.logs.event("connection", "active_local_rebuild");
+                                if let Some(c) = catalogue {
+                                    self.recovery(owner, dashboard, c);
+                                }
+                            }
+                        }
                         continue;
                     }
                     if p.attempt.is_none() && !owner.is_operation_current(&p.ticket) {

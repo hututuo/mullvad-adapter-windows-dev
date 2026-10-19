@@ -190,7 +190,7 @@ mod tests {
         assert_eq!(c["proxy-groups"][2]["proxies"], json!(["DIRECT"]));
         assert_eq!(c["rules"][0], format!("DOMAIN,api.mullvad.net,{API}"));
         assert_eq!(
-            c["rules"][1],
+            c["rules"][2],
             format!("IP-CIDR,45.83.223.196/32,{API},no-resolve")
         );
         assert!(p.summary.rule_count > 8000);
