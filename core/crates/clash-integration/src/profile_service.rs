@@ -201,6 +201,10 @@ fn request_path<'a>(header: &'a str, token: &str, port: u16) -> Option<&'a str> 
     (host && digest(fingerprint)).then_some(fingerprint)
 }
 fn serve(stream: &mut TcpStream, store: &Path, token: &str, port: u16) -> std::io::Result<()> {
+    // Darwin may inherit the listener's nonblocking flag on accepted sockets.
+    // This dedicated I/O thread uses bounded blocking reads, never WouldBlock
+    // as an implicit rejection before the client has sent its request.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let mut header = Vec::new();
@@ -279,6 +283,8 @@ mod tests {
         let port = s.record.port;
         let get = |s: &Service| {
             let mut c = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, s.record.port)).unwrap();
+            // Cover accept-before-client-write, including Darwin flag inheritance.
+            thread::sleep(Duration::from_millis(20));
             write!(
                 c,
                 "GET /{}/{}.yaml HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
