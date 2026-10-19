@@ -11,11 +11,15 @@ jobs:
     timeout-minutes: 30
     env:
       RUSTFLAGS: '-C target-feature=+crt-static'
+      CARGO_HOME: 'D:\c'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
+      - name: Allow long upstream source paths on disposable runner
+        run: git config --global core.longpaths true
       - name: Test isolated component
         run: cargo test --manifest-path tools/official-quic-bridge/Cargo.toml --locked --target x86_64-pc-windows-msvc
       - name: Build isolated component
