@@ -325,6 +325,19 @@ impl ResourceOwner {
                 .as_ref()
                 .map_or(true, |a| self.state().candidate_is_current(a, now))
     }
+    /// Classify network invalidation before cancelling/draining the exact ticket.
+    /// This never grants authority or treats user/identity preemption as a retry.
+    pub fn operation_binding_changed(&self, ticket: &OperationTicket) -> bool {
+        self.operation.as_ref().is_some_and(|op| {
+            op.id == ticket.id
+                && op.worker_instance == ticket.worker_instance
+                && op.token == ticket.token
+                && Arc::ptr_eq(&op.cancel.0, &ticket.monitor.cancel.0)
+                && self.state().current(&op.token)
+                && self.observation.now() < op.deadline
+                && self.observation.binding_evidence().as_ref() != Some(&op.binding)
+        })
+    }
     pub fn is_operation_current(&self, ticket: &OperationTicket) -> bool {
         self.operation.as_ref().is_some_and(|op| {
             op.id == ticket.id
@@ -1607,6 +1620,11 @@ mod tests {
                 ),
             }
             assert!(!owner.is_operation_current(&ticket));
+            assert_eq!(
+                owner.operation_binding_changed(&ticket),
+                change == 2,
+                "only still-owned network invalidation may retain the candidate"
+            );
             owner.poll();
             assert!(network.is_cancelled());
             assert!(owner.begin_operation(binding, 3, None).is_err());

@@ -23,19 +23,19 @@ final class MainWindowDockPresence {
         stopObserving()
         mainWindow = window
         visibility = window.observe(\.isVisible, options: [.new]) { [weak self] _, _ in
-            Task { @MainActor in self?.reconcile() }
+            Task { @MainActor [weak self] in self?.reconcile() }
         }
         miniaturization = window.observe(\.isMiniaturized, options: [.new]) { [weak self] _, _ in
-            Task { @MainActor in self?.reconcile() }
+            Task { @MainActor [weak self] in self?.reconcile() }
         }
         for name in [NSWindow.didBecomeKeyNotification, NSWindow.didBecomeMainNotification,
                      NSWindow.didChangeOcclusionStateNotification, NSWindow.didDeminiaturizeNotification] {
             notifications.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
-                Task { @MainActor in self?.reconcile() }
+                Task { @MainActor [weak self] in self?.reconcile() }
             })
         }
         notifications.append(NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.apply(.accessory) }
+            Task { @MainActor [weak self] in self?.apply(.accessory) }
         })
         DispatchQueue.main.async { [weak self] in self?.reconcile() }
     }

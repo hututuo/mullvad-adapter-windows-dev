@@ -392,11 +392,40 @@ struct HttpTransport {
     agent: ureq::Agent,
 }
 
+// Official 2026.5 compile-time API endpoint, not relay/device metadata:
+// https://github.com/mullvad/mullvadvpn-app/blob/2026.5/mullvad-api/mullvad-api-constants/src/lib.rs
+// Resolve only this exact HTTPS authority. URI, SNI, Host and certificate
+// validation remain api.mullvad.net; no DNS query or mutation replay is needed.
+#[derive(Debug)]
+struct OfficialApiResolver;
+impl ureq::unversioned::resolver::Resolver for OfficialApiResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        _: &ureq::config::Config,
+        _: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        let mut addresses = self.empty();
+        addresses.push(official_api_address(uri)?);
+        Ok(addresses)
+    }
+}
+fn official_api_address(uri: &ureq::http::Uri) -> Result<SocketAddr, ureq::Error> {
+    if uri.scheme_str() != Some("https")
+        || uri.host() != Some("api.mullvad.net")
+        || uri.port_u16().is_some_and(|port| port != 443)
+    {
+        return Err(ureq::Error::HostNotFound);
+    }
+    Ok(SocketAddr::from(([45, 83, 223, 196], 443)))
+}
+
 impl HttpTransport {
     fn new(proxy: BootstrapProxy) -> Result<Self, Error> {
         Self::with_proxy(Some(proxy))
     }
     fn with_proxy(proxy: Option<BootstrapProxy>) -> Result<Self, Error> {
+        let direct = proxy.is_none();
         let proxy = proxy
             .map(|proxy| {
                 ureq::Proxy::new(&format!("http://{}", proxy.0)).map_err(|_| Error::InvalidProxy)
@@ -417,7 +446,15 @@ impl HttpTransport {
             .timeout_connect(Some(ACCOUNT_READ_DEADLINE))
             .build();
         Ok(Self {
-            agent: config.new_agent(),
+            agent: if direct {
+                ureq::Agent::with_parts(
+                    config,
+                    ureq::unversioned::transport::DefaultConnector::default(),
+                    OfficialApiResolver,
+                )
+            } else {
+                config.new_agent()
+            },
         })
     }
 }
@@ -1213,6 +1250,24 @@ mod tests {
             "01234567-89ab-cdef-0123-456789abcdeg",
         ] {
             assert!(DeviceId::new(value.into()).is_err());
+        }
+    }
+
+    #[test]
+    fn direct_bootstrap_replaces_dns_without_rewriting_tls_authority() {
+        let uri: ureq::http::Uri = (ROOT.to_owned() + "app/v1/relays").parse().unwrap();
+        assert_eq!(
+            official_api_address(&uri).unwrap(),
+            "45.83.223.196:443".parse().unwrap()
+        );
+        assert_eq!(uri.host(), Some("api.mullvad.net"));
+        for wrong in [
+            "http://api.mullvad.net/",
+            "https://api.mullvad.net:444/",
+            "https://api.mullvad.net.evil.invalid/",
+            "https://45.83.223.196/",
+        ] {
+            assert!(official_api_address(&wrong.parse().unwrap()).is_err());
         }
     }
 

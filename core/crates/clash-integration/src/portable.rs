@@ -142,6 +142,10 @@ pub fn generate(source: Option<&Value>, front: u16, selection: &Selection) -> Re
         .map(|line| {
             if line == "DOMAIN,api.mullvad.net,DIRECT" {
                 format!("DOMAIN,api.mullvad.net,{API}")
+            } else if line == "IP-CIDR,45.83.223.196/32,DIRECT,no-resolve" {
+                // Direct bootstrap uses a literal socket while retaining TLS SNI.
+                // TUN must not route it through the business tunnel it bootstraps.
+                format!("IP-CIDR,45.83.223.196/32,{API},no-resolve")
             } else {
                 line.to_owned()
             }
@@ -185,6 +189,10 @@ mod tests {
         assert_eq!(c["proxy-groups"][1]["proxies"][0], NODE);
         assert_eq!(c["proxy-groups"][2]["proxies"], json!(["DIRECT"]));
         assert_eq!(c["rules"][0], format!("DOMAIN,api.mullvad.net,{API}"));
+        assert_eq!(
+            c["rules"][1],
+            format!("IP-CIDR,45.83.223.196/32,{API},no-resolve")
+        );
         assert!(p.summary.rule_count > 8000);
     }
     #[test]

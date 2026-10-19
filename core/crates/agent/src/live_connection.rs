@@ -24,6 +24,7 @@ struct Pending {
     automatic: bool,
     rejected: Option<(u64, adapter_domain::Canary)>,
     retry_stale: bool,
+    retry_network: bool,
 }
 pub(crate) struct Connections {
     pub(crate) client: connection_tunnel::Client,
@@ -33,7 +34,7 @@ pub(crate) struct Connections {
     next_instance: u64,
     next_health: Instant,
     recovering: Option<(Instant, VecDeque<String>)>,
-    manual_candidates: Option<(Instant, String, VecDeque<String>)>,
+    manual_candidates: Option<(Instant, String, VecDeque<String>, bool)>,
     deferred: Option<String>,
     last_relay: Option<String>,
     disconnecting: bool,
@@ -109,7 +110,10 @@ impl Connections {
         if self.pending.is_some() {
             return Err("operation_busy");
         }
-        if owner.state().paused || owner.state().attachment != Attachment::Available {
+        if owner.state().paused
+            || owner.state().attachment != Attachment::Available
+            || !owner.observation().binding_settled()
+        {
             return Err("waiting_network");
         }
         if dashboard.settings.required_multihop || dashboard.settings.required_pq {
@@ -254,21 +258,18 @@ impl Connections {
             owner.finish_operation(&ticket);
             return Err("tunnel_command_busy");
         }
-        if !automatic && relay.is_none() {
+        if !automatic {
             let alternatives = catalogue
                 .active_in_city(&attempt.path.city)
                 .filter(|r| {
-                    r.hostname() != picked.hostname()
+                    relay.is_none()
+                        && r.hostname() != picked.hostname()
                         && catalogue.shadowsocks_inlet(r, None).is_some()
                 })
                 .take(2)
                 .map(|r| r.hostname().to_owned())
                 .collect();
-            self.manual_candidates = Some((
-                Instant::now() + Duration::from_millis(adapter_domain::RECOVERY_BUDGET_MS),
-                attempt.path.city.clone(),
-                alternatives,
-            ));
+            self.seed_manual_candidates(attempt.path.city.clone(), alternatives, relay.is_some());
         }
         dashboard.connection = Some(ConnectionInfo {
             relay: attempt.path.relay.clone(),
@@ -290,6 +291,7 @@ impl Connections {
             automatic,
             rejected: None,
             retry_stale: false,
+            retry_network: false,
         });
         dashboard.active_relay = None;
         dashboard.operation = Some(
@@ -362,6 +364,7 @@ impl Connections {
         owner.cancel_current_operation();
         if let Some(pending) = &mut self.pending {
             pending.retry_stale |= code == "candidate_evidence_stale";
+            pending.retry_network |= code == "network_binding_changed";
             if self
                 .client
                 .submit(Command::Abort {
@@ -402,6 +405,36 @@ impl Connections {
         dashboard.status = "disconnecting".into();
         dashboard.readiness = None;
         Ok(())
+    }
+    fn seed_manual_candidates(
+        &mut self,
+        city: String,
+        alternatives: VecDeque<String>,
+        exact: bool,
+    ) {
+        // An exact relay has no alternatives, but still owns a bounded retry
+        // intent. Scheduler retries must not refill its queue or renew its budget.
+        self.manual_candidates.get_or_insert_with(|| {
+            (
+                Instant::now() + Duration::from_millis(adapter_domain::RECOVERY_BUDGET_MS),
+                city,
+                alternatives,
+                exact,
+            )
+        });
+    }
+    fn retry_manual_candidate(&mut self, relay: String, retry_exact: bool) {
+        if let Some((_, _, queue, exact)) = &mut self.manual_candidates {
+            if *exact && !retry_exact {
+                // Explicit selection retries network/stale interruption only;
+                // a real measurement/start failure must not spin the same node.
+                self.manual_candidates = None;
+                return;
+            }
+            queue.push_front(relay);
+            self.next_attempt =
+                Instant::now() + Duration::from_millis(adapter_domain::LOCAL_RETRY_MS);
+        }
     }
     fn defer_stale_candidate(&mut self, relay: String) {
         // Do not pop the next city candidate or renew its recovery budget.
@@ -460,7 +493,7 @@ impl Connections {
             return;
         }
         if restored {
-            if let Some((deadline, _, _)) = &mut self.manual_candidates {
+            if let Some((deadline, _, _, _)) = &mut self.manual_candidates {
                 *deadline =
                     Instant::now() + Duration::from_millis(adapter_domain::RECOVERY_BUDGET_MS);
             }
@@ -480,7 +513,12 @@ impl Connections {
         if let Some(pending) = &self.pending {
             if !pending.aborting && !owner.is_operation_current(&pending.ticket) {
                 if pending.attempt.is_some() {
-                    self.abort(owner, "connection_cancelled", dashboard);
+                    let code = if owner.operation_binding_changed(&pending.ticket) {
+                        "network_binding_changed"
+                    } else {
+                        "connection_cancelled"
+                    };
+                    self.abort(owner, code, dashboard);
                 }
                 // A health probe uses its own cancellable operation. The selected
                 // worker survives cancellation; wait for the probe reply to drain.
@@ -778,6 +816,13 @@ impl Connections {
                     dashboard.last_error = Some("candidate_not_ready".into());
                     if !automatic {
                         self.recovering = None;
+                        if self
+                            .manual_candidates
+                            .as_ref()
+                            .is_some_and(|(_, _, _, exact)| *exact)
+                        {
+                            self.manual_candidates = None;
+                        }
                         owner.state_mut().manual_preempt();
                     }
                 }
@@ -824,12 +869,11 @@ impl Connections {
                         dashboard.active_relay = None;
                     }
                     if !automatic {
-                        if let (Some((_, _, queue)), Some(attempt)) =
-                            (&mut self.manual_candidates, &p.attempt)
-                        {
-                            queue.push_front(attempt.path.relay.clone());
-                            self.next_attempt = Instant::now()
-                                + Duration::from_millis(adapter_domain::LOCAL_RETRY_MS);
+                        if let Some(attempt) = &p.attempt {
+                            self.retry_manual_candidate(
+                                attempt.path.relay.clone(),
+                                code == "candidate_evidence_stale",
+                            );
                         }
                     }
                     if automatic && owner.state().stage == adapter_domain::Stage::RebuildOriginal {
@@ -872,7 +916,7 @@ impl Connections {
                     let p = self.pending.take().unwrap();
                     let now = owner.now();
                     if automatic
-                        && p.retry_stale
+                        && (p.retry_stale || p.retry_network)
                         && p.attempt
                             .as_ref()
                             .is_some_and(|attempt| owner.state().candidate_is_current(attempt, now))
@@ -880,12 +924,11 @@ impl Connections {
                         self.defer_stale_candidate(p.attempt.as_ref().unwrap().path.relay.clone());
                     }
                     if !automatic && p.rejected.is_none() {
-                        if let (Some((_, _, queue)), Some(attempt)) =
-                            (&mut self.manual_candidates, &p.attempt)
-                        {
-                            queue.push_front(attempt.path.relay.clone());
-                            self.next_attempt = Instant::now()
-                                + Duration::from_millis(adapter_domain::LOCAL_RETRY_MS);
+                        if let Some(attempt) = &p.attempt {
+                            self.retry_manual_candidate(
+                                attempt.path.relay.clone(),
+                                p.retry_network || p.retry_stale,
+                            );
                         }
                     }
                     if automatic && owner.state().stage == adapter_domain::Stage::RebuildOriginal {
@@ -934,6 +977,7 @@ impl Connections {
         if self.pending.is_some()
             || owner.state().paused
             || owner.state().attachment != Attachment::Available
+            || !owner.observation().binding_settled()
             || dashboard.operation.is_some()
         {
             return;
@@ -941,7 +985,7 @@ impl Connections {
         if Instant::now() < self.next_attempt {
             return;
         }
-        if let Some((deadline, city, queue)) = &mut self.manual_candidates {
+        if let Some((deadline, city, queue, _)) = &mut self.manual_candidates {
             if Instant::now() >= *deadline
                 || dashboard.settings.selected_city.as_ref() != Some(city)
             {
@@ -955,7 +999,7 @@ impl Connections {
                         self.connect(owner, dashboard, identity, catalogue, Some(&relay), false)
                     {
                         if code != "relay_not_active" {
-                            if let Some((_, _, queue)) = &mut self.manual_candidates {
+                            if let Some((_, _, queue, _)) = &mut self.manual_candidates {
                                 queue.push_front(relay);
                             }
                             self.next_attempt = Instant::now()
@@ -1047,6 +1091,7 @@ impl Connections {
                         automatic: true,
                         rejected: None,
                         retry_stale: false,
+                        retry_network: false,
                     });
                     let _ = self.logs.event("connection", "probing");
                 } else {
@@ -1060,6 +1105,49 @@ impl Connections {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    #[test]
+    fn exact_manual_intent_has_no_fallback_and_retries_do_not_renew_it() {
+        let root =
+            std::env::temp_dir().join(format!("mullvad-exact-intent-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let logs = crate::live_diagnostics::LogClient::start(root.clone()).unwrap();
+        let (mut c, _mailbox) = Connections::new(root, logs);
+        c.seed_manual_candidates("city".into(), VecDeque::new(), true);
+        let (deadline, city, queue, _) = c.manual_candidates.as_mut().unwrap();
+        assert_eq!(city, "city");
+        assert!(
+            queue.is_empty(),
+            "explicit selection must not choose another relay"
+        );
+        *deadline = Instant::now() - Duration::from_millis(1);
+        let expired = *deadline;
+        queue.push_front("exact-relay".into());
+        c.seed_manual_candidates(
+            "other-city".into(),
+            VecDeque::from(["other-relay".into()]),
+            false,
+        );
+        let (deadline, city, queue, _) = c.manual_candidates.as_ref().unwrap();
+        assert_eq!(*deadline, expired);
+        assert_eq!(city, "city");
+        assert_eq!(queue, &VecDeque::from(["exact-relay".to_string()]));
+        c.retry_manual_candidate("exact-relay".into(), false);
+        assert!(
+            c.manual_candidates.is_none(),
+            "measured/start failure stops exact retry"
+        );
+        c.seed_manual_candidates("city".into(), VecDeque::new(), true);
+        let budget = c.manual_candidates.as_ref().unwrap().0;
+        c.retry_manual_candidate("exact-relay".into(), true);
+        assert_eq!(c.manual_candidates.as_ref().unwrap().0, budget);
+        assert_eq!(
+            c.manual_candidates.as_ref().unwrap().2,
+            VecDeque::from(["exact-relay".to_string()])
+        );
+        c.begin_user_selection();
+        assert!(c.manual_candidates.is_none());
+    }
+
     #[test]
     fn stale_candidate_keeps_next_city_candidates_and_original_budget_until_user_preempts() {
         let root = std::env::temp_dir().join(format!(

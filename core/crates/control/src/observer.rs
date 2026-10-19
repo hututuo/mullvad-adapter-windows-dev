@@ -218,6 +218,7 @@ pub struct ObservedOwner {
     clock: Clock,
     bindings: Vec<PhysicalBinding>,
     continuity: u64,
+    stable_since: Option<u64>,
 }
 impl ObservedOwner {
     pub(crate) fn now(&self) -> u64 {
@@ -267,6 +268,7 @@ impl ObservedOwner {
             clock,
             bindings: vec![],
             continuity: 0,
+            stable_since: None,
         })
     }
     #[cfg(any(windows, feature = "windows-api-check"))]
@@ -300,6 +302,14 @@ impl ObservedOwner {
     }
     pub fn bindings(&self) -> &[PhysicalBinding] {
         &self.bindings
+    }
+    /// Fresh binding evidence is not yet proof that a changed attachment has
+    /// settled. Keep cancellation immediate, but delay new product tunnel I/O.
+    pub fn binding_settled(&self) -> bool {
+        self.stable_since.is_some_and(|since| {
+            let now = (self.clock)();
+            now >= since && now - since >= adapter_domain::SETTLE_MS
+        }) && self.binding_evidence().is_some()
     }
     pub fn stamp(&self) -> Option<ObservationStamp> {
         self.binding_evidence().map(ObservationStamp)
@@ -352,6 +362,7 @@ impl ObservedOwner {
             // gap. Saturation permanently closes the bound-evidence gate.
             self.continuity = self.continuity.saturating_add(1);
             self.bindings.clear();
+            self.stable_since = None;
             self.state.observe(Attachment::Unknown, now);
         }
         if let Some(mut observation) = update.observation {
@@ -370,6 +381,11 @@ impl ObservedOwner {
             };
             if attachment != Attachment::Available || self.bindings != observation.bindings {
                 self.continuity = self.continuity.saturating_add(1);
+                self.stable_since = if attachment == Attachment::Available {
+                    Some(now)
+                } else {
+                    None
+                };
             }
             self.bindings = observation.bindings;
             self.state.observe(attachment, now);
@@ -830,6 +846,56 @@ mod tests {
         assert_eq!(owner.state().epoch, 0);
         assert!(!owner.state().paused);
     }
+    #[test]
+    fn available_binding_changes_must_settle_without_fabricating_an_outage() {
+        let (now, clock) = clock();
+        let index = Arc::new(AtomicU64::new(2));
+        let read = index.clone();
+        let mut owner = ObservedOwner::with_clock(
+            State::new("settle".into()),
+            move || {
+                let mut result = observation(1);
+                result.bindings[0].index = read.load(Ordering::SeqCst) as u32;
+                result
+            },
+            clock,
+        )
+        .unwrap();
+        drain(&mut owner, 1);
+        assert!(!owner.binding_settled());
+        for at in [500, 1000, 1500, 2000] {
+            sample_at(&mut owner, &now, at);
+        }
+        assert!(owner.binding_settled());
+        index.store(3, Ordering::SeqCst);
+        sample_at(&mut owner, &now, 2500);
+        assert!(!owner.binding_settled());
+        index.store(4, Ordering::SeqCst);
+        sample_at(&mut owner, &now, 3000);
+        for at in [3500, 4000, 4500] {
+            sample_at(&mut owner, &now, at);
+            assert!(!owner.binding_settled());
+        }
+        sample_at(&mut owner, &now, 5000);
+        assert!(owner.binding_settled());
+        assert_eq!(owner.bindings()[0].index, 4);
+        assert_eq!(owner.state().epoch, 0);
+        assert!(!owner.state().paused);
+        owner.change_hint().notify();
+        assert!(!owner.binding_settled());
+        sample_at(&mut owner, &now, 5500);
+        assert!(!owner.binding_settled());
+        for at in [6000, 6500, 7000, 7500] {
+            sample_at(&mut owner, &now, at);
+        }
+        assert!(owner.binding_settled());
+        now.store(9500, Ordering::SeqCst);
+        assert!(
+            !owner.binding_settled(),
+            "stale sampling never authorizes I/O"
+        );
+    }
+
     #[test]
     fn exhausted_continuity_counter_never_reauthorizes_bound_evidence() {
         let (_now, clock) = clock();

@@ -49,6 +49,8 @@ struct PendingQuick {
     automatic: bool,
     progress: QuickTestState,
 }
+// Explicit user intent waits for physical connectivity until cancelled or
+// preempted. The recovery budget starts when tunnel work can actually begin.
 struct QueuedConnect {
     relay: Option<String>,
 }
@@ -716,7 +718,7 @@ pub fn serve(scope: &str) -> io::Result<()> {
         // User intent preempts automatic ICMP maintenance, but cancellation is
         // not completion: keep the owner occupied until every native call has
         // returned and the Finished receipt above releases its ticket.
-        if quick.is_none() {
+        if quick.is_none() && owner.observation().binding_settled() && !owner.state().paused {
             if let Some(intent) = queued_connect.take() {
                 dashboard.operation = None;
                 let result = match (identity.as_ref(), catalogue.as_ref()) {
@@ -732,8 +734,22 @@ pub fn serve(scope: &str) -> io::Result<()> {
                     (_, None) => Err("metadata_missing"),
                 };
                 if let Err(code) = result {
-                    dashboard.last_error = Some(code.into());
-                    logs.event("connection", code)?;
+                    if code == "waiting_network" {
+                        // A notification may race the outer stability check.
+                        // The accepted user intent remains cancellable and exact.
+                        queued_connect = Some(intent);
+                        dashboard.operation = Some("connect".into());
+                        dashboard.status = "waiting_network".into();
+                    } else {
+                        dashboard.status = if dashboard.active_relay.is_some() {
+                            "connected"
+                        } else {
+                            "disconnected"
+                        }
+                        .into();
+                        dashboard.last_error = Some(code.into());
+                        logs.event("connection", code)?;
+                    }
                 }
             }
         }
@@ -1050,18 +1066,30 @@ pub fn serve(scope: &str) -> io::Result<()> {
                                 (identity.as_ref(), catalogue.as_ref())
                             {
                                 connections.begin_user_selection();
-                                match connections.connect(
-                                    &mut owner,
-                                    &mut dashboard,
-                                    identity,
-                                    catalogue,
-                                    relay,
-                                    false,
-                                ) {
-                                    Ok(operation_id) => AppReply::Accepted { operation_id },
-                                    Err(code) => {
-                                        dashboard.last_error = Some(code.into());
-                                        failure(code)
+                                if !owner.observation().binding_settled() || owner.state().paused {
+                                    let operation_id = boot_id()?;
+                                    queued_connect = Some(QueuedConnect {
+                                        relay: relay.map(str::to_owned),
+                                    });
+                                    dashboard.operation = Some("connect".into());
+                                    dashboard.status = "waiting_network".into();
+                                    dashboard.last_error = None;
+                                    logs.event("connection", "waiting_network_settle")?;
+                                    AppReply::Accepted { operation_id }
+                                } else {
+                                    match connections.connect(
+                                        &mut owner,
+                                        &mut dashboard,
+                                        identity,
+                                        catalogue,
+                                        relay,
+                                        false,
+                                    ) {
+                                        Ok(operation_id) => AppReply::Accepted { operation_id },
+                                        Err(code) => {
+                                            dashboard.last_error = Some(code.into());
+                                            failure(code)
+                                        }
                                     }
                                 }
                             } else {
@@ -1176,6 +1204,12 @@ pub fn serve(scope: &str) -> io::Result<()> {
                             if queued_connect.take().is_some() {
                                 owner.cancel_current_operation();
                                 dashboard.operation = None;
+                                dashboard.status = if dashboard.active_relay.is_some() {
+                                    "connected"
+                                } else {
+                                    "disconnected"
+                                }
+                                .into();
                                 AppReply::Accepted {
                                     operation_id: "queued-connection-cancel".into(),
                                 }
