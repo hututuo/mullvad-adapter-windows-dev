@@ -20,11 +20,11 @@ param(
 $ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$OutputEncoding=[Console]::OutputEncoding
 $diag=$DiagnosticRoot
-$problem='';$stage='preflight';$bytes=$null;$payload=$null;$login=$null;$config=$null;$wg=$null
+$stage='preflight';$bytes=$null;$payload=$null;$login=$null;$config=$null;$wg=$null
 $lease=$null;$p=$null;$started=$false;$out=$null;$err=$null;$clashBefore=$null
 $id=[Guid]::NewGuid().ToString('N')
 $receipt=[ordered]@{component_only=$true;mode=$Mode;relay=$Relay;port=$Port;receipt_id=$id;time_utc=[DateTimeOffset]::UtcNow.ToString('o');outcome='FAIL';error=$null;probes=@();owned_engine_stop=$true;public_engine_signal_counters=@{};bound_carrier_acceptance='NOT_RUN';product_readiness='NOT_RUN'}
-function Require($condition,[string]$code){if(!$condition){$script:problem=$code;throw 'matrix_guard'}}
+function Require($condition,[string]$code){if(!$condition){$failure=[InvalidOperationException]::new('tunnel_path_guard');$failure.Data['TunnelPathCode']=$code;throw $failure}}
 function Read-Json([string]$path){Require ((Get-Item -LiteralPath $path).Length -le 8388608) 'input_cap';return ([IO.File]::ReadAllText($path,[Text.Encoding]::UTF8)|ConvertFrom-Json)}
 function Public-V4($value){
  $ip=$null;if(![Net.IPAddress]::TryParse([string]$value,[ref]$ip)){return $false}
@@ -56,14 +56,21 @@ function Assert-ClashIndependent {
  Require ($owner.Path -eq 'C:\Program Files\Clash Verge\verge-mihomo.exe' -and $owner.SessionId -eq [Diagnostics.Process]::GetCurrentProcess().SessionId) 'clash_listener_owner'
  $reply=Invoke-FriendClash '/proxies';$map=$reply.proxies
  Require ($null -ne $map) 'clash_proxies_schema'
+ $providerNodes=$null
  # ASCII source remains safe under Windows PowerShell 5's default file decoding.
  $name=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('5pmu6YCa5aSW572R5Ye65Y+j'))
- $seen=@{};$path=@();$leaf=$null
+ $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal);$path=@();$leaf=$null
  for($i=0;$i -lt 16;$i++){
-  Require ($name -and !$seen.ContainsKey($name) -and $name -notmatch '(?i)mullvad' -and $name -notin @('DIRECT','REJECT','GLOBAL')) 'clash_graph_loop_or_adapter'
-  $seen[$name]=$true;$prop=$map.PSObject.Properties[$name];Require ($null -ne $prop) 'clash_graph_unknown'
-  $node=$prop.Value;$type=([string]$node.type).ToLowerInvariant();$path+=($name+'|'+$type+'|'+[string]$node.now)
-  if($type -in @('selector','select','urltest','fallback')){Require ([string]$node.now -and @($node.all) -contains [string]$node.now) 'clash_graph_selection';$name=[string]$node.now;continue}
+  Require ($name -and !$seen.Contains($name) -and $name -notmatch '(?i)mullvad' -and $name -notin @('DIRECT','REJECT','GLOBAL')) 'clash_graph_loop_or_adapter'
+  [void]$seen.Add($name);$matches=@($map.PSObject.Properties|Where-Object {$_.Name -ceq $name})
+  if($matches.Count -eq 1){$node=$matches[0].Value}else{
+   Require ($matches.Count -eq 0) 'clash_graph_ambiguous'
+   if($null -eq $providerNodes){$providers=Invoke-FriendClash '/providers/proxies';Require ($null -ne $providers.providers) 'clash_providers_schema';$providerNodes=@(foreach($provider in @($providers.providers.PSObject.Properties)){foreach($candidate in @($provider.Value.proxies)){$candidate}});Require ($providerNodes.Count -le 16384) 'clash_catalogue_cap'}
+   $matches=@($providerNodes|Where-Object {[string]$_.name -ceq $name});Require ($matches.Count -gt 0) 'clash_graph_unknown';Require ($matches.Count -eq 1) 'clash_graph_ambiguous';$node=$matches[0]
+  }
+  Require ([string]$node.name -ceq $name) 'clash_node_name_mismatch'
+  $type=([string]$node.type).ToLowerInvariant();$path+=($name+'|'+$type+'|'+[string]$node.now+'|'+[string]$node.'provider-name')
+  if($type -in @('selector','select','urltest','fallback')){Require ([string]$node.now -and @($node.all) -ccontains [string]$node.now) 'clash_graph_selection';$name=[string]$node.now;continue}
   Require ($type -in @('vmess','vless','trojan','shadowsocks','ss')) 'clash_leaf_not_independent'
   foreach($field in @('dialer-proxy','underlying-proxy')){Require (![string]$node.$field) 'clash_leaf_chained'}
   if($node.server){$addr=$null;$s=[string]$node.server;Require ($s -notmatch '(?i)(^localhost$|\.localhost$)') 'clash_leaf_loopback';if([Net.IPAddress]::TryParse($s,[ref]$addr)){Require (![Net.IPAddress]::IsLoopback($addr) -and !$addr.Equals([Net.IPAddress]::Any) -and !$addr.Equals([Net.IPAddress]::IPv6Any)) 'clash_leaf_loopback'}}
@@ -108,7 +115,7 @@ try{
  $hash=[Security.Cryptography.SHA256]::Create();try{$fp=([BitConverter]::ToString($hash.ComputeHash($pubBytes))).Replace('-','').ToLowerInvariant()}finally{$hash.Dispose()}
  $created=$false;$lease=[Threading.Mutex]::new($false,('Global\MullvadAdapter.Peer.'+$fp),[ref]$created);Require $created 'peer_lease_exists'
  Assert-Idle $public.public_key;$receipt.identity_match=$true
- if($Mode -eq 'clash'){$clashBefore=Assert-ClashIndependent;$receipt.clash_leaf_type=$clashBefore.leaf_type}
+ if($Mode -eq 'clash'){$stage='clash_preflight';$clashBefore=Assert-ClashIndependent;$receipt.clash_leaf_type=$clashBefore.leaf_type}
  $stage='catalogue';$c=Read-Json (Join-Path $env:LOCALAPPDATA ('MullvadAdapter-'+$Scope+'\relays.json'))
  $relays=@($c.wireguard.relays|Where-Object {$_.hostname -ceq $Relay -and $_.active -eq $true});Require ($relays.Count -eq 1) 'relay_not_uniquely_active';$r=$relays[0]
  Require (Public-V4 $r.ipv4_addr_in) 'relay_ipv4_invalid';$relayKey=[Convert]::FromBase64String($r.public_key);Require ($relayKey.Length -eq 32) 'relay_key_invalid'
@@ -140,7 +147,11 @@ try{
  foreach($test in @(@('literal_ip','https://1.1.1.1/cdn-cgi/trace',200),@('hostname','https://www.gstatic.com/generate_204',204))){$receipt.probes+=@(Probe $test[0] $test[1] $test[2]);Assert-OwnedListeners}
  if($Mode -eq 'clash'){$after=Assert-ClashIndependent;Require ($after.signature -ceq $clashBefore.signature) 'clash_selection_changed'}
  if(@($receipt.probes|Where-Object {!$_.pass}).Count -eq 0){$receipt.outcome='COMPONENT_PASS';if($ExitCheck){$receipt.exit_check=Probe 'mullvad_exit' 'https://am.i.mullvad.net/json' 200 -Body}}
-}catch{if($problem){$receipt.error=$problem}else{$receipt.error=$stage+'_failed'};$receipt.outcome='FAIL'}finally{
+}catch{
+ $failure=$_.Exception;$closedCode=$null
+ for($i=0;$i -lt 8 -and $null -ne $failure;$i++){if([string]$failure.Data['TunnelPathCode'] -cmatch '^[a-z][a-z0-9_]{0,63}$'){$closedCode=[string]$failure.Data['TunnelPathCode'];break};$failure=$failure.InnerException}
+ if($closedCode){$receipt.error=$closedCode}else{$receipt.error=$stage+'_failed'};$receipt.outcome='FAIL'
+}finally{
  $cleanup=[Diagnostics.Stopwatch]::StartNew()
  $stopped=!$started
  if($p -and $started){try{if(!$p.HasExited){$p.Kill()};$stopped=$p.WaitForExit([int][Math]::Max(0,5000-$cleanup.ElapsedMilliseconds))}catch{$stopped=$false}}
