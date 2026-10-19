@@ -140,7 +140,7 @@ try{
  }
  if($ObserveWire){
   $stage='wire_launch';Require ($Mode -eq 'direct') 'wire_mode_unsupported'
-  Require ((Get-FileHash -LiteralPath $WireObserverPath -Algorithm SHA256).Hash.ToLowerInvariant() -ceq 'abff8c19f8ebb9ed9f13618a8575b63b6282fce75716f45fb968baf6b15cb834') 'wire_code_pin_mismatch'
+  Require ((Get-FileHash -LiteralPath $WireObserverPath -Algorithm SHA256).Hash.ToLowerInvariant() -ceq '77d6b3d19cb1b60d26539e0862a4217864849c708cb6eb999518a5c305dc7667') 'wire_code_pin_mismatch'
   $wireClass='UdpWireObserver_'+$id;Require (!($wireClass -as [type])) 'wire_type_preloaded'
   $wireCode=[IO.File]::ReadAllText($WireObserverPath,[Text.Encoding]::UTF8).Replace('UdpWireObserver',$wireClass)
   $wireType=Add-Type -TypeDefinition $wireCode -PassThru;Require ($wireType.FullName -ceq $wireClass) 'wire_type_mismatch';$wireCode=$null

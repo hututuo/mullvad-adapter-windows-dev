@@ -15,7 +15,8 @@ public sealed class UdpWireObserver : IDisposable
     private readonly Socket local, outer;
     private readonly CancellationTokenSource cancel = new CancellationTokenSource();
     private Task worker;
-    private long sent, received, type1, type2, type3, type4, nonWg;
+    private long sent, received, type1, type2, type3, type4, nonWg, dnsResponse;
+    private int minLength = Int32.MaxValue, maxLength;
     private readonly long[] sizes = new long[8];
     private int faulted, stopped, localClosed, outerClosed;
     public int LocalPort { get; private set; }
@@ -93,6 +94,11 @@ public sealed class UdpWireObserver : IDisposable
     private void Observe(byte[] bytes, int count)
     {
         Interlocked.Increment(ref received);
+        int previous;
+        do { previous = minLength; if (count >= previous) break; }
+        while (Interlocked.CompareExchange(ref minLength, count, previous) != previous);
+        do { previous = maxLength; if (count <= previous) break; }
+        while (Interlocked.CompareExchange(ref maxLength, count, previous) != previous);
         int bucket = count == 0 ? 0 : count < 32 ? 1 : count < 64 ? 2 :
             count < 92 ? 3 : count < 148 ? 4 : count < 512 ? 5 : count < 1472 ? 6 : 7;
         Interlocked.Increment(ref sizes[bucket]);
@@ -102,7 +108,55 @@ public sealed class UdpWireObserver : IDisposable
         else if (type == 2 && count == 92) Interlocked.Increment(ref type2);
         else if (type == 3 && count == 64) Interlocked.Increment(ref type3);
         else if (type == 4 && count >= 32) Interlocked.Increment(ref type4);
-        else Interlocked.Increment(ref nonWg);
+        else
+        {
+            Interlocked.Increment(ref nonWg);
+            if (DnsResponseShape(bytes, count)) Interlocked.Increment(ref dnsResponse);
+        }
+    }
+    // Conservative DNS envelope shape only: no source, semantic or authenticity claim.
+    private static int U16(byte[] b, int p) { return (b[p] << 8) | b[p + 1]; }
+    private static bool DnsName(byte[] b, int n, ref int p, HashSet<int> starts)
+    {
+        int cursor = p, expanded = 1; bool jumped = false;
+        for (int steps = 0; steps < 128; steps++)
+        {
+            if (cursor < 12 || cursor >= n) return false;
+            int at = cursor, size = b[cursor++];
+            if ((size & 192) == 192)
+            {
+                if (cursor >= n) return false;
+                int target = ((size & 63) << 8) | b[cursor++];
+                if (target >= at || !starts.Contains(target)) return false;
+                starts.Add(at);
+                if (!jumped) p = cursor; jumped = true; cursor = target; continue;
+            }
+            if ((size & 192) != 0 || size > n - cursor) return false;
+            starts.Add(at);
+            if (size == 0) { if (!jumped) p = cursor; return true; }
+            expanded += size + 1; if (expanded > 255) return false;
+            cursor += size;
+        }
+        return false;
+    }
+    private static bool DnsResponseShape(byte[] b, int n)
+    {
+        if (n < 12 || n > b.Length || (b[2] & 128) == 0 || (b[2] & 120) != 0 || (b[3] & 64) != 0) return false;
+        int questions = U16(b, 4), answers = U16(b, 6), authority = U16(b, 8), additional = U16(b, 10);
+        if (questions + answers + authority + additional > 64) return false;
+        int p = 12; HashSet<int> starts = new HashSet<int>();
+        for (int i = 0; i < questions; i++)
+        {
+            if (!DnsName(b, n, ref p, starts) || n - p < 4 || U16(b, p) == 0 || U16(b, p + 2) == 0) return false;
+            p += 4;
+        }
+        for (int i = 0; i < answers + authority + additional; i++)
+        {
+            if (!DnsName(b, n, ref p, starts) || n - p < 10 || U16(b, p) == 0 || U16(b, p + 2) == 0) return false;
+            int length = U16(b, p + 8); p += 10;
+            if (length > n - p) return false; p += length;
+        }
+        return p == n;
     }
     private void Forward()
     {
@@ -160,6 +214,10 @@ public sealed class UdpWireObserver : IDisposable
         result["wg_type1_148"] = Interlocked.Read(ref type1); result["wg_type2_92"] = Interlocked.Read(ref type2);
         result["wg_type3_64"] = Interlocked.Read(ref type3); result["wg_type4_ge32"] = Interlocked.Read(ref type4);
         result["non_wg_shape"] = Interlocked.Read(ref nonWg);
+        int minimum = Interlocked.CompareExchange(ref minLength, 0, 0);
+        result["received_min_length"] = minimum == Int32.MaxValue ? 0 : minimum;
+        result["received_max_length"] = Interlocked.CompareExchange(ref maxLength, 0, 0);
+        result["dns_response_shape"] = Interlocked.Read(ref dnsResponse);
         for (int i = 0; i < labels.Length; i++) result[labels[i]] = Interlocked.Read(ref sizes[i]);
         result["faulted"] = Interlocked.CompareExchange(ref faulted, 0, 0) != 0;
         result["running"] = worker != null && !worker.IsCompleted;
