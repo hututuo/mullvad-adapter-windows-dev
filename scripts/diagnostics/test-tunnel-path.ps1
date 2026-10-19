@@ -139,17 +139,17 @@ try{
   if($Mode -eq 'clash'){$wg|Add-Member -NotePropertyName 'dialer-proxy' -NotePropertyValue 'INDEPENDENT-CLASH';$sock=[pscustomobject]@{name='INDEPENDENT-CLASH';type='socks5';server='127.0.0.1';port=7897;udp=$true};$config.proxies=@($sock,$wg)}
  }
  if($ObserveWire){
-  $stage='wire_launch';Require ($Mode -eq 'direct') 'wire_mode_unsupported'
-  Require ((Get-FileHash -LiteralPath $WireObserverPath -Algorithm SHA256).Hash.ToLowerInvariant() -ceq '77d6b3d19cb1b60d26539e0862a4217864849c708cb6eb999518a5c305dc7667') 'wire_code_pin_mismatch'
+  $stage='wire_launch';Require ($Mode -in @('direct','ss')) 'wire_mode_unsupported';$wireDestination=[string]$receipt.outer_endpoint.address
+  Require ((Get-FileHash -LiteralPath $WireObserverPath -Algorithm SHA256).Hash.ToLowerInvariant() -ceq '864a5c6366d0fabfd0227e4280ca36382d77cedc2aae44dfce65a8f5b2af75f7') 'wire_code_pin_mismatch'
   $wireClass='UdpWireObserver_'+$id;Require (!($wireClass -as [type])) 'wire_type_preloaded'
   $wireCode=[IO.File]::ReadAllText($WireObserverPath,[Text.Encoding]::UTF8).Replace('UdpWireObserver',$wireClass)
   $wireType=Add-Type -TypeDefinition $wireCode -PassThru;Require ($wireType.FullName -ceq $wireClass) 'wire_type_mismatch';$wireCode=$null
-  $sources=@(Find-NetRoute -RemoteIPAddress $r.ipv4_addr_in|Where-Object {$_.PSObject.Properties['IPAddress']})
+  $sources=@(Find-NetRoute -RemoteIPAddress $wireDestination|Where-Object {$_.PSObject.Properties['IPAddress']})
   Require ($sources.Count -eq 1) 'wire_route_ambiguous';$wireRoute=$sources[0]
   $physical=@(Get-NetAdapter -Physical|Where-Object {$_.Status -eq 'Up' -and $_.ifIndex -eq $wireRoute.InterfaceIndex})
   Require ($physical.Count -eq 1) 'wire_route_not_physical'
-  $wire=$wireType::Start([string]$wireRoute.IPAddress,[int]$wireRoute.InterfaceIndex,[string]$r.ipv4_addr_in,$Port);$wireStopped=$false
-  $receipt.wire_interface_index=[int]$wireRoute.InterfaceIndex;$wg.server='127.0.0.1';$wg.port=$wire.LocalPort
+  $wire=$wireType::Start([string]$wireRoute.IPAddress,[int]$wireRoute.InterfaceIndex,[string]$wireDestination,$Port);$wireStopped=$false
+  $receipt.wire_interface_index=[int]$wireRoute.InterfaceIndex;if($Mode -eq 'ss'){$ss.server='127.0.0.1';$ss.port=$wire.LocalPort}else{$wg.server='127.0.0.1';$wg.port=$wire.LocalPort}
  }
  $stage='launch';$exe=Join-Path $env:LOCALAPPDATA 'Mullvad Adapter\runtime\mihomo.exe'
  Require ((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant() -ceq '1fa8055e03596fc35167f70e9ecd1890517d38d960a39177445746a1b0defc2b') 'engine_pin_mismatch'
@@ -162,7 +162,7 @@ try{
  Start-Sleep -Milliseconds 700;Assert-OwnedListeners;$stage='canaries'
  foreach($test in @(@('literal_ip','https://1.1.1.1/cdn-cgi/trace',200),@('hostname','https://www.gstatic.com/generate_204',204))){$receipt.probes+=@(Probe $test[0] $test[1] $test[2]);Assert-OwnedListeners}
  if($Mode -eq 'clash'){$after=Assert-ClashIndependent;Require ($after.signature -ceq $clashBefore.signature) 'clash_selection_changed'}
- if($wire){$wireHealth=$wire.Snapshot();Require (!$wireHealth['faulted'] -and $wireHealth['running']) 'wire_worker_failed';$finalRoute=@(Find-NetRoute -RemoteIPAddress $r.ipv4_addr_in|Where-Object {$_.PSObject.Properties['IPAddress']});$receipt.wire_route_stable=($finalRoute.Count -eq 1 -and $finalRoute[0].InterfaceIndex -eq $wireRoute.InterfaceIndex -and [string]$finalRoute[0].IPAddress -ceq [string]$wireRoute.IPAddress);Require $receipt.wire_route_stable 'wire_route_changed'}
+ if($wire){$wireHealth=$wire.Snapshot();Require (!$wireHealth['faulted'] -and $wireHealth['running']) 'wire_worker_failed';$finalRoute=@(Find-NetRoute -RemoteIPAddress $wireDestination|Where-Object {$_.PSObject.Properties['IPAddress']});$receipt.wire_route_stable=($finalRoute.Count -eq 1 -and $finalRoute[0].InterfaceIndex -eq $wireRoute.InterfaceIndex -and [string]$finalRoute[0].IPAddress -ceq [string]$wireRoute.IPAddress);Require $receipt.wire_route_stable 'wire_route_changed'}
  if(@($receipt.probes|Where-Object {!$_.pass}).Count -eq 0){$receipt.outcome='COMPONENT_PASS';if($ExitCheck){$receipt.exit_check=Probe 'mullvad_exit' 'https://am.i.mullvad.net/json' 200 -Body}}
 }catch{
  $failure=$_.Exception;$closedCode=$null

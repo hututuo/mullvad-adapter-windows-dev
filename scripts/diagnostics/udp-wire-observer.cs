@@ -16,6 +16,7 @@ public sealed class UdpWireObserver : IDisposable
     private readonly CancellationTokenSource cancel = new CancellationTokenSource();
     private Task worker;
     private long sent, received, type1, type2, type3, type4, nonWg, dnsResponse;
+    private long echoExact, echoDnsFlags;
     private int minLength = Int32.MaxValue, maxLength;
     private readonly long[] sizes = new long[8];
     private int faulted, stopped, localClosed, outerClosed;
@@ -158,9 +159,24 @@ public sealed class UdpWireObserver : IDisposable
         }
         return p == n;
     }
+    private void ObserveEcho(byte[] reply, int count, byte[] lastOutbound, int lastLength)
+    {
+        if (lastLength == 0 || count != lastLength) return;
+        bool exact = true, outsideFlagsEqual = true;
+        for (int i = 0; i < count; i++)
+        {
+            if (reply[i] == lastOutbound[i]) continue;
+            exact = false;
+            if (i != 2 && i != 3) outsideFlagsEqual = false;
+        }
+        if (exact) Interlocked.Increment(ref echoExact);
+        else if (count >= 4 && outsideFlagsEqual && (reply[2] & 128) != 0)
+            Interlocked.Increment(ref echoDnsFlags);
+    }
     private void Forward()
     {
         byte[] bytes = new byte[65535];
+        byte[] lastOutbound = new byte[65507]; int lastLength = 0;
         IPEndPoint client = null;
         try
         {
@@ -183,11 +199,14 @@ public sealed class UdpWireObserver : IDisposable
                             if (client == null) client = candidate;
                             if (outer.Send(bytes, count, SocketFlags.None) != count)
                                 throw new InvalidOperationException("udp_wire_partial_datagram");
+                            Array.Clear(lastOutbound, 0, lastLength);
+                            Buffer.BlockCopy(bytes, 0, lastOutbound, 0, count); lastLength = count;
                             Interlocked.Increment(ref sent);
                         }
                         else
                         {
                             int count = outer.Receive(bytes);
+                            ObserveEcho(bytes, count, lastOutbound, lastLength);
                             Observe(bytes, count);
                             if (client != null && local.SendTo(bytes, 0, count, SocketFlags.None, client) != count)
                                 throw new InvalidOperationException("udp_wire_partial_datagram");
@@ -201,6 +220,7 @@ public sealed class UdpWireObserver : IDisposable
         finally
         {
             Array.Clear(bytes, 0, bytes.Length);
+            Array.Clear(lastOutbound, 0, lastOutbound.Length);
             CloseSockets();
         }
     }
@@ -218,6 +238,8 @@ public sealed class UdpWireObserver : IDisposable
         result["received_min_length"] = minimum == Int32.MaxValue ? 0 : minimum;
         result["received_max_length"] = Interlocked.CompareExchange(ref maxLength, 0, 0);
         result["dns_response_shape"] = Interlocked.Read(ref dnsResponse);
+        result["echo_exact_last_outbound"] = Interlocked.Read(ref echoExact);
+        result["echo_dns_flags_only"] = Interlocked.Read(ref echoDnsFlags);
         for (int i = 0; i < labels.Length; i++) result[labels[i]] = Interlocked.Read(ref sizes[i]);
         result["faulted"] = Interlocked.CompareExchange(ref faulted, 0, 0) != 0;
         result["running"] = worker != null && !worker.IsCompleted;
