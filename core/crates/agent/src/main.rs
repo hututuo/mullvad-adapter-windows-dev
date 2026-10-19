@@ -2,6 +2,8 @@
 //! Live tunnel selection remains gated until its transaction/egress acceptance.
 use adapter_control::MockControl;
 use adapter_protocol::{Hello, Response, API_MAJOR, API_MINOR};
+#[cfg(any(windows, feature = "windows-api-check", test))]
+mod inlet_trials;
 #[cfg(any(windows, feature = "windows-api-check"))]
 mod live_connection;
 mod live_device;

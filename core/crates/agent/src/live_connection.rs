@@ -42,6 +42,7 @@ pub(crate) struct Connections {
     next_attempt: Instant,
     logs: crate::live_diagnostics::LogClient,
     frozen: bool,
+    inlet_trials: crate::inlet_trials::InletTrials,
 }
 impl Connections {
     pub(crate) fn new(
@@ -66,17 +67,20 @@ impl Connections {
                 next_attempt: Instant::now(),
                 logs,
                 frozen: false,
+                inlet_trials: Default::default(),
             },
             mailbox,
         )
     }
     pub(crate) fn freeze(&mut self) {
         self.frozen = true;
+        self.inlet_trials.clear();
         self.recovering = None;
         self.manual_candidates = None;
         self.deferred = None;
     }
     pub(crate) fn identity_changed(&mut self, owner: &mut ResourceOwner) {
+        self.inlet_trials.clear();
         self.recovering = None;
         self.manual_candidates = None;
         self.deferred = None;
@@ -97,6 +101,7 @@ impl Connections {
         code: &'static str,
     ) {
         debug_assert!(self.pending.is_none());
+        self.inlet_trials.clear();
         self.recovering = None;
         self.manual_candidates = None;
         self.deferred = None;
@@ -125,6 +130,7 @@ impl Connections {
     }
     /// Called only for an accepted user intent, never for scheduler retries.
     pub(crate) fn begin_user_selection(&mut self) {
+        self.inlet_trials.clear();
         self.manual_candidates = None;
         self.recovering = None;
         self.deferred = None;
@@ -190,6 +196,7 @@ impl Connections {
             return Err("relay_not_active");
         }
         let original = automatic
+            && owner.state().stage == adapter_domain::Stage::RebuildOriginal
             && owner
                 .state()
                 .path
@@ -208,9 +215,19 @@ impl Connections {
                 .authorize_shadowsocks_inlet(picked, *saved.ip(), saved.port())
                 .ok_or("original_inlet_withdrawn")?
         } else {
-            catalogue
-                .shadowsocks_inlet(picked, None)
-                .ok_or("shadowsocks_inlet_missing")?
+            let mut allowed = catalogue.shadowsocks_inlets(picked);
+            if let Some(selected) = self
+                .inlet_trials
+                .selected(picked.hostname())
+                .and_then(|i| catalogue.authorize_shadowsocks_inlet(picked, i.address, i.port))
+            {
+                if !allowed.contains(&selected) {
+                    allowed.push(selected);
+                }
+            }
+            self.inlet_trials
+                .choose(picked.hostname(), &allowed)
+                .ok_or("shadowsocks_inlets_exhausted")?
         };
         let binding = owner
             .observation()
@@ -426,6 +443,7 @@ impl Connections {
         self.recovering = None;
         self.manual_candidates = None;
         self.deferred = None;
+        self.inlet_trials.clear();
         self.disconnecting = true;
         self.last_relay = None;
         owner.cancel_current_operation();
@@ -472,6 +490,49 @@ impl Connections {
                 Instant::now() + Duration::from_millis(adapter_domain::LOCAL_RETRY_MS);
         }
     }
+    fn advance_inlet(
+        &mut self,
+        path: &Path,
+        catalogue: Option<&adapter_catalogue::Catalogue>,
+        automatic: bool,
+        fallback_allowed: bool,
+    ) -> bool {
+        if automatic && !fallback_allowed {
+            return false;
+        }
+        if !automatic && self.manual_candidates.is_none() {
+            return false;
+        }
+        let Some(catalogue) = catalogue else {
+            return false;
+        };
+        let Some(relay) = catalogue
+            .active_in_city(&path.city)
+            .find(|r| r.hostname() == path.relay)
+        else {
+            return false;
+        };
+        if !self.inlet_trials.reject(&path.relay, &path.inlet) {
+            return false;
+        }
+        if self
+            .inlet_trials
+            .choose(&path.relay, &catalogue.shadowsocks_inlets(relay))
+            .is_none()
+        {
+            return false;
+        }
+        if automatic {
+            self.deferred = Some(path.relay.clone());
+        } else {
+            self.retry_manual_candidate(path.relay.clone(), true);
+        }
+        // Owned Unready already joined its worker/carrier. Only a short dispatch
+        // pause is needed; the unchanged network-settle guard remains mandatory.
+        self.next_attempt = Instant::now() + Duration::from_millis(250);
+        let _ = self.logs.event("connection", "same_relay_inlet_retry");
+        true
+    }
     fn defer_stale_candidate(&mut self, relay: String) {
         // Do not pop the next city candidate or renew its recovery budget.
         self.deferred = Some(relay);
@@ -511,6 +572,7 @@ impl Connections {
         if owner.state_mut().request_original_rebuild(now).is_err() {
             return;
         }
+        self.inlet_trials.clear();
         self.next_attempt = Instant::now();
         self.recovering = Some((
             Instant::now() + Duration::from_millis(adapter_domain::RECOVERY_BUDGET_MS),
@@ -529,6 +591,7 @@ impl Connections {
             return;
         }
         if restored {
+            self.inlet_trials.clear();
             if let Some((deadline, _, _, _)) = &mut self.manual_candidates {
                 *deadline =
                     Instant::now() + Duration::from_millis(adapter_domain::RECOVERY_BUDGET_MS);
@@ -721,6 +784,7 @@ impl Connections {
                         if path.slot == "a" { "slot_a" } else { "slot_b" }.into();
                     dashboard.active_relay = Some(path.relay);
                     self.last_relay = dashboard.active_relay.clone();
+                    self.inlet_trials.clear();
                     dashboard.status = "connected".into();
                     dashboard.readiness = owner.state().readiness.map(|r| {
                         if r == adapter_domain::Readiness::Ready {
@@ -843,9 +907,38 @@ impl Connections {
                     }
                 }
                 Reply::Unready { proof, .. } => {
+                    // A hint can arrive after poll's first ticket check but before
+                    // this completion. Cleanup is confirmed by Unready; retain
+                    // the exact selected inlet and original budget, not negative
+                    // evidence from an interrupted physical-network window.
                     let negative = proof.failed_canary();
+                    // Capture one completion-time fence; repeated current checks
+                    // must not create an unclassified late-hint branch.
+                    let current = owner.is_operation_current(&p.ticket);
+                    if !current && owner.operation_binding_changed(&p.ticket) {
+                        let p = self.pending.take().unwrap();
+                        owner.finish_operation(&p.ticket);
+                        if let Some(attempt) = p.attempt.as_ref() {
+                            if automatic {
+                                self.defer_stale_candidate(attempt.path.relay.clone());
+                            } else {
+                                self.retry_manual_candidate(attempt.path.relay.clone(), true);
+                            }
+                        }
+                        dashboard.operation = None;
+                        dashboard.front_selected = "reject".into();
+                        dashboard.readiness = None;
+                        dashboard.status = if owner.state().paused {
+                            "waiting_network"
+                        } else {
+                            "disconnected"
+                        }
+                        .into();
+                        dashboard.last_error = Some("network_binding_changed".into());
+                        self.record(dashboard, "network_binding_changed", "failed", None);
+                        continue;
+                    }
                     if negative.is_none() {
-                        let current = owner.is_operation_current(&p.ticket);
                         let p = self.pending.take().unwrap();
                         owner.finish_operation(&p.ticket);
                         if current {
@@ -875,7 +968,6 @@ impl Connections {
                     let now = owner.now();
                     let measured =
                         now.checked_sub(proof.oldest_observation().elapsed().as_millis() as u64);
-                    let current = owner.is_operation_current(&p.ticket);
                     let p = self.pending.take().unwrap();
                     if current {
                         if let (Some(attempt), Some(at), Some(canary)) =
@@ -900,12 +992,23 @@ impl Connections {
                     dashboard.front_selected = "reject".into();
                     dashboard.status = "disconnected".into();
                     dashboard.last_error = Some("candidate_not_ready".into());
+                    let retry_same = current
+                        && negative.is_some_and(|canary| !canary.alive())
+                        && p.attempt.as_ref().is_some_and(|attempt| {
+                            self.advance_inlet(
+                                &attempt.path,
+                                catalogue,
+                                automatic,
+                                owner.state().stage == adapter_domain::Stage::Fallback,
+                            )
+                        });
                     if !automatic {
                         self.recovering = None;
-                        if self
-                            .manual_candidates
-                            .as_ref()
-                            .is_some_and(|(_, _, _, exact)| *exact)
+                        if !retry_same
+                            && self
+                                .manual_candidates
+                                .as_ref()
+                                .is_some_and(|(_, _, _, exact)| *exact)
                         {
                             self.manual_candidates = None;
                         }
@@ -1100,7 +1203,7 @@ impl Connections {
                     if let Err(code) =
                         self.connect(owner, dashboard, identity, catalogue, Some(&relay), false)
                     {
-                        if code != "relay_not_active" {
+                        if !matches!(code, "relay_not_active" | "shadowsocks_inlets_exhausted") {
                             if let Some((_, _, queue, _)) = &mut self.manual_candidates {
                                 queue.push_front(relay);
                             }
@@ -1143,7 +1246,12 @@ impl Connections {
                         let token = owner.state().token();
                         let _ = owner.state_mut().original_withdrawn(&token, now);
                         let _ = self.logs.event("connection", code);
-                    } else if matches!(code, "relay_not_active" | "recovery_budget_exhausted") {
+                    } else if matches!(
+                        code,
+                        "relay_not_active"
+                            | "recovery_budget_exhausted"
+                            | "shadowsocks_inlets_exhausted"
+                    ) {
                         self.deferred = None;
                     } else {
                         // No candidate was measured. Local preparation/queue
@@ -1245,6 +1353,64 @@ mod tests {
         );
         c.begin_user_selection();
         assert!(c.manual_candidates.is_none());
+    }
+
+    #[test]
+    fn exact_relay_can_advance_inlet_without_other_relay_or_budget_renewal() {
+        let root =
+            std::env::temp_dir().join(format!("mullvad-inlet-intent-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let logs = crate::live_diagnostics::LogClient::start(root.clone()).unwrap();
+        let (mut c, _) = Connections::new(root, logs);
+        let fixture: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../catalogue/fixtures/relay-contract.json"
+        ))
+        .unwrap();
+        let cat = adapter_catalogue::Catalogue::parse(
+            &serde_json::to_vec(&fixture[0]["payload"]).unwrap(),
+        )
+        .unwrap();
+        let relay = cat
+            .relays()
+            .iter()
+            .find(|r| r.active() && cat.shadowsocks_inlets(r).len() > 1)
+            .unwrap();
+        let city = relay.location().to_string();
+        c.seed_manual_candidates(city.clone(), VecDeque::new(), true);
+        let deadline = c.manual_candidates.as_ref().unwrap().0;
+        let first = cat.shadowsocks_inlets(relay)[0];
+        let mut path = Path {
+            relay: relay.hostname().into(),
+            city,
+            inlet: format!("{}:{}", first.address, first.port),
+            transport: "wireguard-over-shadowsocks".into(),
+            entry_relay: None,
+            slot: "a".into(),
+            instance: 1,
+            front: 1,
+        };
+        assert!(c.advance_inlet(&path, Some(&cat), false, false));
+        let (after, _, q, exact) = c.manual_candidates.as_mut().unwrap();
+        assert_eq!(*after, deadline);
+        assert!(*exact);
+        assert_eq!(q.pop_front().as_deref(), Some(path.relay.as_str()));
+        let next = c
+            .inlet_trials
+            .choose(&path.relay, &cat.shadowsocks_inlets(relay))
+            .unwrap();
+        assert_ne!(next, first);
+        path.inlet = format!("{}:{}", next.address, next.port);
+        assert!(
+            !c.advance_inlet(&path, Some(&cat), true, false),
+            "cannot change original inlet before domain fallback"
+        );
+        assert!(c.deferred.is_none());
+        c.begin_user_selection();
+        assert_eq!(
+            c.inlet_trials
+                .choose(&path.relay, &cat.shadowsocks_inlets(relay)),
+            Some(first)
+        );
     }
 
     #[test]

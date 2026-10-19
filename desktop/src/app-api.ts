@@ -170,6 +170,8 @@ const errors: Record<string, string> = {
   identity_missing: "请登录账号创建本机设备，或导入独立设备身份。",
   candidate_evidence_stale: "探测结果在提交前已过期，正在保留同一节点重试；这不代表节点失效。",
   active_evidence_stale: "本次健康检查证据已过期，保留当前通道并重新核对。",
+  same_relay_inlet_retry: "正在重试同一节点的备用入口。",
+  shadowsocks_inlets_exhausted: "当前节点的备用入口均未通过连接验证，请查看诊断结果。",
   candidate_not_ready: "这个节点未通过连接验证；请查看诊断中的具体结果。",
   original_inlet_withdrawn: "原入口已从官方目录撤下，正在当前城市内恢复。",
   worker_configuration_rejected: "连接配置未通过校验；请导出诊断文件。",

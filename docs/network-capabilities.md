@@ -54,3 +54,9 @@ TUN需有独立API规则。配置了本机代理时不会静默回退或重放�
 - [Mullvad restrictive networks](https://mullvad.net/en/help/connecting-to-mullvad-vpn-from-restrictive-locations)
 - [Mullvad relay selection](https://github.com/mullvad/mullvadvpn-app/blob/main/docs/relay-selector.md)
 - [Mullvad SS implementation](https://github.com/mullvad/mullvadvpn-app/blob/main/tunnel-obfuscation/src/shadowsocks.rs)
+
+### Same-relay SS inlet recovery
+
+Windows keeps the established SS default as its first choice. After a fresh owned data-plane failure and confirmed worker/carrier cleanup, it can try at most four metadata-authorized inlet combinations on that same relay before moving through the existing same-city relay queue. Dedicated extra IPv4 addresses may use 443 or the established default port; primary relay addresses remain restricted to the official SS port ranges. Addresses are read from current metadata, not machine constants. No UDP53 candidate is added.
+
+Original-path recovery still starts with the exact saved inlet. New alternatives are fallback attempts, retain the existing 45-second round start budget, and cannot run concurrently under one WG identity. Stale evidence, cancellation, physical-offline state and local setup errors do not consume an inlet. DNS-only or single-service degradation does not advance this inlet queue. A healthy committed path is retained; no spare tunnel is probed in the background. Metadata refresh cannot resurrect failed endpoints or grow one round beyond twelve measured inlet failures.

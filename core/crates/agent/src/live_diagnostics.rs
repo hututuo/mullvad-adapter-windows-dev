@@ -88,6 +88,8 @@ fn safe_event(value: &LogEvent) -> bool {
                 | "probing"
                 | "degraded_preserved"
                 | "candidate_not_ready"
+                | "same_relay_inlet_retry"
+                | "shadowsocks_inlets_exhausted"
                 | "candidate_cancelled"
                 | "candidate_start_failed"
                 | "worker_start_cancelled"
@@ -401,6 +403,8 @@ mod tests {
             ("connection", "active_binding_changed"),
             ("connection", "active_local_rebuild"),
             ("connection", "active_data_failed"),
+            ("connection", "same_relay_inlet_retry"),
+            ("connection", "shadowsocks_inlets_exhausted"),
         ] {
             let event = LogEvent {
                 time: 1,

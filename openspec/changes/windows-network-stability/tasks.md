@@ -11,3 +11,6 @@
 - [x] NS-6 terminal recovery retires deferred scheduler work, preserves exhausted budget/original intent, and does not project historical paths as active verification. A confirmed new physical outage may start a new bounded round.
 - [ ] Native Windows new-source runtime/API/Clash and full installer acceptance.
 - [ ] Alternative TCP transport implementation and original Wi-Fi acceptance (requires that network; not implied by SS/UDP hotspot success).
+
+- [x] NS-7 bounded metadata-authorized same-relay SS inlet alternatives before changing relay, preserving exact original rebuild, existing round budget, serial peer ownership and negative-evidence fences.
+- [ ] NS-7 real Windows new-candidate inlet fallback and installation acceptance (component/runtime evidence from older source does not satisfy this).

@@ -246,6 +246,34 @@ impl Catalogue {
                 kind: ShadowsocksInletKind::RelayAddress,
             })
     }
+    /// Bounded same-relay candidates, not measurements or permission to retry.
+    /// Keep the established default first, then interleave each published IPv4
+    /// extra's 443/default ports in metadata order. Primary ports stay published.
+    pub fn shadowsocks_inlets(&self, relay: &Relay) -> Vec<ShadowsocksInlet> {
+        let Some(first) = self
+            .shadowsocks_inlet(relay, None)
+            .and_then(|inlet| self.authorize_shadowsocks_inlet(relay, inlet.address, inlet.port))
+        else {
+            return Vec::new();
+        };
+        let mut inlets = vec![first];
+        for address in relay.extra_ss.iter().filter_map(|ip| match ip {
+            IpAddr::V4(address) => Some(*address),
+            IpAddr::V6(_) => None,
+        }) {
+            for port in [443, EXTRA_SHADOWSOCKS_PORT] {
+                if let Some(inlet) = self.authorize_shadowsocks_inlet(relay, address, port) {
+                    if !inlets.contains(&inlet) {
+                        inlets.push(inlet);
+                        if inlets.len() == 4 {
+                            return inlets;
+                        }
+                    }
+                }
+            }
+        }
+        inlets
+    }
     /// Capability metadata only, never probe success. Auto order remains ss/v6/v4.
     pub fn transports(&self, relay: &Relay) -> Vec<Transport> {
         if !relay.active {
@@ -412,6 +440,90 @@ mod tests {
         assert_eq!(Some(primary.address), relay.ipv4());
         assert_eq!(primary.kind, ShadowsocksInletKind::RelayAddress);
         assert!(catalogue.shadowsocks_inlet(relay, Some(0)).is_none());
+    }
+    #[test]
+    fn ss_candidates_preserve_default_interleave_metadata_order_and_stop_at_four() {
+        let mut value = fixture();
+        value["wireguard"]["relays"][0]["shadowsocks_extra_addr_in"] =
+            serde_json::json!(["2001:4860::8", "8.8.8.8", "8.8.4.4", "1.1.1.1"]);
+        let catalogue = parse(value).unwrap();
+        let relay = &catalogue.relays()[0];
+        let inlets = catalogue.shadowsocks_inlets(relay);
+        assert_eq!(
+            inlets.first().copied(),
+            catalogue.shadowsocks_inlet(relay, None)
+        );
+        let endpoints: Vec<_> = inlets
+            .iter()
+            .map(|inlet| (inlet.address.to_string(), inlet.port))
+            .collect();
+        assert_eq!(
+            endpoints,
+            vec![
+                ("8.8.8.8".into(), 20484),
+                ("8.8.8.8".into(), 443),
+                ("8.8.4.4".into(), 443),
+                ("8.8.4.4".into(), 20484),
+            ]
+        );
+        for inlet in inlets {
+            assert_eq!(
+                catalogue.authorize_shadowsocks_inlet(relay, inlet.address, inlet.port),
+                Some(inlet)
+            );
+        }
+    }
+    #[test]
+    fn ss_candidates_deduplicate_repeated_extra_addresses_and_the_initial_port() {
+        let mut value = fixture();
+        value["wireguard"]["relays"][0]["shadowsocks_extra_addr_in"] =
+            serde_json::json!(["8.8.4.4", "8.8.4.4", "2001:4860::8"]);
+        let catalogue = parse(value).unwrap();
+        let inlets = catalogue.shadowsocks_inlets(&catalogue.relays()[0]);
+        assert_eq!(inlets.len(), 2);
+        assert_eq!(
+            inlets.iter().map(|inlet| inlet.port).collect::<Vec<_>>(),
+            vec![20484, 443]
+        );
+        assert!(inlets
+            .iter()
+            .all(|inlet| inlet.address == "8.8.4.4".parse::<Ipv4Addr>().unwrap()));
+    }
+    #[test]
+    fn ss_candidates_without_ipv4_extras_use_only_the_first_published_primary_port() {
+        let mut value = fixture();
+        value["wireguard"]["shadowsocks_port_ranges"] =
+            serde_json::json!([[51920, 51949], [51900, 51901]]);
+        for extras in [serde_json::json!([]), serde_json::json!(["2001:4860::8"])] {
+            value["wireguard"]["relays"][0]["shadowsocks_extra_addr_in"] = extras;
+            let catalogue = parse(value.clone()).unwrap();
+            let relay = &catalogue.relays()[0];
+            assert_eq!(
+                catalogue.shadowsocks_inlets(relay),
+                vec![ShadowsocksInlet {
+                    address: relay.ipv4().unwrap(),
+                    port: 51900,
+                    kind: ShadowsocksInletKind::RelayAddress,
+                }]
+            );
+        }
+        value["wireguard"]["relays"][0]["ipv4_addr_in"] = Value::Null;
+        value["wireguard"]["relays"][0]["ipv6_addr_in"] = "2001:4860::8".into();
+        let catalogue = parse(value).unwrap();
+        assert!(catalogue
+            .shadowsocks_inlets(&catalogue.relays()[0])
+            .is_empty());
+    }
+    #[test]
+    fn ss_candidates_reject_inactive_relays_even_with_ipv4_extras() {
+        let mut value = fixture();
+        value["wireguard"]["relays"][0]["active"] = false.into();
+        value["wireguard"]["relays"][0]["shadowsocks_extra_addr_in"] =
+            serde_json::json!(["8.8.4.4"]);
+        let catalogue = parse(value).unwrap();
+        assert!(catalogue
+            .shadowsocks_inlets(&catalogue.relays()[0])
+            .is_empty());
     }
     #[test]
     fn withdrawn_or_ipv6_only_ss_extra_does_not_authorize_guessed_ipv4_or_port() {
