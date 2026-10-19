@@ -31,6 +31,7 @@ enum CheckResult {
             adapter_engine_mihomo::canary_batch::Report,
             adapter_engine_mihomo::canary_batch::BatchError,
         >,
+        Option<adapter_engine_mihomo::canary_batch::ProbeDiagnostics>,
         adapter_platform::engine_output::Snapshot,
         Option<adapter_engine_mihomo::worker_lifecycle::CarrierSnapshot>,
     ),
@@ -205,13 +206,18 @@ pub fn verify(
             })?;
         // The parent receives only immutable public canary observations. No
         // controller, process handle, private configuration or device key escapes.
+        let mut diagnostics = None;
+        let observe = |value| diagnostics = Some(value);
         let report = if carried {
-            worker.probe_bound().map(|proof| proof.into_report())
+            worker
+                .probe_bound_observed(observe)
+                .map(|proof| proof.into_report())
         } else {
-            worker.probe()
+            worker.probe_observed(observe)
         };
         let _ = send.try_send(CheckResult::Probed(
             report,
+            diagnostics,
             worker.output_snapshot(),
             worker.carrier_snapshot(),
         ));
@@ -219,6 +225,8 @@ pub fn verify(
     })?;
     let mut result = None;
     let mut outcomes = None;
+    let mut probe_diagnostics = None;
+    let mut binding_current_at_report = None;
     let mut startup_error = None;
     let mut probe_error = None;
     let mut carrier_output = None;
@@ -228,18 +236,24 @@ pub fn verify(
     loop {
         let (_, event) = owner.poll();
         if let Ok(observation) = receive.try_recv() {
+            binding_current_at_report = Some(
+                owner.observation().stamp().as_ref() == Some(&stamp)
+                    && owner.state().current(&token),
+            );
             let report = match observation {
                 CheckResult::StartFailed(error) => {
                     startup_error = Some(error);
                     None
                 }
-                CheckResult::Probed(Ok(report), output, carrier) => {
+                CheckResult::Probed(Ok(report), diagnostics, output, carrier) => {
+                    probe_diagnostics = diagnostics;
                     engine_output = output;
                     carrier_output = carrier;
                     outcomes = Some(report.outcomes());
                     Some(report)
                 }
-                CheckResult::Probed(Err(error), output, carrier) => {
+                CheckResult::Probed(Err(error), diagnostics, output, carrier) => {
+                    probe_diagnostics = diagnostics;
                     engine_output = output;
                     carrier_output = carrier;
                     probe_error = Some(match error {
@@ -284,16 +298,20 @@ pub fn verify(
             if let Some(error) = probe_error {
                 println!(
                     "{}",
-                    serde_json::json!({"relay":hostname,"transport":mode,"outer_port":outer_port,"outer_address":outer_address,"endpoint_kind":endpoint_kind,"stage":"canary","error":error,"carrier":carrier_output,"engine_signals":engine_output.signals(),"engine_warning_lines":engine_output.warning_lines,"engine_output_truncated":engine_output.truncated,"front_selection":"NOT_PERFORMED","owned_worker_stop":"PASS","physical_capture":"NOT_RUN"})
+                    serde_json::json!({"relay":hostname,"transport":mode,"outer_port":outer_port,"outer_address":outer_address,"endpoint_kind":endpoint_kind,"stage":"canary","error":error,"probe_diagnostics":probe_diagnostics,"binding_current_at_report":binding_current_at_report,"carrier":carrier_output,"engine_signals":engine_output.signals(),"engine_warning_lines":engine_output.warning_lines,"engine_output_truncated":engine_output.truncated,"front_selection":"NOT_PERFORMED","owned_worker_stop":"PASS","physical_capture":"NOT_RUN"})
                 );
                 return Err(io::Error::other(error));
             }
-            let canary = result
-                .flatten()
-                .ok_or_else(|| io::Error::other("tunnel_check_incomplete"))?;
+            let Some(canary) = result.flatten() else {
+                println!(
+                    "{}",
+                    serde_json::json!({"relay":hostname,"transport":mode,"stage":"canary","error":"tunnel_check_incomplete","probe_diagnostics":probe_diagnostics,"binding_current_at_report":binding_current_at_report,"carrier":carrier_output,"front_selection":"NOT_PERFORMED","owned_worker_stop":"PASS","physical_capture":"NOT_RUN"})
+                );
+                return Err(io::Error::other("tunnel_check_incomplete"));
+            };
             println!(
                 "{}",
-                serde_json::json!({"relay":hostname,"transport":mode,"outer_port":outer_port,"outer_address":outer_address,"endpoint_kind":endpoint_kind,"ip":canary.ip,"dns":canary.dns,"https":canary.https,"probes":outcomes,"carrier":carrier_output,"engine_signals":engine_output.signals(),"engine_warning_lines":engine_output.warning_lines,"engine_output_truncated":engine_output.truncated,"front_selection":"NOT_PERFORMED","physical_capture":"NOT_RUN","physical_socket":if carried {"PASS_SOCKET_SUBMISSION_AND_RX_PKTINFO"} else {"NOT_RUN"},"owned_worker_stop":"PASS"})
+                serde_json::json!({"relay":hostname,"transport":mode,"outer_port":outer_port,"outer_address":outer_address,"endpoint_kind":endpoint_kind,"ip":canary.ip,"dns":canary.dns,"https":canary.https,"probes":outcomes,"probe_diagnostics":probe_diagnostics,"binding_current_at_report":binding_current_at_report,"carrier":carrier_output,"engine_signals":engine_output.signals(),"engine_warning_lines":engine_output.warning_lines,"engine_output_truncated":engine_output.truncated,"front_selection":"NOT_PERFORMED","physical_capture":"NOT_RUN","physical_socket":if carried {"PASS_SOCKET_SUBMISSION_AND_RX_PKTINFO"} else {"NOT_RUN"},"owned_worker_stop":"PASS"})
             );
             return if canary.ip && canary.dns && canary.https {
                 Ok(())

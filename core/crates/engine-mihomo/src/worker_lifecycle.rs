@@ -315,6 +315,18 @@ impl Worker {
     ) -> Result<crate::canary_batch::Report, crate::canary_batch::BatchError> {
         crate::canary_batch::for_worker(&self.process, &self.network, self.mixed_port)
     }
+    /// Maintenance-only observations; the same readiness and owner gates apply.
+    pub fn probe_observed(
+        &mut self,
+        observe: impl FnOnce(crate::canary_batch::ProbeDiagnostics),
+    ) -> Result<crate::canary_batch::Report, crate::canary_batch::BatchError> {
+        crate::canary_batch::for_worker_observed(
+            &self.process,
+            &self.network,
+            self.mixed_port,
+            observe,
+        )
+    }
     pub fn output_snapshot(&self) -> adapter_platform::engine_output::Snapshot {
         self.process.output_snapshot()
     }
@@ -324,6 +336,19 @@ impl Worker {
     pub fn probe_bound_on(
         &self,
         operation: &BoundNetwork,
+    ) -> Result<BoundReport, crate::canary_batch::BatchError> {
+        self.probe_bound_observed_on(operation, |_| {})
+    }
+    pub fn probe_bound_observed(
+        &self,
+        observe: impl FnOnce(crate::canary_batch::ProbeDiagnostics),
+    ) -> Result<BoundReport, crate::canary_batch::BatchError> {
+        self.probe_bound_observed_on(&self.network, observe)
+    }
+    fn probe_bound_observed_on(
+        &self,
+        operation: &BoundNetwork,
+        observe: impl FnOnce(crate::canary_batch::ProbeDiagnostics),
     ) -> Result<BoundReport, crate::canary_batch::BatchError> {
         use crate::canary_batch::BatchError;
         if operation.is_cancelled() {
@@ -336,7 +361,12 @@ impl Worker {
         let window = carrier
             .begin(operation.cancellation_monitor())
             .map_err(|_| BatchError::LocalFailure)?;
-        let report = crate::canary_batch::for_worker(&self.process, operation, self.mixed_port)?;
+        let report = crate::canary_batch::for_worker_observed(
+            &self.process,
+            operation,
+            self.mixed_port,
+            observe,
+        )?;
         if operation.is_cancelled() {
             return Err(BatchError::Cancelled);
         }

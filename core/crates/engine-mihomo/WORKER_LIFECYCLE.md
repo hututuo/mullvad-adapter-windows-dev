@@ -90,6 +90,10 @@ The Windows maintenance CLI supports `--verify-tunnel --relay <metadata hostname
 nonzero and advertised by the parsed official catalogue for that transport.
 This permits testing a published alternate WG port on the same relay without
 switching cities or scanning the full catalogue. It never selects a front.
+Use `--verify-bound-tunnel` with the same arguments for the physical carrier
+path. Never run these commands concurrently with another tunnel using the same
+device identity, including the official client. Use an isolated `--scope` with an
+existing explicitly imported identity and validated official relay catalogue.
 
 Reports retain closed IP/DNS/hostname probe outcomes, including DNS timeout vs
 unavailable and hostname **not run because DNS failed**. A failed dependency is
@@ -98,3 +102,17 @@ route/config/peer/controller/deadline/start stage; a startup failure is not
 automatically labelled uncertain cleanup. Actual cleanup uncertainty still
 remains a hard failure. No engine text, private configuration, payload, account
 or private key is exposed in these reports, and readiness rules are unchanged.
+
+`probe_diagnostics` retains historical IP/DNS/hostname outcomes and their age in
+milliseconds at collection, even when the completed batch is subsequently
+rejected as stale or cancelled. `stale` uses the unchanged five-second TTL;
+future completion times have unknown age and are stale. An unrun hostname has
+null age and `not_run_dns_failed`, not a fabricated HTTPS failure. A failure
+before a complete observation set can still have null diagnostics. These fields
+cannot authorize readiness or replace the error/exit status. The collection
+snapshot may be older by the time the report is printed after owned cleanup.
+`binding_current_at_report` records whether the captured observation stamp and
+operation token still matched when the host received the result. It does not
+prove Internet reachability, and false does not mean every relay is down.
+Cancelled/stale/incomplete results remain nonzero, with confirmed owned-worker
+cleanup reported separately. Carrier counters alone do not prove tunnel success.

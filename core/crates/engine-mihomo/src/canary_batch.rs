@@ -30,6 +30,32 @@ pub struct ProbeOutcomes {
     pub dns: ProbeOutcome,
     pub hostname: ProbeOutcome,
 }
+/// Historical observations only. These labels never authorize readiness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct PhaseDiagnostic {
+    pub outcome: ProbeOutcome,
+    pub age_ms: Option<u64>,
+    pub stale: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ProbeDiagnostics {
+    pub ip: PhaseDiagnostic,
+    pub dns: PhaseDiagnostic,
+    pub hostname: PhaseDiagnostic,
+}
+fn phase_diagnostic(
+    outcome: ProbeOutcome,
+    completed: Option<Instant>,
+    now: Instant,
+) -> PhaseDiagnostic {
+    let age = completed.and_then(|at| now.checked_duration_since(at));
+    PhaseDiagnostic {
+        outcome,
+        age_ms: age.map(|value| value.as_millis().min(u64::MAX as u128) as u64),
+        stale: completed.is_some()
+            && age.is_none_or(|value| value > Duration::from_millis(adapter_domain::PROBE_TTL_MS)),
+    }
+}
 fn https_outcome(result: HttpsResult) -> ProbeOutcome {
     match result {
         HttpsResult::Passed(_) => ProbeOutcome::Passed,
@@ -62,6 +88,18 @@ pub struct Report {
     hostname: Option<Measurement<HttpsResult>>,
 }
 impl Report {
+    pub fn diagnostics(&self, now: Instant) -> ProbeDiagnostics {
+        let outcomes = self.outcomes();
+        ProbeDiagnostics {
+            ip: phase_diagnostic(outcomes.ip, Some(self.ip.completed), now),
+            dns: phase_diagnostic(outcomes.dns, Some(self.dns.completed), now),
+            hostname: phase_diagnostic(
+                outcomes.hostname,
+                self.hostname.as_ref().map(|m| m.completed),
+                now,
+            ),
+        }
+    }
     pub fn outcomes(&self) -> ProbeOutcomes {
         ProbeOutcomes {
             ip: https_outcome(self.ip.value),
@@ -163,7 +201,14 @@ fn measured<T>(
         }
     }
 }
+#[cfg(test)]
 fn collect(driver: &impl Driver) -> Result<Report, BatchError> {
+    collect_observed(driver, |_| {})
+}
+fn collect_observed(
+    driver: &impl Driver,
+    observe: impl FnOnce(ProbeDiagnostics),
+) -> Result<Report, BatchError> {
     if driver.cancelled() {
         return Err(BatchError::Cancelled);
     }
@@ -216,6 +261,9 @@ fn collect(driver: &impl Driver) -> Result<Report, BatchError> {
         })
     });
     let report = refresh_early_phases(driver, report?, driver.now())?;
+    // Preserve closed historical outcomes before cancellation/freshness rejects
+    // readiness. No timestamp, error or policy is changed by this observer.
+    observe(report.diagnostics(driver.now()));
     if driver.cancelled()
         || matches!(report.ip.value, HttpsResult::Cancelled)
         || matches!(report.dns.value, DnsResult::Cancelled)
@@ -302,6 +350,15 @@ pub(crate) fn for_worker(
     network: &adapter_control::owned_lifecycle::BoundNetwork,
     port: u16,
 ) -> Result<Report, BatchError> {
+    for_worker_observed(process, network, port, |_| {})
+}
+#[cfg(any(windows, feature = "windows-api-check"))]
+pub(crate) fn for_worker_observed(
+    process: &adapter_platform::windows_process::OwnedProcess,
+    network: &adapter_control::owned_lifecycle::BoundNetwork,
+    port: u16,
+    observe: impl FnOnce(ProbeDiagnostics),
+) -> Result<Report, BatchError> {
     use adapter_platform::windows_controller_owner::ControllerOwner;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -386,23 +443,82 @@ pub(crate) fn for_worker(
         wrong_owner: Arc::new(AtomicBool::new(false)),
         port,
     };
-    let result = collect(&driver);
+    let mut diagnostics = None;
+    let result = collect_observed(&driver, |value| diagnostics = Some(value));
     let live = driver.owner.is_alive();
-    if network.is_cancelled() {
-        return Err(BatchError::Cancelled);
+    let result = if network.is_cancelled() {
+        Err(BatchError::Cancelled)
+    } else if driver.wrong_owner.load(Ordering::Acquire) || !live {
+        Err(BatchError::LocalFailure)
+    } else {
+        result.and_then(|report| {
+            let now = Instant::now();
+            diagnostics = Some(report.diagnostics(now));
+            report.fresh_canary(now)?;
+            Ok(report)
+        })
+    };
+    if let Some(diagnostics) = diagnostics {
+        observe(diagnostics);
     }
-    if driver.wrong_owner.load(Ordering::Acquire) || !live {
-        return Err(BatchError::LocalFailure);
-    }
-    result.and_then(|report| {
-        report.fresh_canary(Instant::now())?;
-        Ok(report)
-    })
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn historical_diagnostics_keep_failed_dns_and_skipped_https_without_readiness() {
+        let now = Instant::now();
+        let report = Report {
+            started: now - Duration::from_secs(8),
+            finished: now,
+            ip: Measurement {
+                value: HttpsResult::Deadline,
+                completed: now,
+            },
+            dns: Measurement {
+                value: DnsResult::Timeout,
+                completed: now - Duration::from_secs(6),
+            },
+            hostname: None,
+        };
+        let diagnostics = report.diagnostics(now);
+        assert_eq!(diagnostics.ip.outcome, ProbeOutcome::Deadline);
+        assert_eq!(diagnostics.ip.age_ms, Some(0));
+        assert!(!diagnostics.ip.stale);
+        assert_eq!(diagnostics.dns.outcome, ProbeOutcome::Timeout);
+        assert_eq!(diagnostics.dns.age_ms, Some(6000));
+        assert!(diagnostics.dns.stale);
+        assert_eq!(diagnostics.hostname.outcome, ProbeOutcome::NotRunDnsFailed);
+        assert_eq!(diagnostics.hostname.age_ms, None);
+        assert!(!diagnostics.hostname.stale);
+        assert_eq!(report.fresh_canary(now), Err(BatchError::Stale));
+        let json = serde_json::to_value(diagnostics).unwrap();
+        assert_eq!(json["dns"]["outcome"], "timeout");
+        assert_eq!(json["hostname"]["outcome"], "not_run_dns_failed");
+    }
+    #[test]
+    fn diagnostic_freshness_matches_exact_ttl_and_rejects_future_completion() {
+        let now = Instant::now();
+        let completed = now - Duration::from_millis(adapter_domain::PROBE_TTL_MS);
+        assert!(!phase_diagnostic(ProbeOutcome::Passed, Some(completed), now).stale);
+        assert!(
+            phase_diagnostic(
+                ProbeOutcome::Passed,
+                Some(completed),
+                now + Duration::from_nanos(1)
+            )
+            .stale
+        );
+        let future = phase_diagnostic(
+            ProbeOutcome::Passed,
+            Some(now + Duration::from_secs(1)),
+            now,
+        );
+        assert!(future.stale);
+        assert_eq!(future.age_ms, None);
+    }
     fn slow_hostname_report(now: Instant) -> Report {
         let early = now - Duration::from_secs(6);
         Report {
@@ -888,14 +1004,25 @@ mod tests {
             || DnsResult::Rejected,
             || panic!("DNS dependency failed"),
         );
-        assert!(matches!(collect(&fake), Err(BatchError::Cancelled)));
+        let mut observed = None;
+        assert!(matches!(
+            collect_observed(&fake, |value| observed = Some(value)),
+            Err(BatchError::Cancelled)
+        ));
+        let observed = observed.unwrap();
+        assert_eq!(observed.ip.outcome, ProbeOutcome::Cancelled);
+        assert_eq!(observed.dns.outcome, ProbeOutcome::Rejected);
+        assert_eq!(fake.active.load(Ordering::SeqCst), 0);
         let fake = Fake::new(
             || panic!("must not start"),
             || panic!("must not start"),
             || panic!("must not start"),
         );
         fake.abort();
-        assert!(matches!(collect(&fake), Err(BatchError::Cancelled)));
+        assert!(matches!(
+            collect_observed(&fake, |_| panic!("no observations before start")),
+            Err(BatchError::Cancelled)
+        ));
         assert_eq!(fake.active.load(Ordering::SeqCst), 0);
     }
     #[test]
