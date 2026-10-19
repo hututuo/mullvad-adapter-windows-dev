@@ -1,0 +1,40 @@
+name: direct-quic-diagnostic
+on:
+  push:
+    branches: ['test/windows-direct-quic-*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows-component:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: '-C target-feature=+crt-static'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - name: Test isolated component
+        run: cargo test --manifest-path tools/official-quic-bridge/Cargo.toml --locked --target x86_64-pc-windows-msvc
+      - name: Build isolated component
+        run: cargo build --manifest-path tools/official-quic-bridge/Cargo.toml --locked --release --target x86_64-pc-windows-msvc
+      - name: Verify closed failure and prepare component receipt
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $bin='tools/official-quic-bridge/target/x86_64-pc-windows-msvc/release/adapter-quic-diagnostic.exe'
+          $out = '{}' | & $bin 2>&1
+          if ($LASTEXITCODE -ne 2 -or ($out -join '') -notmatch 'input_invalid') { throw 'closed input rejection failed' }
+          New-Item -ItemType Directory -Path component | Out-Null
+          Copy-Item $bin component/
+          Copy-Item tools/official-quic-bridge/README.md,tools/official-quic-bridge/Cargo.lock,LICENSE component/
+          $file=Get-Item $bin
+          [ordered]@{schema=1;kind='diagnostic_component';version='0.0.0';source_sha=$env:GITHUB_SHA;upstream_sha='19fb87407f4b81fe15372c2c7f8a20e7ab4eb220';run_id=$env:GITHUB_RUN_ID;platform='windows';architecture='x86_64';filename=$file.Name;size=$file.Length;sha256=(Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLower();signing='NOT_RUN';native_unit_tests='PASS';real_quic='NOT_RUN';real_wireguard='NOT_RUN';installer='NOT_RUN'} | ConvertTo-Json | Set-Content component/component.json -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-direct-quic-${{ github.sha }}
+          path: component/
+          if-no-files-found: error
+          retention-days: 7
