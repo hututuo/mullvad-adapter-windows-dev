@@ -38,7 +38,7 @@ fn safe_event(value: &LogEvent) -> bool {
         && value.layer == "agent"
         && matches!(
             value.stage.as_str(),
-            "start" | "front" | "physical" | "api" | "stop" | "quick" | "connection"
+            "start" | "front" | "physical" | "api" | "api_access" | "stop" | "quick" | "connection"
         )
         && matches!(
             value.code.as_str(),
@@ -108,6 +108,17 @@ fn safe_event(value: &LogEvent) -> bool {
                 | "tunnel_command_busy"
                 | "tunnel_transaction_failed"
                 | "active_probe_failed"
+                | "active_probe_local_failure"
+                | "active_probe_cancelled"
+                | "active_binding_changed"
+                | "active_local_rebuild"
+                | "active_data_failed"
+                | "network_binding_changed"
+                | "waiting_network_settle"
+                | "direct_verified"
+                | "independent_proxy_verified"
+                | "healthy_tunnel_verified"
+                | "cache_write_failed"
                 | "active_worker_missing"
                 | "binding_changed"
                 | "relay_not_active"
@@ -375,6 +386,35 @@ mod tests {
         ));
         std::fs::create_dir(&path).unwrap();
         path
+    }
+    #[test]
+    fn api_routes_and_network_recovery_events_remain_loggable_without_raw_data() {
+        for (stage, code) in [
+            ("api_access", "direct_verified"),
+            ("api_access", "independent_proxy_verified"),
+            ("api_access", "healthy_tunnel_verified"),
+            ("api_access", "cache_write_failed"),
+            ("connection", "network_binding_changed"),
+            ("connection", "waiting_network_settle"),
+            ("connection", "active_probe_local_failure"),
+            ("connection", "active_probe_cancelled"),
+            ("connection", "active_binding_changed"),
+            ("connection", "active_local_rebuild"),
+            ("connection", "active_data_failed"),
+        ] {
+            let event = LogEvent {
+                time: 1,
+                layer: "agent".into(),
+                stage: stage.into(),
+                code: code.into(),
+                connection: None,
+                quick_test: None,
+            };
+            assert!(
+                safe_event(&event),
+                "{stage}/{code} must not disable event logging"
+            );
+        }
     }
     fn snapshot() -> Dashboard {
         use adapter_protocol::app::{Account, Settings};

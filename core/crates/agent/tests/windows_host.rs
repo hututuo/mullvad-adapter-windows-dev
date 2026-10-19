@@ -17,13 +17,18 @@ fn final_response_can_be_read_late_before_ack_and_host_survives_reconnect() {
     let scope = boot_id().unwrap();
     let owner = Identity::current().unwrap().with_scope(&scope).unwrap();
     let mut host = Host(
-        ProcessCommand::new(env!("CARGO_BIN_EXE_adapter-agent"))
-            .args(["--mock-pipe", "--scope", &scope])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+        // Cross-built fixtures may run away from the build machine. The override
+        // is test-only; production process resolution stays manifest-bound.
+        ProcessCommand::new(
+            std::env::var_os("ADAPTER_TEST_AGENT_EXE")
+                .unwrap_or_else(|| env!("CARGO_BIN_EXE_adapter-agent").into()),
+        )
+        .args(["--mock-pipe", "--scope", &scope])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap(),
     );
     let mut pipe = Pipe::connect(&owner, Duration::from_secs(3)).unwrap();
     let hello = match read_frame::<Response>(&mut pipe).unwrap() {
