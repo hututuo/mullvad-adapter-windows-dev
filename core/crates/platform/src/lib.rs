@@ -23,6 +23,9 @@ pub mod windows_icmp;
 #[cfg(any(test, windows, feature = "windows-api-check"))]
 pub mod windows_datagram;
 
+#[cfg(any(test, windows, feature = "windows-api-check"))]
+pub mod windows_tcp_stream;
+
 #[cfg(any(windows, feature = "windows-api-check"))]
 pub mod windows_controller_owner;
 
