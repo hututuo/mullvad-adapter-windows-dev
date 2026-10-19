@@ -131,7 +131,7 @@ fn error_code(e: ProxyError) -> &'static str {
             // QUIC CRYPTO_ERROR encodes the TLS alert; never export server text.
             let code = u64::from(e.code);
             match code {
-                0x12a..=0x12e | 0x130 => "tls_certificate_rejected",
+                0x12a..=0x12e | 0x130 => "quic_certificate_alert",
                 0x100..=0x1ff => "quic_tls_alert",
                 _ => "quic_transport_error",
             }

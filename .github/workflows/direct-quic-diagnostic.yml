@@ -29,8 +29,14 @@ jobs:
         run: |
           $ErrorActionPreference='Stop'
           $bin='tools/official-quic-bridge/target/x86_64-pc-windows-msvc/release/adapter-quic-diagnostic.exe'
-          $out = '{}' | & $bin 2>&1
-          if ($LASTEXITCODE -ne 2 -or ($out -join '') -notmatch 'input_invalid') { throw 'closed input rejection failed' }
+          $si=[Diagnostics.ProcessStartInfo]::new((Resolve-Path $bin).Path)
+          $si.UseShellExecute=$false; $si.RedirectStandardInput=$true; $si.RedirectStandardOutput=$true; $si.RedirectStandardError=$true
+          $proc=[Diagnostics.Process]::Start($si)
+          $proc.StandardInput.Write('{}'); $proc.StandardInput.Close()
+          $stdout=$proc.StandardOutput.ReadToEndAsync(); $stderr=$proc.StandardError.ReadToEndAsync()
+          if (!$proc.WaitForExit(5000)) { $proc.Kill(); throw 'closed input deadline' }
+          if ($proc.ExitCode -ne 2 -or !$stderr.Wait(1000) -or !$stdout.Wait(1000) -or $stderr.Result -notmatch 'input_invalid' -or $stdout.Result.Length -ne 0) { throw 'closed input rejection failed' }
+          $proc.Dispose()
           New-Item -ItemType Directory -Path component | Out-Null
           Copy-Item $bin component/
           Copy-Item tools/official-quic-bridge/README.md,tools/official-quic-bridge/Cargo.lock,LICENSE component/
