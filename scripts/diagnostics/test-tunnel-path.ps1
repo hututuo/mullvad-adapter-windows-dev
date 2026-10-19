@@ -10,6 +10,8 @@ param(
  [string]$ClashHelperPath=(Join-Path $DiagnosticRoot 'clash-pipe.ps1'),
  [ValidatePattern('^[a-z0-9-]{1,64}$')][string]$Relay='us-sjc-wg-002',
  [ValidateRange(0,31)][int]$SsExtraIndex=0,
+ [switch]$ObserveWire,
+ [string]$WireObserverPath=(Join-Path $DiagnosticRoot 'udp-wire-observer.cs'),
  [switch]$ExitCheck
 )
 # Component experiment only. Alternate endpoint success is not product acceptance.
@@ -22,7 +24,7 @@ $ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$OutputEncoding=[Console]::OutputEncoding
 $diag=$DiagnosticRoot
 $stage='preflight';$bytes=$null;$payload=$null;$login=$null;$config=$null;$wg=$null
-$lease=$null;$p=$null;$started=$false;$out=$null;$err=$null;$clashBefore=$null
+$wire=$null;$wireRoute=$null;$wireStopped=$true;$lease=$null;$p=$null;$started=$false;$out=$null;$err=$null;$clashBefore=$null
 $id=[Guid]::NewGuid().ToString('N')
 $receipt=[ordered]@{component_only=$true;mode=$Mode;relay=$Relay;port=$Port;ss_extra_index=$SsExtraIndex;receipt_id=$id;time_utc=[DateTimeOffset]::UtcNow.ToString('o');outcome='FAIL';error=$null;probes=@();owned_engine_stop=$true;public_engine_signal_counters=@{};bound_carrier_acceptance='NOT_RUN';product_readiness='NOT_RUN'}
 function Require($condition,[string]$code){if(!$condition){$failure=[InvalidOperationException]::new('tunnel_path_guard');$failure.Data['TunnelPathCode']=$code;throw $failure}}
@@ -136,6 +138,19 @@ try{
   $wg.server=$r.ipv4_addr_in;$wg.port=$Port;$receipt.outer_endpoint=@{address=[string]$wg.server;port=$Port;protocol='udp'};$wg.mtu=1280;$wg.PSObject.Properties.Remove('dialer-proxy');$config.proxies=@($wg)
   if($Mode -eq 'clash'){$wg|Add-Member -NotePropertyName 'dialer-proxy' -NotePropertyValue 'INDEPENDENT-CLASH';$sock=[pscustomobject]@{name='INDEPENDENT-CLASH';type='socks5';server='127.0.0.1';port=7897;udp=$true};$config.proxies=@($sock,$wg)}
  }
+ if($ObserveWire){
+  $stage='wire_launch';Require ($Mode -eq 'direct') 'wire_mode_unsupported'
+  Require ((Get-FileHash -LiteralPath $WireObserverPath -Algorithm SHA256).Hash.ToLowerInvariant() -ceq 'abff8c19f8ebb9ed9f13618a8575b63b6282fce75716f45fb968baf6b15cb834') 'wire_code_pin_mismatch'
+  $wireClass='UdpWireObserver_'+$id;Require (!($wireClass -as [type])) 'wire_type_preloaded'
+  $wireCode=[IO.File]::ReadAllText($WireObserverPath,[Text.Encoding]::UTF8).Replace('UdpWireObserver',$wireClass)
+  $wireType=Add-Type -TypeDefinition $wireCode -PassThru;Require ($wireType.FullName -ceq $wireClass) 'wire_type_mismatch';$wireCode=$null
+  $sources=@(Find-NetRoute -RemoteIPAddress $r.ipv4_addr_in|Where-Object {$_.PSObject.Properties['IPAddress']})
+  Require ($sources.Count -eq 1) 'wire_route_ambiguous';$wireRoute=$sources[0]
+  $physical=@(Get-NetAdapter -Physical|Where-Object {$_.Status -eq 'Up' -and $_.ifIndex -eq $wireRoute.InterfaceIndex})
+  Require ($physical.Count -eq 1) 'wire_route_not_physical'
+  $wire=$wireType::Start([string]$wireRoute.IPAddress,[int]$wireRoute.InterfaceIndex,[string]$r.ipv4_addr_in,$Port);$wireStopped=$false
+  $receipt.wire_interface_index=[int]$wireRoute.InterfaceIndex;$wg.server='127.0.0.1';$wg.port=$wire.LocalPort
+ }
  $stage='launch';$exe=Join-Path $env:LOCALAPPDATA 'Mullvad Adapter\runtime\mihomo.exe'
  Require ((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant() -ceq '1fa8055e03596fc35167f70e9ecd1890517d38d960a39177445746a1b0defc2b') 'engine_pin_mismatch'
  $work=Join-Path $diag ('path-matrix-'+$id);[void](New-Item -ItemType Directory -Path $work)
@@ -147,6 +162,7 @@ try{
  Start-Sleep -Milliseconds 700;Assert-OwnedListeners;$stage='canaries'
  foreach($test in @(@('literal_ip','https://1.1.1.1/cdn-cgi/trace',200),@('hostname','https://www.gstatic.com/generate_204',204))){$receipt.probes+=@(Probe $test[0] $test[1] $test[2]);Assert-OwnedListeners}
  if($Mode -eq 'clash'){$after=Assert-ClashIndependent;Require ($after.signature -ceq $clashBefore.signature) 'clash_selection_changed'}
+ if($wire){$wireHealth=$wire.Snapshot();Require (!$wireHealth['faulted'] -and $wireHealth['running']) 'wire_worker_failed';$finalRoute=@(Find-NetRoute -RemoteIPAddress $r.ipv4_addr_in|Where-Object {$_.PSObject.Properties['IPAddress']});$receipt.wire_route_stable=($finalRoute.Count -eq 1 -and $finalRoute[0].InterfaceIndex -eq $wireRoute.InterfaceIndex -and [string]$finalRoute[0].IPAddress -ceq [string]$wireRoute.IPAddress);Require $receipt.wire_route_stable 'wire_route_changed'}
  if(@($receipt.probes|Where-Object {!$_.pass}).Count -eq 0){$receipt.outcome='COMPONENT_PASS';if($ExitCheck){$receipt.exit_check=Probe 'mullvad_exit' 'https://am.i.mullvad.net/json' 200 -Body}}
 }catch{
  $failure=$_.Exception;$closedCode=$null
@@ -157,9 +173,11 @@ try{
  $stopped=!$started
  if($p -and $started){try{if(!$p.HasExited){$p.Kill()};$stopped=$p.WaitForExit([int][Math]::Max(0,5000-$cleanup.ElapsedMilliseconds))}catch{$stopped=$false}}
  $receipt.owned_engine_stop=$stopped
+ if($wire){try{$wireStopped=$wire.Stop([int][Math]::Max(0,5000-$cleanup.ElapsedMilliseconds));$receipt.wire_observer=$wire.Snapshot();if($receipt.wire_observer['faulted']){$receipt.outcome='FAIL';$receipt.error='wire_worker_failed'}}catch{$wireStopped=$false};$receipt.owned_wire_stop=$wireStopped}
+
  if($stopped -and $out -and $err){try{if($out.Wait([int][Math]::Max(0,[Math]::Min(250,5000-$cleanup.ElapsedMilliseconds))) -and $err.Wait([int][Math]::Max(0,[Math]::Min(250,5000-$cleanup.ElapsedMilliseconds)))){$logs=$out.Result+"`n"+$err.Result;foreach($signal in @('sending handshake initiation','receiving handshake response','handshake did not complete','invalid mac','failed to decrypt','authentication failed','i/o timeout','network is unreachable')){$receipt.public_engine_signal_counters[$signal.Replace(' ','_')]=[regex]::Matches($logs,[regex]::Escape($signal),[Text.RegularExpressions.RegexOptions]::IgnoreCase).Count};$logs=$null}}catch{$receipt.error='log_drain_failed'}}
  if($payload){[Array]::Clear($payload,0,$payload.Length)};if($bytes){[Array]::Clear($bytes,0,$bytes.Length)};if($keyBytes){[Array]::Clear($keyBytes,0,$keyBytes.Length)};$payload=$null;$bytes=$null;$login=$null;$config=$null;$wg=$null;$ss=$null;$wgRows=$null;$out=$null;$err=$null
- if($stopped){if($p){$p.Dispose()};if($lease){$lease.Dispose()}}else{$receipt.outcome='FAIL';$receipt.error='owned_stop_unconfirmed';$global:MullvadDiagnosticUnconfirmedPeerLease=$lease}
+ if($stopped -and $wireStopped){if($p){$p.Dispose()};if($lease){$lease.Dispose()}}else{$receipt.outcome='FAIL';$receipt.error='owned_stop_unconfirmed';$global:MullvadDiagnosticUnconfirmedPeerLease=$lease;$global:MullvadDiagnosticUnconfirmedResources=@($p,$wire)}
  try{[IO.File]::WriteAllText((Join-Path $diag ('path-matrix-'+$Mode+'-'+$Port+'-'+$id+'.json')),($receipt|ConvertTo-Json -Depth 8 -Compress),[Text.UTF8Encoding]::new($false))}catch{$receipt.outcome='FAIL';$receipt.error='receipt_write_failed'}
  $receipt|ConvertTo-Json -Depth 8 -Compress
 }
