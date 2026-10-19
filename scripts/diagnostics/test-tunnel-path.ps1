@@ -9,6 +9,7 @@ param(
  [string]$RpcHelperPath=(Join-Path $DiagnosticRoot 'rpc-helpers.ps1'),
  [string]$ClashHelperPath=(Join-Path $DiagnosticRoot 'clash-pipe.ps1'),
  [ValidatePattern('^[a-z0-9-]{1,64}$')][string]$Relay='us-sjc-wg-002',
+ [ValidateRange(0,31)][int]$SsExtraIndex=0,
  [switch]$ExitCheck
 )
 # Component experiment only. Alternate endpoint success is not product acceptance.
@@ -23,7 +24,7 @@ $diag=$DiagnosticRoot
 $stage='preflight';$bytes=$null;$payload=$null;$login=$null;$config=$null;$wg=$null
 $lease=$null;$p=$null;$started=$false;$out=$null;$err=$null;$clashBefore=$null
 $id=[Guid]::NewGuid().ToString('N')
-$receipt=[ordered]@{component_only=$true;mode=$Mode;relay=$Relay;port=$Port;receipt_id=$id;time_utc=[DateTimeOffset]::UtcNow.ToString('o');outcome='FAIL';error=$null;probes=@();owned_engine_stop=$true;public_engine_signal_counters=@{};bound_carrier_acceptance='NOT_RUN';product_readiness='NOT_RUN'}
+$receipt=[ordered]@{component_only=$true;mode=$Mode;relay=$Relay;port=$Port;ss_extra_index=$SsExtraIndex;receipt_id=$id;time_utc=[DateTimeOffset]::UtcNow.ToString('o');outcome='FAIL';error=$null;probes=@();owned_engine_stop=$true;public_engine_signal_counters=@{};bound_carrier_acceptance='NOT_RUN';product_readiness='NOT_RUN'}
 function Require($condition,[string]$code){if(!$condition){$failure=[InvalidOperationException]::new('tunnel_path_guard');$failure.Data['TunnelPathCode']=$code;throw $failure}}
 function Read-Json([string]$path){Require ((Get-Item -LiteralPath $path).Length -le 8388608) 'input_cap';return ([IO.File]::ReadAllText($path,[Text.Encoding]::UTF8)|ConvertFrom-Json)}
 function Public-V4($value){
@@ -129,10 +130,10 @@ try{
  $wg.'private-key'=$login.device.wg_data.private_key;$wg.'public-key'=$r.public_key;$wg.ip=($login.device.wg_data.addresses.ipv4_address -split '/')[0];$wg.ipv6=($login.device.wg_data.addresses.ipv6_address -split '/')[0]
  if($Mode -eq 'ss'){
   $extra=@($r.shadowsocks_extra_addr_in|Where-Object {Public-V4 $_})
-  if($extra.Count){$ss.server=$extra[0]}else{Require ($Port -ge 51900 -and $Port -le 51949 -and (In-Ranges $c.wireguard.shadowsocks_port_ranges $Port)) 'primary_ss_port_not_advertised';$ss.server=$r.ipv4_addr_in}
-  $ss.port=$Port;$ss.PSObject.Properties.Remove('dialer-proxy');$wg.server='127.0.0.1';$wg.port=51820;$wg.'dialer-proxy'='SS-INLET';$config.proxies=@($ss,$wg)
+  if($extra.Count){Require ($SsExtraIndex -lt $extra.Count) 'ss_extra_index_out_of_range';$ss.server=$extra[$SsExtraIndex]}else{Require ($SsExtraIndex -eq 0) 'ss_extra_index_unavailable';Require ($Port -ge 51900 -and $Port -le 51949 -and (In-Ranges $c.wireguard.shadowsocks_port_ranges $Port)) 'primary_ss_port_not_advertised';$ss.server=$r.ipv4_addr_in}
+  $ss.port=$Port;$receipt.outer_endpoint=@{address=[string]$ss.server;port=$Port;protocol='udp'};$ss.PSObject.Properties.Remove('dialer-proxy');$wg.server='127.0.0.1';$wg.port=51820;$wg.'dialer-proxy'='SS-INLET';$config.proxies=@($ss,$wg)
  }else{
-  $wg.server=$r.ipv4_addr_in;$wg.port=$Port;$wg.mtu=1280;$wg.PSObject.Properties.Remove('dialer-proxy');$config.proxies=@($wg)
+  $wg.server=$r.ipv4_addr_in;$wg.port=$Port;$receipt.outer_endpoint=@{address=[string]$wg.server;port=$Port;protocol='udp'};$wg.mtu=1280;$wg.PSObject.Properties.Remove('dialer-proxy');$config.proxies=@($wg)
   if($Mode -eq 'clash'){$wg|Add-Member -NotePropertyName 'dialer-proxy' -NotePropertyValue 'INDEPENDENT-CLASH';$sock=[pscustomobject]@{name='INDEPENDENT-CLASH';type='socks5';server='127.0.0.1';port=7897;udp=$true};$config.proxies=@($sock,$wg)}
  }
  $stage='launch';$exe=Join-Path $env:LOCALAPPDATA 'Mullvad Adapter\runtime\mihomo.exe'
