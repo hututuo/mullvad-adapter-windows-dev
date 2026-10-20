@@ -127,6 +127,13 @@ fn safe_event(value: &LogEvent) -> bool {
                 | "active_binding_changed"
                 | "active_local_rebuild"
                 | "active_data_failed"
+                | "active_failure_confirmation"
+                | "active_front_repair_failed"
+                | "original_inlet_short_retry"
+                | "direct_routes_exhausted_chain_last"
+                | "route_trial_failed"
+                | "route_trial_failed_restore_previous"
+                | "restore_previous_failed_use_verified_backup"
                 | "network_binding_changed"
                 | "waiting_network_settle"
                 | "direct_verified"
@@ -475,6 +482,39 @@ mod tests {
             quick_test: None,
             city_candidates: vec![],
         }
+    }
+    #[test]
+    fn recovery_transitions_survive_diagnostic_export_without_accepting_free_text() {
+        let root = temporary();
+        let logs = Logs { root: root.clone() };
+        let transitions = [
+            "active_failure_confirmation",
+            "active_front_repair_failed",
+            "original_inlet_short_retry",
+            "direct_routes_exhausted_chain_last",
+            "route_trial_failed",
+            "route_trial_failed_restore_previous",
+            "restore_previous_failed_use_verified_backup",
+        ];
+        for code in transitions {
+            logs.event("connection", code).unwrap();
+            assert!(logs
+                .event("connection", &format!("{code} private-key=untrusted"))
+                .is_err());
+        }
+        let report = logs
+            .report(&snapshot(), "33333333-3333-3333-3333-333333333333")
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+        let exported: Vec<_> = body["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["code"].as_str().unwrap())
+            .collect();
+        assert_eq!(exported, transitions);
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn withdrawn_original_inlet_is_reported_without_disabling_logging() {
