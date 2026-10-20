@@ -99,3 +99,10 @@ Windows 默认在启动后连接已选城市；优先使用仍被当前目录授
 外部 Clash 已启用所选配置和系统代理/TUN时，命中本机节点的流量才进入适配器。
 隧道未就绪或重建时 front 拒绝转发，不提供 DIRECT 回落；已有长连接可能中断，不能
 宣称无损切换或系统级 kill switch。国内/局域网直连与用户其他节点继续按 Clash 规则。
+
+Clash Verge 2.5.8 服务模式会覆盖 YAML 中的 sidecar 控制管道。Windows 接入只在
+当前用户 SID 摘要匹配时解析官方 sidecar-release / production 管道对；仅一个存活
+才使用，两者同时存在或权限错误则明确失败。一次接入事务固定控制端点，不跨端点
+重放写操作，不转向 HTTP 或发送 HTTP secret，也不更改 Clash 的服务模式。
+命名与模式切换依据为 [Clash Verge v2.5.8](https://github.com/clash-verge-rev/clash-verge-rev/blob/v2.5.8/src-tauri/src/core/manager/state.rs)
+及其固定 [service-ipc v2.7.6](https://github.com/clash-verge-rev/clash-verge-service-ipc/blob/v2.7.6/src/core/paths.rs)。

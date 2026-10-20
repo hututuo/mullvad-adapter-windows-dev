@@ -289,7 +289,10 @@ impl LocalController {
             return Ok(Self {
                 agent: ureq::Agent::with_parts(
                     config,
-                    pipe_transport::PipeConnector(name.clone()),
+                    pipe_transport::PipeConnector(
+                        adapter_platform::windows_control_pipe::resolve_verge_pipe(name)
+                            .map_err(|_| err("controller_unavailable"))?,
+                    ),
                     ureq::unversioned::resolver::DefaultResolver::default(),
                 ),
                 base: "http://127.0.0.1:1".into(), // virtual URI; no TCP socket

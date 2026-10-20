@@ -37,6 +37,10 @@
   groups. Explain that the selected external Clash configuration owns ingress.
 - WHEN either route is selected, THEN show the actual attempted/committed route,
   and distinguish build, candidate, install and real egress evidence.
+- WHEN Clash Verge switches between sidecar-release and production service mode,
+  THEN resolve only its strict current-user SID hash pipe pair before the control
+  transaction; require one present endpoint and freeze that name. Ambiguity,
+  foreign owner or access errors fail closed without HTTP fallback or secret.
 
 ## AR5: Exhaustion is followed by bounded cooldown rounds
 - WHEN an authorized connection intent exhausts a round and automatic recovery is

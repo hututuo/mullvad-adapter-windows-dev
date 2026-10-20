@@ -7,6 +7,61 @@ use std::{
 };
 use windows_sys::Win32::{Foundation::*, Storage::FileSystem::*, System::Pipes::*};
 
+/// Clash Verge 2.5.8 overrides the YAML sidecar pipe when its service starts.
+/// Resolve that known pair once, before constructing the HTTP client. Never
+/// switch endpoints after a request has been sent or enumerate other users.
+pub fn resolve_verge_pipe(configured: &str) -> io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let owner = crate::windows::Identity::current()?;
+    let key = format!("{:x}", Sha256::digest(owner.sid_for_storage().as_bytes()));
+    resolve_verge_with(configured, &key, pipe_present)
+}
+fn resolve_verge_with(
+    configured: &str,
+    key: &str,
+    present: impl Fn(&str) -> io::Result<bool>,
+) -> io::Result<String> {
+    let suffix = configured
+        .strip_prefix(r"\\.\pipe\verge-mihomo-sidecar-release-")
+        .or_else(|| configured.strip_prefix(r"\\.\pipe\verge-mihomo-production-"));
+    let Some(suffix) = suffix else {
+        return Ok(configured.to_owned()); // Custom endpoints retain their contract.
+    };
+    if suffix.len() != 64
+        || !suffix
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || suffix != key
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "local_control_owner_mismatch",
+        ));
+    }
+    let sidecar = format!(r"\\.\pipe\verge-mihomo-sidecar-release-{key}");
+    let service = format!(r"\\.\pipe\verge-mihomo-production-{key}");
+    match (present(&sidecar)?, present(&service)?) {
+        (true, false) => Ok(sidecar),
+        (false, true) => Ok(service),
+        (true, true) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "local_control_ambiguous",
+        )),
+        (false, false) => Err(timeout()),
+    }
+}
+fn pipe_present(name: &str) -> io::Result<bool> {
+    let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    if unsafe { WaitNamedPipeW(wide.as_ptr(), 1) } != 0 {
+        return Ok(true);
+    }
+    match unsafe { GetLastError() } {
+        ERROR_FILE_NOT_FOUND => Ok(false),
+        ERROR_SEM_TIMEOUT | ERROR_PIPE_BUSY => Ok(true),
+        code => Err(io::Error::from_raw_os_error(code as i32)),
+    }
+}
+
 pub struct LocalControlPipe {
     handle: HANDLE,
     lifetime: Instant,
@@ -166,6 +221,40 @@ impl Write for LocalControlPipe {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    #[test]
+    fn verge_pair_is_current_user_only_unambiguous_and_resolved_once() {
+        let key = "a".repeat(64);
+        let sidecar = format!(r"\\.\pipe\verge-mihomo-sidecar-release-{key}");
+        let service = format!(r"\\.\pipe\verge-mihomo-production-{key}");
+        assert_eq!(
+            resolve_verge_with(&sidecar, &key, |n| Ok(n == service)).unwrap(),
+            service
+        );
+        assert_eq!(
+            resolve_verge_with(&service, &key, |n| Ok(n == sidecar)).unwrap(),
+            sidecar
+        );
+        assert!(resolve_verge_with(&sidecar, &key, |_| Ok(true)).is_err());
+        assert!(resolve_verge_with(&sidecar, &key, |_| Ok(false)).is_err());
+        assert!(resolve_verge_with(&sidecar, &"b".repeat(64), |_| panic!(
+            "foreign owner must not be probed"
+        ))
+        .is_err());
+        assert!(resolve_verge_with(&format!("{sidecar}x"), &key, |_| panic!(
+            "invalid suffix must not be probed"
+        ))
+        .is_err());
+        let custom = r"\\.\pipe\custom-control";
+        assert_eq!(
+            resolve_verge_with(custom, &key, |_| panic!("custom pipe must not be inferred"))
+                .unwrap(),
+            custom
+        );
+        assert!(resolve_verge_with(&sidecar, &key, |_| Err(
+            io::ErrorKind::PermissionDenied.into()
+        ))
+        .is_err());
+    }
     #[test]
     fn remote_pipe_is_rejected_and_missing_local_pipe_has_a_deadline() {
         let start = Instant::now();
