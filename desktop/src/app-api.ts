@@ -5,6 +5,8 @@ export type Settings = {
   bootstrap_port: number | null;
   front_port: number;
   automatic_recovery: boolean;
+  connect_on_start: boolean;
+  tunnel_route: "direct" | "chain" | "auto";
   required_multihop: boolean;
   required_pq: boolean;
 };
@@ -55,11 +57,14 @@ export type Dashboard = {
   device_name: string | null;
   public_key: string | null;
   active_relay: string | null;
-  connection?: { relay:string; city:string; inlet:string; interface_index:number; instance:number; phase:string; ip:boolean|null; dns:boolean|null; https:boolean|null; probes?: {ip:ProbeOutcome;dns:ProbeOutcome;https:ProbeOutcome} } | null;
+  connection?: { relay:string; city:string; inlet:string; interface_index:number; instance:number; phase:string; chained?:boolean; ip:boolean|null; dns:boolean|null; https:boolean|null; probes?: {ip:ProbeOutcome;dns:ProbeOutcome;https:ProbeOutcome} } | null;
   readiness: string | null;
   cities: City[];
   metadata_source: string;
   metadata_updated_at: number | null;
+  metadata_refreshing?: boolean;
+  metadata_error?: string | null;
+  chain_node?: string | null;
   account: {
     authenticated: boolean;
     expiry: string | null;
@@ -189,6 +194,13 @@ const errors: Record<string, string> = {
   identity_backup_occupied: "已有另一份旧身份备份，请先妥善保管，未覆盖任何密钥。",
   identity_activation_uncertain: "新身份的本地写入结果未确认，已暂停使用旧身份。请正常停止后台后重新打开，再核对本机设备身份；密钥和备份均已保留。",
   bootstrap_missing: "请在设置中指定可用的本地外网代理端口。",
+  metadata_refresh_busy: "官方目录正在后台更新，现有连接保持运行。",
+  metadata_refresh_unavailable: "目录更新暂不可用，已保留缓存，稍后自动重试。",
+  chain_not_configured: "请先在诊断与设置中保存一个独立链式节点。",
+  chain_configuration_invalid: "本机链式节点配置无法核验，请重新从 Clash 选择。",
+  chain_write_failed: "链式节点未能安全保存，请重试；现有连接保持运行。",
+  disconnect_before_chain_change: "当前链式连接仍使用原节点。请先断开，再更换链式节点；不会在后台替换原路径。",
+  clash_not_found: "尚未找到唯一的本机 Clash 配置，请先在 Clash 接入页确认。",
   bootstrap_unavailable: "本地外网代理不可用，请检查指定端口。",
   api_unreachable: "账号服务尚未连接，请检查外网代理出口并导出诊断。",
   backend_stop_worker_failed: "停止操作未能启动；后台不会自动重启，请重试停止。",

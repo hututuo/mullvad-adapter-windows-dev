@@ -11,8 +11,11 @@
 | 25秒保活、MTU、回退预算、路由规则 | 明确的客户端策略，不应伪称 API 数据 |
 | 本机网卡/路由、Clash端口与节点、进程 | 本机观测或用户配置，不复用开发者机器的值 |
 
-目录可使用本机缓存；旧缓存缺少获取时间，界面明确提示缓存而不伪报官方即时数据。
-缓存 TTL 与后台刷新尚未完成，不应以缓存 active 或 ICMP 成功承诺可用。
+Windows 启动先使用有效本机缓存，物理网络稳定后在独立线程自动刷新官方目录，
+成功后每 24 小时更新。失败保留缓存，按 1、5、15 分钟退避；已确认的物理断网暂停请求，
+连续失败期间仅允许一次稳定恢复提前唤醒。手动更新共用单个在途任务，不占用账号或隧道队列。
+新缓存保存实际获取时间，旧缓存没有时间则如实显示；过期目录不是当前可达性的证明。
+更新不会重启健康 worker、主动探测备用 WG，或清空当前恢复轮的失败/时间预算。
 
 ## 真实生产路径与限制
 
@@ -22,6 +25,20 @@ Direct IPv4/IPv6 配置生成器存在，但产品自动恢复尚不选择这些
 QUIC、UDP-over-TCP、LWO 未接入，不能将官方 App 的支持矩阵套用到本软件。
 Windows 对必需多跳/PQ采取显式不支持，不能悄悄降低保护。Mac 旧实现的能力与
 验收独立，不能因此宣称 Windows 等价。IPv6、MTU与大流量仍需单独真机验收。
+
+Windows 可从本机 Clash 实际配置及受限的本地 provider 缓存导入一个独立 SS 叶节点，
+作为可选的隧道承载。策略为仅直连、优先直连后链式备用、固定链式。默认自动策略在
+未保存独立节点时只尝试原有直连；不会猜测或免费生成备用节点。首阶段仅支持 IPv4
+出站、无插件的 aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305 SS UDP。
+不支持的节点、IPv6 literal、歧义名称、越界 provider 路径不列为可用；导入绑定配置摘要，
+配置变化后必须重新读取。密码不进入 renderer、日志、报告或公开配置，在本机 DPAPI 保存。
+
+链式路径为 WG → Mullvad SS → 独立 SS → 自持认证 carrier → 物理网卡。物理 socket
+和 route witness 指向独立 SS 的真实 IPv4；最终业务选择仍只有 Mullvad。不会借用外部
+Clash 的通用 SOCKS 端口冒充物理绑定证据，也不改用户的 Clash 选择组。域名经有界的
+系统解析线程解析后，仅接受公网 IPv4；无法解析或被 fake-IP 接管时会明确失败。
+仍存活或待恢复的链式原路径不允许后台更换上游，需先显式断开。独立节点本身必须
+支持 UDP，链式不是 UDP-over-TCP，不能据此承诺能通过全面 UDP 封锁。
 
 对称型 NAT 不等于必然连接失败：客户端主动连接固定公网 relay 与 P2P 打洞
 不同，出站 UDP 及相同目标的回包仍可能可用。25秒 WireGuard 保活用于维护
@@ -60,3 +77,18 @@ TUN需有独立API规则。配置了本机代理时不会静默回退或重放�
 Windows keeps the established SS default as its first choice. After a fresh owned data-plane failure and confirmed worker/carrier cleanup, it can try at most four metadata-authorized inlet combinations on that same relay before moving through the existing same-city relay queue. Dedicated extra IPv4 addresses may use 443 or the established default port; primary relay addresses remain restricted to the official SS port ranges. Addresses are read from current metadata, not machine constants. No UDP53 candidate is added.
 
 Original-path recovery still starts with the exact saved inlet. New alternatives are fallback attempts, retain the existing 45-second round start budget, and cannot run concurrently under one WG identity. Stale evidence, cancellation, physical-offline state and local setup errors do not consume an inlet. DNS-only or single-service degradation does not advance this inlet queue. A healthy committed path is retained; no spare tunnel is probed in the background. Metadata refresh cannot resurrect failed endpoints or grow one round beyond twelve measured inlet failures.
+
+With an independent SS upstream configured, automatic mode tries that same Mullvad
+inlet through the chain after measured direct failure, then alternates bounded
+direct/chain attempts. Both routes share the four-per-relay/twelve-per-round cap.
+The original committed route is rebuilt first. A healthy chain is retained rather
+than periodically switching its IP or probing another tunnel to prefer direct.
+
+## 启动与系统流量接入
+
+Windows 默认在启动后连接已选城市；优先使用仍被当前目录授权的上次节点和 SS 入口，
+完整验证后才提交 front。可在连接设置关闭；本次启动中显式断开/取消会撤销启动意图。
+启动不会创建身份或替用户开启系统代理/TUN，也不会在退出后私自更改 Clash 规则。
+外部 Clash 已启用所选配置和系统代理/TUN时，命中本机节点的流量才进入适配器。
+隧道未就绪或重建时 front 拒绝转发，不提供 DIRECT 回落；已有长连接可能中断，不能
+宣称无损切换或系统级 kill switch。国内/局域网直连与用户其他节点继续按 Clash 规则。

@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             endpoint: "2001:db8::1".parse()?,
             port: 33431,
         },
-        "ss" => Transport::Shadowsocks {
+        "ss" | "chain" => Transport::Shadowsocks {
             endpoint: "198.51.100.2".parse()?,
             port: 443,
         },
@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = if mode == "front" {
         front(&listener, 51003, 51005)?
     } else {
-        worker(&WorkerInput {
+        let input = WorkerInput {
             identity: Identity {
                 private_key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
                 preshared_key: None,
@@ -46,7 +46,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ipv6: true,
             },
             listener,
-        })?
+        };
+        if mode == "chain" {
+            let upstream = chain::UpstreamSs::decode(br#"{"name":"synthetic-upstream","server":"192.0.2.7","port":8443,"cipher":"aes-128-gcm","password":"synthetic-not-a-real-secret"}"#)?;
+            worker_chain_config(
+                &input,
+                &Carrier {
+                    port: 51009,
+                    password: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                },
+                &upstream,
+                "192.0.2.7".parse()?,
+            )?
+        } else {
+            worker(&input)?
+        }
     };
     std::io::stdout().write_all(output.expose())?;
     Ok(())

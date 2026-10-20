@@ -25,6 +25,7 @@ pub struct TunnelSpec {
     pub ipv6: Ipv6Addr,
     pub relay_public_key: String,
     pub transport: Transport,
+    pub chain: Option<Arc<crate::chain::UpstreamSs>>,
     pub slot: Selected,
     pub mixed_port: u16,
     pub controller_port: u16,
@@ -191,27 +192,27 @@ impl Manager {
                     });
                 }
                 let monitor = network.cancellation_monitor();
-                let worker = Worker::start_carried(
-                    &self.executable,
-                    &spec.runtime,
-                    &WorkerRequest {
-                        identity: Identity {
-                            private_key: &spec.private_key,
-                            preshared_key: None,
-                            ipv4: spec.ipv4,
-                            ipv6: Some(spec.ipv6),
-                        },
-                        relay_public_key: &spec.relay_public_key,
-                        transport: spec.transport,
-                        protection: Protection::Standard,
-                        listener: Listener {
-                            mixed_port: spec.mixed_port,
-                            controller_port: spec.controller_port,
-                            controller_secret: &spec.controller_secret,
-                        },
+                let request = WorkerRequest {
+                    identity: Identity {
+                        private_key: &spec.private_key,
+                        preshared_key: None,
+                        ipv4: spec.ipv4,
+                        ipv6: Some(spec.ipv6),
                     },
-                    network,
-                );
+                    relay_public_key: &spec.relay_public_key,
+                    transport: spec.transport,
+                    protection: Protection::Standard,
+                    listener: Listener {
+                        mixed_port: spec.mixed_port,
+                        controller_port: spec.controller_port,
+                        controller_secret: &spec.controller_secret,
+                    },
+                };
+                let worker = if let Some(chain) = &spec.chain {
+                    Worker::start_chained(&self.executable, &spec.runtime, &request, network, chain)
+                } else {
+                    Worker::start_carried(&self.executable, &spec.runtime, &request, network)
+                };
                 let worker = match worker {
                     Ok(worker) => worker,
                     Err(crate::worker_lifecycle::WorkerStartError::Cleanup) => {

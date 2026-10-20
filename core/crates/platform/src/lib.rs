@@ -44,5 +44,6 @@ pub mod egress;
 #[cfg(any(test, windows, feature = "windows-api-check"))]
 mod launch_gate;
 
+pub mod chain_endpoint;
 #[cfg(any(windows, feature = "windows-api-check"))]
 pub mod windows_control_pipe;

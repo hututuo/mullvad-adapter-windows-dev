@@ -34,6 +34,10 @@ pub struct Settings {
     pub bootstrap_port: Option<u16>,
     pub front_port: u16,
     pub automatic_recovery: bool,
+    #[serde(default = "enabled")]
+    pub connect_on_start: bool,
+    #[serde(default)]
+    pub tunnel_route: TunnelRoute,
     pub required_multihop: bool,
     pub required_pq: bool,
 }
@@ -45,10 +49,23 @@ impl Default for Settings {
             bootstrap_port: None,
             front_port: 17890,
             automatic_recovery: true,
+            connect_on_start: true,
+            tunnel_route: TunnelRoute::Auto,
             required_multihop: false,
             required_pq: false,
         }
     }
+}
+fn enabled() -> bool {
+    true
+}
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TunnelRoute {
+    Direct,
+    Chain,
+    #[default]
+    Auto,
 }
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -135,24 +152,53 @@ impl AppRequest {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AppCommand {
     Dashboard,
-    SaveSettings { settings: Settings },
+    SaveSettings {
+        settings: Settings,
+    },
     RefreshCatalogue,
-    Relays { city: Option<String>, page: u16 },
-    SelectCity { city: String },
+    /// Only the native Clash reader constructs this credential-bearing value.
+    ConfigureChain {
+        proxy: SecretText,
+    },
+    Relays {
+        city: Option<String>,
+        page: u16,
+    },
+    SelectCity {
+        city: String,
+    },
     Connect,
-    ConnectRelay { hostname: String },
+    ConnectRelay {
+        hostname: String,
+    },
     Disconnect,
     CancelOperation,
-    QuickTest { city: String },
-    FullTest { city: String },
-    AccountLogin { account: SecretText },
+    QuickTest {
+        city: String,
+    },
+    FullTest {
+        city: String,
+    },
+    AccountLogin {
+        account: SecretText,
+    },
     AccountRefresh,
     AccountLogout,
-    RemoveDevice { device_id: String },
-    CreateDevice { confirm: bool },
-    UseCreatedDevice { confirm: bool },
-    RevealKey { confirm: bool },
-    RedeemVoucher { voucher: SecretText },
+    RemoveDevice {
+        device_id: String,
+    },
+    CreateDevice {
+        confirm: bool,
+    },
+    UseCreatedDevice {
+        confirm: bool,
+    },
+    RevealKey {
+        confirm: bool,
+    },
+    RedeemVoucher {
+        voucher: SecretText,
+    },
     ExportReport,
     Shutdown,
 }
@@ -260,6 +306,8 @@ pub enum ProbeOutcome {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectionInfo {
+    #[serde(default)]
+    pub chained: bool,
     pub relay: String,
     pub city: String,
     pub inlet: String,
@@ -322,6 +370,12 @@ pub struct Dashboard {
     pub cities: Vec<City>,
     pub metadata_source: String,
     pub metadata_updated_at: Option<u64>,
+    #[serde(default)]
+    pub metadata_refreshing: bool,
+    #[serde(default)]
+    pub metadata_error: Option<String>,
+    #[serde(default)]
+    pub chain_node: Option<String>,
     pub account: Account,
     pub operation: Option<String>,
     pub last_error: Option<String>,
@@ -438,6 +492,19 @@ impl AppReply {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn old_settings_gain_automatic_start_and_safe_optional_chain_policy() {
+        let value = serde_json::to_value(Settings::default()).unwrap();
+        let mut old = value.clone();
+        old.as_object_mut().unwrap().remove("connect_on_start");
+        old.as_object_mut().unwrap().remove("tunnel_route");
+        let restored: Settings = serde_json::from_value(old).unwrap();
+        assert!(restored.connect_on_start);
+        assert_eq!(restored.tunnel_route, TunnelRoute::Auto);
+        let mut bad = value;
+        bad["tunnel_route"] = serde_json::json!("direct_on_failure");
+        assert!(serde_json::from_value::<Settings>(bad).is_err());
+    }
     #[test]
     fn settings_reject_invalid_favorites_ports_and_selected_city() {
         let mut value = Settings::default();

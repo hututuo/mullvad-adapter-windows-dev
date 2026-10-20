@@ -10,6 +10,8 @@ pub struct Request {
     choice: Option<Choice>,
     preview_id: Option<String>,
     selection: Option<adapter_clash_integration::portable::Selection>,
+    chain_name: Option<String>,
+    chain_fingerprint: Option<String>,
 }
 static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(windows)]
@@ -158,6 +160,46 @@ fn execute(input: Request) -> Result<Value, String> {
         }
         found.into_iter().next().unwrap()
     };
+    if input.kind == "chain_list" {
+        let choices = adapter_clash_integration::chain_source::list(&root, front)?;
+        return Ok(json!({"choices":choices}));
+    }
+    if input.kind == "chain_configure" {
+        let selected = adapter_clash_integration::chain_source::selected(
+            &root,
+            front,
+            input
+                .chain_name
+                .as_deref()
+                .ok_or("clash_chain_choice_missing")?,
+        )?;
+        if input.chain_fingerprint.as_deref() != Some(selected.fingerprint.as_str()) {
+            return Err("clash_config_changed".into());
+        }
+        #[derive(serde::Serialize)]
+        struct NativeChain<'a> {
+            name: &'a str,
+            server: &'a str,
+            port: u16,
+            cipher: &'a str,
+            password: &'a str,
+        }
+        let bytes = serde_json::to_string(&NativeChain {
+            name: &selected.name,
+            server: &selected.server,
+            port: selected.port,
+            cipher: &selected.cipher,
+            password: &selected.password,
+        })
+        .map_err(|_| "clash_chain_configuration_invalid")?;
+        return match super::transact(adapter_protocol::app::AppCommand::ConfigureChain {
+            proxy: adapter_protocol::app::SecretText::new(bytes),
+        })? {
+            adapter_protocol::app::AppReply::Accepted { .. } => Ok(json!({"accepted":true})),
+            adapter_protocol::app::AppReply::Error { code } => Err(code),
+            _ => Err("invalid_response".into()),
+        };
+    }
     let app_root = adapter_platform::windows_paths::AppRoot::open("WindowsClash")
         .map_err(|_| "clash_private_store_unavailable")?;
     let store = app_root.path().join("clash-integration");

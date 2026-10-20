@@ -60,6 +60,10 @@ fn safe_event(value: &LogEvent) -> bool {
                 | "metadata_cache_write_failed"
                 | "metadata_cache_access_denied"
                 | "metadata_cache_read_failed"
+                | "metadata_missing"
+                | "metadata_refresh_started"
+                | "metadata_refresh_complete"
+                | "metadata_refresh_unavailable"
                 | "account_required"
                 | "identity_missing"
                 | "current_device_protected"
@@ -89,6 +93,11 @@ fn safe_event(value: &LogEvent) -> bool {
                 | "degraded_preserved"
                 | "candidate_not_ready"
                 | "same_relay_inlet_retry"
+                | "same_relay_chain_retry"
+                | "chain_not_configured"
+                | "chain_configuration_invalid"
+                | "chain_write_failed"
+                | "chain_configured"
                 | "shadowsocks_inlets_exhausted"
                 | "candidate_cancelled"
                 | "candidate_start_failed"
@@ -442,6 +451,9 @@ mod tests {
             cities: vec![],
             metadata_source: "missing".into(),
             metadata_updated_at: None,
+            metadata_refreshing: false,
+            metadata_error: None,
+            chain_node: None,
             account: Account::default(),
             operation: None,
             last_error: None,
@@ -532,6 +544,7 @@ mod tests {
         let root = temporary();
         let logs = Logs { root: root.clone() };
         let mut info = adapter_protocol::app::ConnectionInfo {
+            chained: false,
             relay: "xx-aaa-wg-001".into(),
             city: "xx-aaa".into(),
             inlet: "192.0.2.1:20484".into(),

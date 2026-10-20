@@ -1,5 +1,6 @@
 //! Pure Mihomo configuration contracts. No process, file, socket or live peer use.
 mod carrier;
+pub mod chain;
 #[cfg(any(test, windows, feature = "windows-api-check"))]
 mod device_identity;
 #[cfg(any(test, windows, feature = "windows-api-check"))]
@@ -370,6 +371,43 @@ pub fn worker_with_carrier_route(
     }
     Ok(config)
 }
+/// The physical witness belongs to the independent SS leaf, not the logical
+/// Mullvad inlet. Both SS layers remain inside the retained owned worker.
+pub fn worker_with_chain_carrier_route(
+    input: &WorkerInput<'_>,
+    route: &adapter_platform::egress::EgressSnapshot,
+    carrier: &Carrier<'_>,
+    upstream: &chain::UpstreamSs,
+    endpoint: Ipv4Addr,
+) -> io::Result<SecretConfig> {
+    let binding = route.binding();
+    if !route.is_fresh()
+        || route.destination() != IpAddr::V4(endpoint)
+        || !chain::public_ipv4(endpoint)
+        || !binding.ipv4
+        || input.egress.luid != binding.luid
+        || input.egress.index != binding.index
+        || input.egress.alias != route.alias()
+    {
+        return Err(invalid());
+    }
+    let result = worker_chain_config(input, carrier, upstream, endpoint)?;
+    if !route.is_fresh() {
+        return Err(invalid());
+    }
+    Ok(result)
+}
+pub fn worker_chain_config(
+    input: &WorkerInput<'_>,
+    carrier: &Carrier<'_>,
+    upstream: &chain::UpstreamSs,
+    endpoint: Ipv4Addr,
+) -> io::Result<SecretConfig> {
+    if !matches!(input.transport, Transport::Shadowsocks { .. }) || !chain::public_ipv4(endpoint) {
+        return Err(invalid());
+    }
+    worker_config_graph(input, Some(carrier), false, Some((upstream, endpoint)))
+}
 fn worker_config(
     input: &WorkerInput<'_>,
     carrier: Option<&Carrier<'_>>,
@@ -380,6 +418,14 @@ fn worker_config_with_output(
     input: &WorkerInput<'_>,
     carrier: Option<&Carrier<'_>>,
     diagnostic: bool,
+) -> io::Result<SecretConfig> {
+    worker_config_graph(input, carrier, diagnostic, None)
+}
+fn worker_config_graph<'a>(
+    input: &'a WorkerInput<'a>,
+    carrier: Option<&'a Carrier<'a>>,
+    diagnostic: bool,
+    chain: Option<(&'a chain::UpstreamSs, Ipv4Addr)>,
 ) -> io::Result<SecretConfig> {
     if carrier.is_some_and(|carrier| {
         carrier.port < 1024
@@ -462,13 +508,17 @@ fn worker_config_with_output(
             } else {
                 None
             };
-            ss.dialer_proxy = carrier.map(|_| "CARRIER");
+            ss.dialer_proxy = if chain.is_some() {
+                Some("UPSTREAM-SS")
+            } else {
+                carrier.map(|_| "CARRIER")
+            };
             ss.ip_version = Some("ipv4");
             proxies.push(ss);
             wg.server = "127.0.0.1".into();
             wg.port = 51820;
             wg.dialer_proxy = Some("SS-INLET");
-            wg.mtu = Some(1265);
+            wg.mtu = Some(if chain.is_some() { 1240 } else { 1265 });
         }
     }
     if let Some(carrier) = carrier {
@@ -484,6 +534,14 @@ fn worker_config_with_output(
         inlet.password = Some(carrier.password);
         inlet.ip_version = Some("ipv4");
         proxies.push(inlet);
+    }
+    if let Some((upstream, endpoint)) = chain {
+        let mut ss = Proxy::empty("UPSTREAM-SS", "ss", endpoint.to_string(), upstream.port());
+        ss.cipher = Some(upstream.cipher().ok_or_else(invalid)?);
+        ss.password = Some(upstream.password());
+        ss.ip_version = Some("ipv4");
+        ss.dialer_proxy = Some("CARRIER");
+        proxies.push(ss);
     }
     proxies.push(wg);
     let mut output = config(&input.listener, v6, proxies, vec!["MULLVAD"]);
@@ -520,6 +578,62 @@ pub fn front(listener: &Listener<'_>, slot_a: u16, slot_b: u16) -> io::Result<Se
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn chain_has_one_final_wg_choice_and_an_owned_physical_carrier() {
+        let input = WorkerInput {
+            identity: Identity {
+                private_key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+                preshared_key: None,
+                ipv4: "10.64.0.2".parse().unwrap(),
+                ipv6: None,
+            },
+            relay_public_key: "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            transport: Transport::Shadowsocks {
+                endpoint: "198.51.100.2".parse().unwrap(),
+                port: 20484,
+            },
+            protection: Protection::Standard,
+            egress: Egress {
+                alias: "synthetic",
+                luid: 1,
+                index: 1,
+                ipv4: true,
+                ipv6: false,
+            },
+            listener: Listener {
+                mixed_port: 51001,
+                controller_port: 51002,
+                controller_secret:
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            },
+        };
+        let upstream = chain::UpstreamSs::decode(br#"{"name":"synthetic","server":"192.0.2.9","port":8443,"cipher":"aes-128-gcm","password":"synthetic-upstream"}"#).unwrap();
+        let config = worker_chain_config(
+            &input,
+            &Carrier {
+                port: 51009,
+                password: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            },
+            &upstream,
+            "192.0.2.9".parse().unwrap(),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(config.expose()).unwrap();
+        assert_eq!(
+            value["proxy-groups"][0]["proxies"],
+            serde_json::json!(["MULLVAD"])
+        );
+        let proxies = value["proxies"].as_array().unwrap();
+        let node = |name: &str| proxies.iter().find(|p| p["name"] == name).unwrap();
+        assert_eq!(node("MULLVAD")["dialer-proxy"], "SS-INLET");
+        assert_eq!(node("SS-INLET")["dialer-proxy"], "UPSTREAM-SS");
+        assert_eq!(node("UPSTREAM-SS")["dialer-proxy"], "CARRIER");
+        assert_eq!(node("UPSTREAM-SS")["server"], "192.0.2.9");
+        assert_eq!(node("CARRIER")["server"], "127.0.0.1");
+        assert_eq!(node("SS-INLET")["server"], "198.51.100.2");
+        assert_eq!(node("UPSTREAM-SS")["password"], "synthetic-upstream");
+        assert!(proxies.iter().all(|p| p.get("interface-name").is_none()));
+    }
     const KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
     const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     #[test]

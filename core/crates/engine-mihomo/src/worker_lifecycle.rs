@@ -68,7 +68,7 @@ impl Worker {
         request: &WorkerRequest<'_>,
         network: BoundNetwork,
     ) -> Result<Self, WorkerStartError> {
-        Self::start_config(executable, runtime, request, network, false, false)
+        Self::start_config(executable, runtime, request, network, false, false, None)
     }
     /// Only for the explicit maintenance probe; raw diagnostics never escape.
     pub fn start_diagnostic(
@@ -77,7 +77,7 @@ impl Worker {
         request: &WorkerRequest<'_>,
         network: BoundNetwork,
     ) -> Result<Self, WorkerStartError> {
-        Self::start_config(executable, runtime, request, network, true, false)
+        Self::start_config(executable, runtime, request, network, true, false, None)
     }
     /// Own the physical outer socket; this alone is not candidate readiness.
     pub fn start_carried(
@@ -86,7 +86,24 @@ impl Worker {
         request: &WorkerRequest<'_>,
         network: BoundNetwork,
     ) -> Result<Self, WorkerStartError> {
-        Self::start_config(executable, runtime, request, network, true, true)
+        Self::start_config(executable, runtime, request, network, true, true, None)
+    }
+    pub fn start_chained(
+        executable: &Path,
+        runtime: &PrivateRuntime,
+        request: &WorkerRequest<'_>,
+        network: BoundNetwork,
+        upstream: &crate::chain::UpstreamSs,
+    ) -> Result<Self, WorkerStartError> {
+        Self::start_config(
+            executable,
+            runtime,
+            request,
+            network,
+            false,
+            true,
+            Some(upstream),
+        )
     }
     fn start_config(
         executable: &Path,
@@ -95,6 +112,7 @@ impl Worker {
         network: BoundNetwork,
         diagnostic: bool,
         carried: bool,
+        chain: Option<&crate::chain::UpstreamSs>,
     ) -> Result<Self, WorkerStartError> {
         let deadline = Instant::now() + Duration::from_secs(15);
         let checkpoint = || {
@@ -107,11 +125,19 @@ impl Worker {
             }
         };
         checkpoint()?;
-        let destination = match request.transport {
-            Transport::DirectV4 { endpoint, .. } | Transport::Shadowsocks { endpoint, .. } => {
-                IpAddr::V4(endpoint)
+        let chain_endpoint = chain
+            .map(|proxy| crate::chain::resolve_ipv4(proxy, &network))
+            .transpose()
+            .map_err(|_| WorkerStartError::Route)?;
+        let destination = if let Some(ip) = chain_endpoint {
+            IpAddr::V4(ip)
+        } else {
+            match request.transport {
+                Transport::DirectV4 { endpoint, .. } | Transport::Shadowsocks { endpoint, .. } => {
+                    IpAddr::V4(endpoint)
+                }
+                Transport::DirectV6 { endpoint, .. } => IpAddr::V6(endpoint),
             }
-            Transport::DirectV6 { endpoint, .. } => IpAddr::V6(endpoint),
         };
         // Acquire within the captured operation, never from an earlier factory.
         let route = snapshot(network.binding(), destination);
@@ -147,11 +173,14 @@ impl Worker {
         )
         .map_err(|_| WorkerStartError::Peer)?;
         checkpoint()?;
-        let outer_port = match request.transport {
-            Transport::DirectV4 { port, .. }
-            | Transport::DirectV6 { port, .. }
-            | Transport::Shadowsocks { port, .. } => port,
-        };
+        let outer_port =
+            chain
+                .map(|proxy| proxy.port())
+                .unwrap_or_else(|| match request.transport {
+                    Transport::DirectV4 { port, .. }
+                    | Transport::DirectV6 { port, .. }
+                    | Transport::Shadowsocks { port, .. } => port,
+                });
         let mut carrier = if carried {
             Some(
                 crate::carrier::windows::Run::open(&route, outer_port)
@@ -161,7 +190,17 @@ impl Worker {
             None
         };
         let prepared = (|| {
-            let config = if let Some(carrier) = &carrier {
+            let config = if let (Some(carrier), Some(chain), Some(endpoint)) =
+                (&carrier, chain, chain_endpoint)
+            {
+                crate::worker_with_chain_carrier_route(
+                    &input,
+                    &route,
+                    &carrier.config(),
+                    chain,
+                    endpoint,
+                )
+            } else if let Some(carrier) = &carrier {
                 crate::worker_with_carrier_route(&input, &route, &carrier.config())
             } else if diagnostic {
                 crate::worker_with_route_diagnostic(&input, &route)

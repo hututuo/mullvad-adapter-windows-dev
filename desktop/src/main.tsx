@@ -21,6 +21,7 @@ import {
 import "./style.css";
 import { ClashPage } from "./clash-page";
 import { SetupPage } from "./setup-page";
+import { ChainRoute } from "./chain-route";
 import { canCreateDevice } from "./device-creation";
 type Page = "setup" | "cities" | "account" | "clash" | "relays" | "diagnostics";
 const pages: { id: Page; name: string; mark: string }[] = [
@@ -69,7 +70,7 @@ function App() {
     [error, setError] = useState(false),
     [pending, setPending] = useState(false);
   const reportRequested = useRef<{ operation: string | null; boot: string } | null>(null);
-  const actionRequested = useRef<{ boot: string; sequence: number } | null>(null);
+  const actionRequested = useRef<{ boot: string; sequence: number; catalogue?: boolean } | null>(null);
   const stopping = useRef(false);
   const initialDestination = useRef(false);
   const keyGeneration = useRef(0), activePage = useRef(page);
@@ -144,12 +145,15 @@ function App() {
           setError(true);
         } else if (reply.kind === "dashboard" && actionRequested.current
           && reply.dashboard.sequence > actionRequested.current.sequence
+          && (!actionRequested.current.catalogue || !reply.dashboard.metadata_refreshing)
           && !reply.dashboard.operation
           && !["connecting", "disconnecting"].includes(reply.dashboard.status)) {
+          const catalogueResult = actionRequested.current.catalogue;
           actionRequested.current = null;
           refreshFailed.current = false;
-          setMessage(reply.dashboard.last_error ? errorText(reply.dashboard.last_error) : "操作已完成");
-          setError(!!reply.dashboard.last_error);
+          const code = catalogueResult ? reply.dashboard.metadata_error : reply.dashboard.last_error;
+          setMessage(code ? errorText(code) : catalogueResult ? "官方目录已更新，现有连接保持运行。" : "操作已完成");
+          setError(!!code);
         } else if (manual || firstSnapshot || refreshFailed.current) {
           setMessage(refreshFailed.current ? "后台连接已恢复" : "当前状态已同步");
           setError(false);
@@ -226,7 +230,7 @@ function App() {
         }
       } else {
         if (reply.kind === "accepted" && command.kind !== "export_report" && current.current) {
-          actionRequested.current = { boot: current.current.boot_id, sequence: current.current.sequence };
+          actionRequested.current = { boot: current.current.boot_id, sequence: current.current.sequence, catalogue:command.kind === "refresh_catalogue" };
         }
         if (command.kind === "export_report" && reply.kind === "accepted" && reportRequested.current) {
           reportRequested.current.operation = reply.operation_id;
@@ -462,6 +466,7 @@ function App() {
                 </span>
               </div>
               <div className="connection-facts">
+                <div><small>当前承载</small><strong>{!data?.active_relay ? "等待连接" : data.connection?.chained ? "独立节点 → Mullvad" : "SS 直连 Mullvad"}</strong></div>
                 <div>
                   <small>主节点</small>
                   <strong>{data?.active_relay ?? "尚未建立"}</strong>
@@ -800,13 +805,14 @@ function App() {
                 <span>
                   共 {total} 个节点 ·{" "}
                   {timeText(data?.metadata_updated_at ?? null)}
-                  {data?.metadata_source === "local_cache" ? " · 本机缓存（获取时间未核实，可更新）" : data?.metadata_source === "official_api" ? " · 官方 API" : " · 尚未取得官方目录"}
+                  {data?.metadata_source === "local_cache" ? ` · 本机缓存${data.metadata_updated_at ? "" : "（旧缓存时间未核实）"}` : data?.metadata_source === "official_api" ? " · 官方 API" : " · 尚未取得官方目录"}
+                  {data?.metadata_refreshing ? " · 后台更新中" : data?.metadata_error ? " · 更新未成功，已保留缓存并安排重试" : " · 自动更新"}
                 </span>
                 <button
-                  disabled={!data || busy}
+                  disabled={!data || !!data.metadata_refreshing}
                   onClick={() => void act({ kind: "refresh_catalogue" })}
                 >
-                  更新目录
+                  {data?.metadata_refreshing ? "更新中…" : "立即更新"}
                 </button>
               </div>
               <div className="table-scroll">
@@ -1012,6 +1018,10 @@ function App() {
                     </label>
                   </div>
                   <label className="check-row">
+                    <input type="checkbox" checked={settings.connect_on_start ?? true} onChange={e => setSettings({...settings, connect_on_start:e.target.checked})}/>
+                    <span>启动后自动连接所选城市，验证通过后才接入流量</span>
+                  </label>
+                  <label className="check-row">
                     <input
                       type="checkbox"
                       checked={settings.automatic_recovery}
@@ -1033,6 +1043,7 @@ function App() {
                 </form>
               </section>
             )}
+            {data && <ChainRoute data={data} disabled={busy} onSettings={async next => { setSettings(next); await act({kind:"save_settings", settings:next}); }}/>}
           </>
         )}
         <footer>

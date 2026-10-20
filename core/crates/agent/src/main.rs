@@ -3,6 +3,8 @@
 use adapter_control::MockControl;
 use adapter_protocol::{Hello, Response, API_MAJOR, API_MINOR};
 #[cfg(any(windows, feature = "windows-api-check", test))]
+mod catalogue_refresh;
+#[cfg(any(windows, feature = "windows-api-check", test))]
 mod inlet_trials;
 #[cfg(any(windows, feature = "windows-api-check"))]
 mod live_connection;

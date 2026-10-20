@@ -1123,5 +1123,6 @@ pub fn export(front: u16) -> Result<String> {
     String::from_utf8(yaml(&json!({"proxies":[node(front)]}))?).map_err(|_| err("invalid_yaml"))
 }
 
+pub mod chain_source;
 #[cfg(test)]
 mod tests;

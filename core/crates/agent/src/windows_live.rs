@@ -28,7 +28,7 @@ use std::time::Instant;
 use std::{
     collections::{BTreeMap, VecDeque},
     fs::OpenOptions,
-    io::{self, Read, Write},
+    io::{self, Read},
     net::{Ipv4Addr, SocketAddrV4},
     path::PathBuf,
     sync::{atomic::Ordering, mpsc},
@@ -140,7 +140,7 @@ struct ApiDone {
     draft: Option<crate::live_device::PublicDraft>,
 }
 enum ApiValue {
-    Catalogue(adapter_catalogue::Catalogue, Vec<City>, u64),
+    Chain(std::sync::Arc<adapter_engine_mihomo::chain::UpstreamSs>),
     Account(AccountSnapshot),
     Draft(crate::live_device::PublicDraft),
     DeviceIdentity(TunnelIdentity),
@@ -183,6 +183,28 @@ fn api_worker(
                         }
                         WorkCommand::Api(command) => command,
                     };
+                    let command = match command {
+                        AppCommand::ConfigureChain { proxy } => {
+                            let proxy = proxy.into_value();
+                            let parsed =
+                                adapter_engine_mihomo::chain::UpstreamSs::decode(proxy.as_bytes())
+                                    .map_err(|_| "chain_configuration_invalid")?;
+                            let encoded =
+                                parsed.encode().map_err(|_| "chain_configuration_invalid")?;
+                            store
+                                .prepare(RecordKind::ChainProxy, &encoded)
+                                .and_then(|p| p.commit())
+                                .map_err(|_| "chain_write_failed")?;
+                            let readback = store
+                                .load(RecordKind::ChainProxy)
+                                .map_err(|_| "chain_write_failed")?;
+                            if readback.expose() != encoded.as_slice() {
+                                return Err("chain_write_failed");
+                            }
+                            return Ok(ApiValue::Chain(std::sync::Arc::new(parsed)));
+                        }
+                        command => command,
+                    };
                     if matches!(command, AppCommand::AccountLogout) {
                         session = None;
                         uncertain_mutation = false;
@@ -220,22 +242,6 @@ fn api_worker(
                     }
                     let client = access.client;
                     match command {
-                        AppCommand::RefreshCatalogue => {
-                            let bytes = client.fetch_relays().map_err(|e| e.code())?;
-                            let (catalogue, cities) = read_catalogue(&bytes)?;
-                            let pending = report_root.join("relays.pending");
-                            let path = report_root.join("relays.json");
-                            let mut file = open_writer_file(&pending, false, false)
-                                .map_err(|_| "metadata_cache_write_failed")?;
-                            file.set_len(0).map_err(|_| "metadata_cache_write_failed")?;
-                            file.write_all(&bytes)
-                                .and_then(|_| file.sync_all())
-                                .map_err(|_| "metadata_cache_write_failed")?;
-                            drop(file);
-                            std::fs::rename(&pending, path)
-                                .map_err(|_| "metadata_cache_write_failed")?;
-                            Ok(ApiValue::Catalogue(catalogue, cities, now_seconds()))
-                        }
                         AppCommand::AccountLogin { account } => {
                             let mut input = account.into_value();
                             let number =
@@ -424,6 +430,142 @@ fn read_catalogue(bytes: &[u8]) -> Result<(adapter_catalogue::Catalogue, Vec<Cit
     Ok((catalogue, cities))
 }
 
+type CatalogueResult = Result<(adapter_catalogue::Catalogue, Vec<City>, u64), &'static str>;
+struct CatalogueJob {
+    proxy: u16,
+    healthy_front: u16,
+}
+fn catalogue_job(dashboard: &Dashboard) -> CatalogueJob {
+    CatalogueJob {
+        proxy: dashboard.settings.bootstrap_port.unwrap_or(0),
+        healthy_front: if dashboard.front_ready
+            && dashboard.readiness.as_deref() == Some("ready")
+            && dashboard.active_relay.is_some()
+            && matches!(dashboard.front_selected.as_str(), "slot_a" | "slot_b")
+        {
+            dashboard.settings.front_port
+        } else {
+            0
+        },
+    }
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RelayCache {
+    schema: u8,
+    fetched_at: u64,
+    relays: serde_json::Value,
+}
+fn load_catalogue_cache(
+    root: &std::path::Path,
+) -> Result<(adapter_catalogue::Catalogue, Vec<City>, Option<u64>), &'static str> {
+    for (name, versioned) in [("relays-cache.json", true), ("relays.json", false)] {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        let file = match open_log_file(&root.join(name), options) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return Err("metadata_cache_read_failed"),
+        };
+        let mut bytes = Vec::new();
+        file.take((adapter_mullvad_api::RELAY_BODY_CAP + 1025) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "metadata_cache_read_failed")?;
+        if bytes.len() > adapter_mullvad_api::RELAY_BODY_CAP + 1024 {
+            return Err("invalid_metadata");
+        }
+        let (bytes, at) = if versioned {
+            let cache: RelayCache =
+                serde_json::from_slice(&bytes).map_err(|_| "invalid_metadata")?;
+            if cache.schema != 1 {
+                return Err("invalid_metadata");
+            }
+            let at = (cache.fetched_at != 0 && cache.fetched_at <= now_seconds())
+                .then_some(cache.fetched_at);
+            (
+                serde_json::to_vec(&cache.relays).map_err(|_| "invalid_metadata")?,
+                at,
+            )
+        } else {
+            (bytes, None)
+        };
+        let (parsed, cities) = read_catalogue(&bytes)?;
+        return Ok((parsed, cities, at));
+    }
+    Err("metadata_missing")
+}
+fn catalogue_worker(
+    store: PrivateStore,
+    root: PathBuf,
+    logs: LogClient,
+) -> io::Result<(
+    mpsc::SyncSender<CatalogueJob>,
+    mpsc::Receiver<CatalogueResult>,
+)> {
+    let (send, jobs) = mpsc::sync_channel::<CatalogueJob>(1);
+    let (done, results) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("catalogue-background-io".into())
+        .spawn(move || {
+            while let Ok(job) = jobs.recv() {
+                let result = (|| {
+                    let cache = store
+                        .load(RecordKind::ApiAddresses)
+                        .ok()
+                        .and_then(|r| ApiAddressCache::decode(r.expose()).ok())
+                        .unwrap_or_default();
+                    let proxy = |port| {
+                        if port == 0 {
+                            Ok(None)
+                        } else {
+                            BootstrapProxy::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into())
+                                .map(Some)
+                        }
+                    };
+                    // Read-only GETs use an independent thread and never hold the
+                    // account/session or connection gate. Account writes are not replayed.
+                    let access = MullvadClient::bootstrap(
+                        &cache,
+                        proxy(job.proxy).map_err(|e| e.code())?,
+                        proxy(job.healthy_front).map_err(|e| e.code())?,
+                    )
+                    .map_err(|e| e.code())?;
+                    let _ = logs.event(
+                        "api_access",
+                        match access.route {
+                            ApiAccessRoute::Direct => "direct_verified",
+                            ApiAccessRoute::IndependentProxy => "independent_proxy_verified",
+                            ApiAccessRoute::HealthyTunnel => "healthy_tunnel_verified",
+                        },
+                    );
+                    let bytes = access.client.fetch_relays().map_err(|e| e.code())?;
+                    let (parsed, cities) = read_catalogue(&bytes)?;
+                    let fetched_at = now_seconds();
+                    let cache = RelayCache {
+                        schema: 1,
+                        fetched_at,
+                        relays: serde_json::from_slice(&bytes).map_err(|_| "invalid_metadata")?,
+                    };
+                    let pending = root.join("relays-cache.pending");
+                    let mut file = open_writer_file(&pending, false, false)
+                        .map_err(|_| "metadata_cache_write_failed")?;
+                    file.set_len(0).map_err(|_| "metadata_cache_write_failed")?;
+                    serde_json::to_writer(&mut file, &cache)
+                        .map_err(|_| "metadata_cache_write_failed")?;
+                    file.sync_all().map_err(|_| "metadata_cache_write_failed")?;
+                    drop(file);
+                    std::fs::rename(pending, root.join("relays-cache.json"))
+                        .map_err(|_| "metadata_cache_write_failed")?;
+                    Ok((parsed, cities, fetched_at))
+                })();
+                if done.send(result).is_err() {
+                    break;
+                }
+            }
+        })?;
+    Ok((send, results))
+}
+
 /// Explicit streaming import. Never reads a guessed path, registers, or prints keys.
 pub fn import_stdin(scope: &str) -> io::Result<()> {
     let root = AppRoot::open(scope)?;
@@ -490,6 +632,9 @@ pub fn serve(scope: &str) -> io::Result<()> {
         cities: vec![],
         metadata_source: "missing".into(),
         metadata_updated_at: None,
+        metadata_refreshing: false,
+        metadata_error: None,
+        chain_node: None,
         account: Account::default(),
         operation: None,
         last_error: None,
@@ -504,39 +649,40 @@ pub fn serve(scope: &str) -> io::Result<()> {
         quick_test: None,
         city_candidates: vec![],
     };
-    let mut catalogue = None;
-    let mut cache_options = OpenOptions::new();
-    cache_options.read(true);
-    let mut cache_data = Vec::new();
-    let cached = match open_log_file(&root.path().join("relays.json"), cache_options) {
-        Ok(file) => file
-            .take((adapter_mullvad_api::RELAY_BODY_CAP + 1) as u64)
-            .read_to_end(&mut cache_data)
-            .map(|_| ())
-            .map_err(|_| "metadata_cache_read_failed"),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            Err("metadata_cache_access_denied")
-        }
-        Err(_) => Err("metadata_cache_read_failed"),
-    }
-    .and_then(|_| {
-        if cache_data.is_empty() {
-            return Ok(());
-        }
-        read_catalogue(&cache_data).map(|(parsed, cities)| {
-            catalogue = Some(parsed);
+    let (mut catalogue, cached_at) = match load_catalogue_cache(root.path()) {
+        Ok((parsed, cities, at)) => {
             dashboard.cities = cities;
             dashboard.metadata_source = "local_cache".into();
-        })
-    });
-    if let Err(code) = cached {
-        dashboard.last_error = Some(code.into());
-        logs.event("start", code)?;
-    }
+            dashboard.metadata_updated_at = at;
+            (Some(parsed), at)
+        }
+        Err("metadata_missing") => (None, None),
+        Err(code) => {
+            dashboard.metadata_error = Some(code.into());
+            logs.event("start", code)?;
+            (None, None)
+        }
+    };
+    let _stale = crate::catalogue_refresh::cache_is_stale(cached_at, now_seconds());
+    let (catalogue_jobs, catalogue_results) =
+        catalogue_worker(store.clone(), root.path().to_owned(), logs.clone())?;
+    let mut catalogue_refresh = crate::catalogue_refresh::CatalogueRefresh::new(Instant::now());
+    let mut catalogue_result = None;
+    let mut startup_pending = dashboard.settings.connect_on_start;
     let (_front, front_events, mailbox) = connection_lifecycle::mailbox();
     let (mut connections, tunnel_mailbox) =
         crate::live_connection::Connections::new(root.path().to_owned(), logs.clone());
+    match store.load(RecordKind::ChainProxy) {
+        Ok(bytes) => match adapter_engine_mihomo::chain::UpstreamSs::decode(bytes.expose()) {
+            Ok(chain) => {
+                dashboard.chain_node = Some(chain.name().into());
+                connections.set_chain(Some(std::sync::Arc::new(chain)));
+            }
+            Err(_) => dashboard.last_error = Some("chain_configuration_invalid".into()),
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => dashboard.last_error = Some("chain_configuration_invalid".into()),
+    }
     let tunnel_store = store.clone();
     let front_runtime = PrivateRuntime::open(&root.path().join("front"))?;
     let executable = runtime.mihomo.clone();
@@ -748,7 +894,12 @@ pub fn serve(scope: &str) -> io::Result<()> {
         // User intent preempts automatic ICMP maintenance, but cancellation is
         // not completion: keep the owner occupied until every native call has
         // returned and the Finished receipt above releases its ticket.
-        if quick.is_none() && owner.observation().binding_settled() && !owner.state().paused {
+        if quick.is_none()
+            && pending_work.is_none()
+            && !connections.busy()
+            && owner.observation().binding_settled()
+            && !owner.state().paused
+        {
             if let Some(intent) = queued_connect.take() {
                 dashboard.operation = None;
                 let result = match (identity.as_ref(), catalogue.as_ref()) {
@@ -814,15 +965,11 @@ pub fn serve(scope: &str) -> io::Result<()> {
                     device_name: draft.device_name,
                 });
                 match done.result {
-                    Ok(ApiValue::Catalogue(parsed, cities, updated_at)) => {
-                        owner.cancel_current_operation();
-                        pings.clear();
-                        maintenance.clear();
-                        catalogue = Some(parsed);
-                        dashboard.cities = cities;
-                        dashboard.metadata_source = "official_api".into();
-                        dashboard.metadata_updated_at = Some(updated_at);
+                    Ok(ApiValue::Chain(chain)) => {
+                        dashboard.chain_node = Some(chain.name().into());
+                        connections.set_chain(Some(chain));
                         dashboard.last_error = None;
+                        logs.event("api", "chain_configured")?;
                     }
                     Ok(ApiValue::Account(account)) => {
                         dashboard.account = Account {
@@ -896,6 +1043,49 @@ pub fn serve(scope: &str) -> io::Result<()> {
                 logs.event("api", dashboard.last_error.as_deref().unwrap_or("complete"))?;
             }
         }
+        catalogue_refresh.observe_network(
+            owner.state().attachment != Attachment::Unavailable,
+            owner.state().attachment == Attachment::Available
+                && !owner.state().paused
+                && owner.observation().binding_settled(),
+        );
+        if catalogue_result.is_none() {
+            catalogue_result = catalogue_results.try_recv().ok();
+        }
+        if !connections.busy() && quick.is_none() {
+            if let Some(result) = catalogue_result.take() {
+                catalogue_refresh.finish(Instant::now(), result.is_ok());
+                dashboard.metadata_refreshing = false;
+                match result {
+                    Ok((parsed, cities, updated_at)) => {
+                        // Keep a selected, healthy data plane untouched. The new
+                        // catalogue authorizes the NEXT attempt, not a new peer.
+                        pings.clear();
+                        maintenance.clear();
+                        catalogue = Some(parsed);
+                        dashboard.cities = cities;
+                        dashboard.metadata_source = "official_api".into();
+                        dashboard.metadata_updated_at = Some(updated_at);
+                        dashboard.metadata_error = None;
+                        logs.event("api", "metadata_refresh_complete")?;
+                    }
+                    Err(code) => {
+                        dashboard.metadata_error = Some(code.into());
+                        logs.event("api", code)?;
+                    }
+                }
+            }
+        }
+        if !shutdown && catalogue_refresh.try_start(Instant::now()) {
+            let job = catalogue_job(&dashboard);
+            if catalogue_jobs.try_send(job).is_ok() {
+                dashboard.metadata_refreshing = true;
+                logs.event("api", "metadata_refresh_started")?;
+            } else {
+                catalogue_refresh.finish(Instant::now(), false);
+                dashboard.metadata_error = Some("metadata_refresh_unavailable".into());
+            }
+        }
         dashboard.logging_degraded = logs.fault.load(Ordering::Acquire);
         dashboard.logging_dropped = logs.dropped.load(Ordering::Acquire);
         dashboard.sequence = dashboard.sequence.saturating_add(1);
@@ -926,6 +1116,24 @@ pub fn serve(scope: &str) -> io::Result<()> {
                         AppCommand::Dashboard => AppReply::Dashboard {
                             dashboard: Box::new(dashboard.clone()),
                         },
+                        AppCommand::RefreshCatalogue => {
+                            if !catalogue_refresh.try_start_manual() {
+                                failure(if catalogue_refresh.in_flight() {
+                                    "metadata_refresh_busy"
+                                } else {
+                                    "waiting_network"
+                                })
+                            } else if catalogue_jobs.try_send(catalogue_job(&dashboard)).is_err() {
+                                catalogue_refresh.finish(Instant::now(), false);
+                                failure("metadata_refresh_unavailable")
+                            } else {
+                                dashboard.metadata_refreshing = true;
+                                logs.event("api", "metadata_refresh_started")?;
+                                AppReply::Accepted {
+                                    operation_id: "metadata-refresh".into(),
+                                }
+                            }
+                        }
                         AppCommand::ExportReport => {
                             if pending_work.is_some()
                                 || queued_connect.is_some()
@@ -1029,6 +1237,7 @@ pub fn serve(scope: &str) -> io::Result<()> {
                             }
                         }
                         AppCommand::SelectCity { city } => {
+                            startup_pending = false;
                             if dashboard.operation.is_some() {
                                 failure("operation_busy")
                             } else if !dashboard.settings.favorite_cities.contains(&city) {
@@ -1072,7 +1281,16 @@ pub fn serve(scope: &str) -> io::Result<()> {
                         {
                             failure("disconnect_before_identity_change")
                         }
+                        AppCommand::ConfigureChain { .. }
+                            if connections.busy()
+                                || owner.state().path.as_ref().is_some_and(|p| {
+                                    p.transport == "wireguard-over-shadowsocks-chain"
+                                }) =>
+                        {
+                            failure("disconnect_before_chain_change")
+                        }
                         command @ (AppCommand::Connect | AppCommand::ConnectRelay { .. }) => {
+                            startup_pending = false;
                             let relay = match &command {
                                 AppCommand::ConnectRelay { hostname } => Some(hostname.as_str()),
                                 _ => None,
@@ -1234,6 +1452,7 @@ pub fn serve(scope: &str) -> io::Result<()> {
                             }
                         }
                         AppCommand::CancelOperation => {
+                            startup_pending = false;
                             if queued_connect.take().is_some() {
                                 owner.cancel_current_operation();
                                 dashboard.operation = None;
@@ -1265,6 +1484,7 @@ pub fn serve(scope: &str) -> io::Result<()> {
                             }
                         }
                         AppCommand::Disconnect => {
+                            startup_pending = false;
                             if queued_connect.take().is_some() {
                                 dashboard.operation = None;
                             }
@@ -1293,6 +1513,7 @@ pub fn serve(scope: &str) -> io::Result<()> {
                                     AppCommand::AccountLogin { .. } => "account_login",
                                     AppCommand::AccountRefresh => "account_refresh",
                                     AppCommand::AccountLogout => "account_logout",
+                                    AppCommand::ConfigureChain { .. } => "chain_configure",
                                     AppCommand::RemoveDevice { .. } => "device_remove",
                                     AppCommand::CreateDevice { .. } => "device_create",
                                     AppCommand::UseCreatedDevice { .. } => "device_activate",
@@ -1335,12 +1556,37 @@ pub fn serve(scope: &str) -> io::Result<()> {
             }
             let _ = pending.reply.try_send(reply);
         }
+        // Startup intent is accepted once and remains behind the physical
+        // settle gate. An explicit disconnect/cancel above revokes it.
+        if startup_pending
+            && !shutdown
+            && dashboard.front_ready
+            && identity.is_some()
+            && catalogue.is_some()
+            && dashboard.settings.selected_city.is_some()
+            && dashboard.operation.is_none()
+            && !connections.busy()
+            && quick.is_none()
+            && pending_work.is_none()
+            && queued_connect.is_none()
+        {
+            startup_pending = false;
+            queued_connect = Some(QueuedConnect { relay: None });
+            connections.begin_user_selection();
+            if let (Ok(saved), Some(catalogue)) =
+                (store.load(RecordKind::Connection), catalogue.as_ref())
+            {
+                connections.remember_startup_path(saved.expose(), catalogue, &dashboard);
+            }
+            dashboard.operation = Some("connect".into());
+        }
         // Maintenance is deliberately tiny: two ICMP targets in ONE city at
         // a time. It never acquires a tunnel identity or blocks account/disk I/O.
         // User operations have priority because this runs after IPC dispatch.
         if !shutdown
             && quick.is_none()
             && pending_work.is_none()
+            && queued_connect.is_none()
             && dashboard.operation.is_none()
             && dashboard.settings.automatic_recovery
             && dashboard.front_ready

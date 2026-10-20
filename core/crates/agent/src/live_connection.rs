@@ -10,8 +10,9 @@ use adapter_engine_mihomo::{
 use adapter_platform::windows_runtime::PrivateRuntime;
 use adapter_protocol::app::{ConnectionInfo, Dashboard};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use zeroize::Zeroizing;
@@ -43,6 +44,9 @@ pub(crate) struct Connections {
     logs: crate::live_diagnostics::LogClient,
     frozen: bool,
     inlet_trials: crate::inlet_trials::InletTrials,
+    chain: Option<Arc<adapter_engine_mihomo::chain::UpstreamSs>>,
+    chain_relays: BTreeSet<String>,
+    chain_mode: adapter_protocol::app::TunnelRoute,
 }
 impl Connections {
     pub(crate) fn new(
@@ -68,19 +72,72 @@ impl Connections {
                 logs,
                 frozen: false,
                 inlet_trials: Default::default(),
+                chain: None,
+                chain_relays: Default::default(),
+                chain_mode: adapter_protocol::app::TunnelRoute::Auto,
             },
             mailbox,
         )
     }
+    pub(crate) fn set_chain(
+        &mut self,
+        chain: Option<Arc<adapter_engine_mihomo::chain::UpstreamSs>>,
+    ) {
+        self.chain = chain;
+    }
+    pub(crate) fn remember_startup_path(
+        &mut self,
+        bytes: &[u8],
+        catalogue: &adapter_catalogue::Catalogue,
+        dashboard: &Dashboard,
+    ) {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+            return;
+        };
+        let Some(city) = value["city"]
+            .as_str()
+            .filter(|city| Some(*city) == dashboard.settings.selected_city.as_deref())
+        else {
+            return;
+        };
+        let Some(relay) = value["relay"].as_str().and_then(|name| {
+            catalogue
+                .active_in_city(city)
+                .find(|r| r.hostname() == name)
+        }) else {
+            return;
+        };
+        let Some(endpoint) = value["inlet"]
+            .as_str()
+            .and_then(|v| v.parse::<std::net::SocketAddrV4>().ok())
+        else {
+            return;
+        };
+        let Some(inlet) =
+            catalogue.authorize_shadowsocks_inlet(relay, *endpoint.ip(), endpoint.port())
+        else {
+            return;
+        };
+        let chained = value["transport"] == "wireguard-over-shadowsocks-chain"
+            && dashboard.settings.tunnel_route != adapter_protocol::app::TunnelRoute::Direct
+            && self.chain.is_some();
+        self.last_relay = Some(relay.hostname().into());
+        self.inlet_trials.prefer(relay.hostname(), inlet, chained);
+        if chained {
+            self.chain_relays.insert(relay.hostname().into());
+        }
+    }
     pub(crate) fn freeze(&mut self) {
         self.frozen = true;
         self.inlet_trials.clear();
+        self.chain_relays.clear();
         self.recovering = None;
         self.manual_candidates = None;
         self.deferred = None;
     }
     pub(crate) fn identity_changed(&mut self, owner: &mut ResourceOwner) {
         self.inlet_trials.clear();
+        self.chain_relays.clear();
         self.recovering = None;
         self.manual_candidates = None;
         self.deferred = None;
@@ -102,6 +159,7 @@ impl Connections {
     ) {
         debug_assert!(self.pending.is_none());
         self.inlet_trials.clear();
+        self.chain_relays.clear();
         self.recovering = None;
         self.manual_candidates = None;
         self.deferred = None;
@@ -131,6 +189,7 @@ impl Connections {
     /// Called only for an accepted user intent, never for scheduler retries.
     pub(crate) fn begin_user_selection(&mut self) {
         self.inlet_trials.clear();
+        self.chain_relays.clear();
         self.manual_candidates = None;
         self.recovering = None;
         self.deferred = None;
@@ -179,6 +238,13 @@ impl Connections {
                     .and_then(|r| catalogue.active_in_city(&city).find(|n| n.hostname() == r))
             })
             .or_else(|| {
+                self.last_relay.as_deref().and_then(|name| {
+                    catalogue
+                        .active_in_city(&city)
+                        .find(|r| r.hostname() == name)
+                })
+            })
+            .or_else(|| {
                 dashboard
                     .city_candidates
                     .iter()
@@ -202,6 +268,24 @@ impl Connections {
                 .path
                 .as_ref()
                 .is_some_and(|p| p.relay == picked.hostname());
+        self.chain_mode = dashboard.settings.tunnel_route;
+        let chained = if original {
+            owner
+                .state()
+                .path
+                .as_ref()
+                .is_some_and(|p| p.transport == "wireguard-over-shadowsocks-chain")
+        } else {
+            self.chain_mode == adapter_protocol::app::TunnelRoute::Chain
+                || (self.chain_mode == adapter_protocol::app::TunnelRoute::Auto
+                    && self.chain_relays.contains(picked.hostname()))
+        };
+        if chained && self.chain.is_none() {
+            return Err("chain_not_configured");
+        }
+        if chained {
+            self.chain_relays.insert(picked.hostname().into());
+        }
         let inlet = if original {
             let saved = owner
                 .state()
@@ -218,7 +302,7 @@ impl Connections {
             let mut allowed = catalogue.shadowsocks_inlets(picked);
             if let Some(selected) = self
                 .inlet_trials
-                .selected(picked.hostname())
+                .selected_route(picked.hostname(), chained)
                 .and_then(|i| catalogue.authorize_shadowsocks_inlet(picked, i.address, i.port))
             {
                 if !allowed.contains(&selected) {
@@ -226,7 +310,7 @@ impl Connections {
                 }
             }
             self.inlet_trials
-                .choose(picked.hostname(), &allowed)
+                .choose_route(picked.hostname(), &allowed, chained)
                 .ok_or("shadowsocks_inlets_exhausted")?
         };
         let binding = owner
@@ -250,7 +334,12 @@ impl Connections {
         let path = Path {
             relay: picked.hostname().into(),
             city: city.clone(),
-            transport: "wireguard-over-shadowsocks".into(),
+            transport: if chained {
+                "wireguard-over-shadowsocks-chain"
+            } else {
+                "wireguard-over-shadowsocks"
+            }
+            .into(),
             inlet: format!("{}:{}", inlet.address, inlet.port),
             entry_relay: None,
             slot: slot.into(),
@@ -276,6 +365,7 @@ impl Connections {
                 endpoint: inlet.address,
                 port: inlet.port,
             },
+            chain: if chained { self.chain.clone() } else { None },
             slot: if slot == "a" {
                 Selected::SlotA
             } else {
@@ -330,6 +420,7 @@ impl Connections {
             instance: attempt.path.instance,
             interface_index: binding.index,
             phase: "starting".into(),
+            chained,
             ip: None,
             dns: None,
             https: None,
@@ -444,6 +535,7 @@ impl Connections {
         self.manual_candidates = None;
         self.deferred = None;
         self.inlet_trials.clear();
+        self.chain_relays.clear();
         self.disconnecting = true;
         self.last_relay = None;
         owner.cancel_current_operation();
@@ -512,15 +604,50 @@ impl Connections {
         else {
             return false;
         };
-        if !self.inlet_trials.reject(&path.relay, &path.inlet) {
+        let was_chain = path.transport == "wireguard-over-shadowsocks-chain";
+        if !self
+            .inlet_trials
+            .reject_route(&path.relay, &path.inlet, was_chain)
+        {
             return false;
+        }
+        let automatic_chain =
+            self.chain.is_some() && self.chain_mode == adapter_protocol::app::TunnelRoute::Auto;
+        let next_chain = if self.chain_mode == adapter_protocol::app::TunnelRoute::Chain {
+            true
+        } else {
+            automatic_chain && !was_chain
+        };
+        if next_chain && !was_chain {
+            if let Ok(endpoint) = path.inlet.parse::<std::net::SocketAddrV4>() {
+                if let Some(inlet) =
+                    catalogue.authorize_shadowsocks_inlet(relay, *endpoint.ip(), endpoint.port())
+                {
+                    self.inlet_trials.prefer(&path.relay, inlet, true);
+                }
+            }
+        }
+        let mut allowed = catalogue.shadowsocks_inlets(relay);
+        if let Some(selected) = self
+            .inlet_trials
+            .selected_route(&path.relay, next_chain)
+            .and_then(|i| catalogue.authorize_shadowsocks_inlet(relay, i.address, i.port))
+        {
+            if !allowed.contains(&selected) {
+                allowed.push(selected);
+            }
         }
         if self
             .inlet_trials
-            .choose(&path.relay, &catalogue.shadowsocks_inlets(relay))
+            .choose_route(&path.relay, &allowed, next_chain)
             .is_none()
         {
             return false;
+        }
+        if next_chain {
+            self.chain_relays.insert(path.relay.clone());
+        } else {
+            self.chain_relays.remove(&path.relay);
         }
         if automatic {
             self.deferred = Some(path.relay.clone());
@@ -530,7 +657,14 @@ impl Connections {
         // Owned Unready already joined its worker/carrier. Only a short dispatch
         // pause is needed; the unchanged network-settle guard remains mandatory.
         self.next_attempt = Instant::now() + Duration::from_millis(250);
-        let _ = self.logs.event("connection", "same_relay_inlet_retry");
+        let _ = self.logs.event(
+            "connection",
+            if next_chain && !was_chain {
+                "same_relay_chain_retry"
+            } else {
+                "same_relay_inlet_retry"
+            },
+        );
         true
     }
     fn defer_stale_candidate(&mut self, relay: String) {
@@ -573,6 +707,7 @@ impl Connections {
             return;
         }
         self.inlet_trials.clear();
+        self.chain_relays.clear();
         self.next_attempt = Instant::now();
         self.recovering = Some((
             Instant::now() + Duration::from_millis(adapter_domain::RECOVERY_BUDGET_MS),
@@ -592,6 +727,7 @@ impl Connections {
         }
         if restored {
             self.inlet_trials.clear();
+            self.chain_relays.clear();
             if let Some((deadline, _, _, _)) = &mut self.manual_candidates {
                 *deadline =
                     Instant::now() + Duration::from_millis(adapter_domain::RECOVERY_BUDGET_MS);
@@ -785,6 +921,7 @@ impl Connections {
                     dashboard.active_relay = Some(path.relay);
                     self.last_relay = dashboard.active_relay.clone();
                     self.inlet_trials.clear();
+                    self.chain_relays.clear();
                     dashboard.status = "connected".into();
                     dashboard.readiness = owner.state().readiness.map(|r| {
                         if r == adapter_domain::Readiness::Ready {
