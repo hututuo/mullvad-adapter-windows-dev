@@ -160,6 +160,14 @@ fn execute(input: Request) -> Result<Value, String> {
         }
         found.into_iter().next().unwrap()
     };
+    if input.kind == "chain_auto" {
+        return automatic_chain(
+            &root,
+            &dashboard,
+            input.chain_name.as_deref(),
+            input.chain_fingerprint.as_deref(),
+        );
+    }
     if input.kind == "chain_list" {
         let choices = adapter_clash_integration::chain_source::list(&root, front)?;
         return Ok(json!({"choices":choices}));
@@ -340,4 +348,228 @@ fn execute(input: Request) -> Result<Value, String> {
         _ => return Err("clash_invalid_command".into()),
     }
     .map_err(|_| "clash_invalid_response".into())
+}
+
+/// Names are preference hints, never proof of a server's geography/readiness.
+fn chain_preference(name: &str) -> u8 {
+    let name = name.to_lowercase();
+    if [
+        "美国",
+        "美國",
+        "🇺🇸",
+        "united states",
+        "usa",
+        "us ",
+        "us-",
+        "us_",
+        "洛杉矶",
+        "西雅图",
+        "硅谷",
+        "圣何塞",
+        "new york",
+        "los angeles",
+        "seattle",
+        "san jose",
+    ]
+    .iter()
+    .any(|s| name.contains(s))
+    {
+        0
+    } else if [
+        "新加坡",
+        "狮城",
+        "獅城",
+        "🇸🇬",
+        "singapore",
+        "sg ",
+        "sg-",
+        "sg_",
+    ]
+    .iter()
+    .any(|s| name.contains(s))
+    {
+        1
+    } else if [
+        "英国",
+        "英國",
+        "🇬🇧",
+        "united kingdom",
+        "london",
+        "uk ",
+        "uk-",
+        "gb-",
+        "伦敦",
+    ]
+    .iter()
+    .any(|s| name.contains(s))
+    {
+        2
+    } else {
+        3
+    }
+}
+
+#[cfg(windows)]
+fn automatic_chain(
+    root: &std::path::Path,
+    dashboard: &adapter_protocol::app::Dashboard,
+    selected_name: Option<&str>,
+    fingerprint: Option<&str>,
+) -> Result<Value, String> {
+    use adapter_clash_integration::chain_source;
+    use adapter_control::{observer::ObservedOwner, owned_lifecycle::BoundNetwork};
+    use adapter_platform::{
+        windows::boot_id, windows_paths::AppRoot, windows_runtime::PrivateRuntime,
+    };
+    use std::time::{Duration, Instant};
+    if dashboard.connection.as_ref().is_some_and(|c| c.chained) && dashboard.active_relay.is_some()
+    {
+        return Ok(json!({"selected":dashboard.chain_node,"kept":true}));
+    }
+    if dashboard.operation.is_some() {
+        return Err("operation_busy".into());
+    }
+    let mut choices = chain_source::list(root, dashboard.settings.front_port)?;
+    choices.sort_by_key(|c| (chain_preference(&c.name), c.name.clone()));
+    let preferred_name = selected_name.or(dashboard.settings.chain_selection.as_deref());
+    if let Some(name) = preferred_name {
+        choices.retain(|c| c.name == name && fingerprint.is_none_or(|fp| c.fingerprint == fp));
+    }
+    if choices.is_empty() {
+        return Err("clash_chain_no_compatible_nodes".into());
+    }
+    // Bound work without hiding compatible choices from the advanced selector.
+    // Round-robin within preference classes prevents one huge region using all
+    // slots, while still trying US before Singapore before UK.
+    let mut candidates = Vec::new();
+    for region in 0..=3 {
+        candidates.extend(
+            choices
+                .iter()
+                .filter(|c| chain_preference(&c.name) == region)
+                .take(2)
+                .cloned(),
+        );
+    }
+    let expected_sha = option_env!("ADAPTER_SOURCE_SHA").ok_or("runtime_invalid")?;
+    let exe = std::env::current_exe().map_err(|_| "runtime_invalid")?;
+    let runtime_dir = exe.parent().ok_or("runtime_invalid")?.join("runtime");
+    let runtime = super::live_runtime::verify_runtime_dir(
+        &runtime_dir,
+        expected_sha,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .map_err(|_| "runtime_invalid")?;
+    use sha2::{Digest, Sha256};
+    let manifest =
+        std::fs::read(runtime_dir.join("manifest.json")).map_err(|_| "runtime_invalid")?;
+    if manifest.len() > 1024 * 1024
+        || Some(format!("{:x}", Sha256::digest(&manifest)).as_str())
+            != option_env!("ADAPTER_RUNTIME_MANIFEST_SHA256")
+    {
+        return Err("runtime_manifest_pin_mismatch".into());
+    }
+    let mut observation = ObservedOwner::windows(adapter_domain::State::new(
+        boot_id().map_err(|_| "random_unavailable")?,
+    ))
+    .map_err(|_| "physical_binding_unavailable")?;
+    let settle_deadline = Instant::now() + Duration::from_secs(5);
+    while !observation.binding_settled() {
+        observation.poll();
+        if super::STOPPING.load(std::sync::atomic::Ordering::Acquire)
+            || Instant::now() >= settle_deadline
+        {
+            return Err("waiting_network".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let binding = observation
+        .bindings()
+        .iter()
+        .copied()
+        .find(|b| b.ipv4)
+        .ok_or("physical_binding_unavailable")?;
+    let network = BoundNetwork::for_auxiliary_probe(&observation, binding)
+        .map_err(|_| "physical_binding_unavailable")?;
+    let private = AppRoot::open("WindowsClash").map_err(|_| "clash_private_store_unavailable")?;
+    let deadline = Instant::now() + Duration::from_secs(45);
+    for choice in candidates {
+        if network.is_cancelled() {
+            return Err("network_binding_changed".into());
+        }
+        if super::STOPPING.load(std::sync::atomic::Ordering::Acquire) || Instant::now() >= deadline
+        {
+            break;
+        }
+        let selected = chain_source::selected(root, dashboard.settings.front_port, &choice.name)?;
+        if selected.fingerprint != choice.fingerprint {
+            return Err("clash_config_changed".into());
+        }
+        let bytes = adapter_protocol::app::SecretText::new(serde_json::to_string(&json!({
+            "name":selected.name,"server":selected.server,"port":selected.port,"cipher":selected.cipher,"password":selected.password
+        })).map_err(|_| "clash_chain_configuration_invalid")?).into_value();
+        let proxy = adapter_engine_mihomo::chain::UpstreamSs::decode(bytes.as_bytes())
+            .map_err(|_| "clash_chain_configuration_invalid")?;
+        let probe_root = private.path().join(format!(
+            "chain-probe-{}",
+            boot_id().map_err(|_| "random_unavailable")?
+        ));
+        let probe_runtime =
+            PrivateRuntime::open(&probe_root).map_err(|_| "clash_private_store_unavailable")?;
+        let measured = adapter_engine_mihomo::chain_probe::qualify_udp(
+            &runtime.mihomo,
+            &probe_runtime,
+            &proxy,
+            &network,
+            deadline.min(Instant::now() + Duration::from_secs(12)),
+        );
+        match measured {
+            Err(adapter_engine_mihomo::chain_probe::ProbeError::Cleanup) => {
+                return Err("cleanup_uncertain".into())
+            }
+            Err(_) => continue,
+            Ok(_) => {}
+        }
+        if network.is_cancelled() || super::STOPPING.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("network_binding_changed".into());
+        }
+        let current = chain_source::selected(root, dashboard.settings.front_port, &choice.name)?;
+        if current.fingerprint != choice.fingerprint {
+            return Err("clash_config_changed".into());
+        }
+        let latest = match super::transact(adapter_protocol::app::AppCommand::Dashboard)? {
+            adapter_protocol::app::AppReply::Dashboard { dashboard } => dashboard,
+            _ => return Err("backend_unavailable".into()),
+        };
+        if latest.boot_id != dashboard.boot_id
+            || latest.settings.chain_selection != dashboard.settings.chain_selection
+        {
+            return Err("clash_config_changed".into());
+        }
+        if latest.operation.is_some() {
+            return Err("operation_busy".into());
+        }
+        return match super::transact(adapter_protocol::app::AppCommand::ConfigureChain {
+            proxy: adapter_protocol::app::SecretText::from_protected(bytes),
+        })? {
+            adapter_protocol::app::AppReply::Accepted { .. } => {
+                Ok(json!({"accepted":true,"selected":choice.name,"udp_verified":true}))
+            }
+            adapter_protocol::app::AppReply::Error { code } => Err(code),
+            _ => Err("invalid_response".into()),
+        };
+    }
+    Err("clash_chain_no_working_route".into())
+}
+
+#[cfg(test)]
+mod chain_preferences {
+    use super::*;
+    #[test]
+    fn real_names_supply_only_ordering_hints() {
+        assert_eq!(chain_preference("🇺🇸 美国 Y02"), 0);
+        assert_eq!(chain_preference("Singapore 03"), 1);
+        assert_eq!(chain_preference("英国Y01"), 2);
+        assert_eq!(chain_preference("Unknown"), 3);
+    }
 }

@@ -291,7 +291,13 @@ fn budget_stops_starting_fallback() {
     let mut s = seeded();
     let token = resume(&mut s);
     assert_eq!(
-        s.original_verified(&token, canary(false, false, false), 47010, 47010, false),
+        s.original_verified(
+            &token,
+            canary(false, false, false),
+            2010 + RECOVERY_BUDGET_MS,
+            2010 + RECOVERY_BUDGET_MS,
+            false
+        ),
         Effect::Disconnected
     );
 }
@@ -348,9 +354,12 @@ fn completed_inflight_fallback_is_not_rejected_only_for_exceeding_start_budget()
     let mut s = seeded();
     let token = resume(&mut s);
     s.original_verified(&token, canary(false, false, false), 2010, 2010, false);
-    let attempt = s.begin_fallback(path("two", "us-sjc", 2), 46_900).unwrap();
+    let start = 2010 + RECOVERY_BUDGET_MS;
+    let attempt = s
+        .begin_fallback(path("two", "us-sjc", 2), start - 100)
+        .unwrap();
     assert!(s
-        .commit_fallback(&attempt, canary(true, true, true), 47_100, 47_100)
+        .commit_fallback(&attempt, canary(true, true, true), start + 100, start + 100)
         .is_ok());
 }
 
@@ -359,11 +368,15 @@ fn deferred_original_rebuild_does_not_start_after_budget_expires() {
     let mut s = seeded();
     let token = resume(&mut s);
     s.original_verified(&token, canary(false, false, false), 2010, 2010, true);
+    let near_end = 2010 + RECOVERY_BUDGET_MS - 100;
     let attempt = s
-        .begin_original_rebuild(path("one", "us-sjc", 2), 2011)
+        .begin_original_rebuild(path("one", "us-sjc", 2), near_end)
         .unwrap();
-    s.original_rebuilt(&attempt, RebuildResult::Busy, 47000, 47000);
-    assert_eq!(s.tick(47250), Some(Effect::Disconnected));
+    s.original_rebuilt(&attempt, RebuildResult::Busy, near_end, near_end);
+    assert_eq!(
+        s.tick(near_end + LOCAL_RETRY_MS),
+        Some(Effect::Disconnected)
+    );
 }
 
 #[test]
@@ -539,4 +552,97 @@ fn hard_deadline_applies_to_every_rebuild_outcome_and_fallback() {
             }
         );
     }
+}
+
+#[test]
+fn serial_original_short_retries_keep_exact_path_and_never_refill_round() {
+    let mut s = seeded();
+    s.observe(Attachment::Available, 0);
+    s.request_original_rebuild(100).unwrap();
+    let committed = s.path.clone();
+    let start = s.recovery_started;
+    let mut now = 101;
+    for (instance, delay) in [(2, Some(1000)), (3, Some(5000)), (4, None)] {
+        let a = s
+            .begin_original_rebuild(path("one", "us-sjc", instance), now)
+            .unwrap();
+        let result = s.original_rebuilt_retry(
+            &a,
+            RebuildResult::Canary {
+                path: a.path.clone(),
+                canary: canary(false, false, false),
+            },
+            now,
+            now,
+            delay,
+        );
+        assert_eq!(s.path, committed);
+        assert_eq!(s.recovery_started, start);
+        assert!(!s.candidate_is_current(&a, now));
+        if let Some(delay) = delay {
+            assert_eq!(result, Effect::Deferred(delay));
+            now += delay;
+            assert!(matches!(s.tick(now), Some(Effect::Rebuild(_, _))));
+        } else {
+            assert!(matches!(result, Effect::SameCity(_, _)));
+            assert_eq!(s.stage, Stage::Fallback);
+        }
+    }
+}
+#[test]
+fn retry_disposition_does_not_accept_stale_foreign_or_preempted_negatives() {
+    for invalid in 0..4 {
+        let mut s = seeded();
+        s.observe(Attachment::Available, 0);
+        s.request_original_rebuild(100).unwrap();
+        let a = s
+            .begin_original_rebuild(path("one", "us-sjc", 2), 101)
+            .unwrap();
+        let (at, now) = match invalid {
+            0 => (100, 101),
+            1 => (102, 101),
+            2 => (101, 6000),
+            _ => (102, 102),
+        };
+        if invalid == 3 {
+            s.manual_preempt();
+        }
+        let token = s.token();
+        let budget = s.recovery_started;
+        assert_eq!(
+            s.original_rebuilt_retry(
+                &a,
+                RebuildResult::Canary {
+                    path: a.path.clone(),
+                    canary: canary(false, false, false)
+                },
+                at,
+                now,
+                Some(1000)
+            ),
+            Effect::Stale
+        );
+        assert_eq!(s.token(), token);
+        assert_eq!(s.recovery_started, budget);
+    }
+}
+#[test]
+fn drained_local_deadline_can_retry_original_without_inventing_negative_evidence() {
+    let mut s = seeded();
+    s.observe(Attachment::Available, 0);
+    s.request_original_rebuild(100).unwrap();
+    let a = s
+        .begin_original_rebuild(path("one", "us-sjc", 2), 101)
+        .unwrap();
+    let late = a.deadline + 1;
+    assert!(!s.candidate_is_current(&a, late));
+    assert_eq!(
+        s.retry_after_local_cleanup(&a, late),
+        Effect::Deferred(LOCAL_RETRY_MS)
+    );
+    assert_eq!(s.recovery_started, Some(100));
+    s.tick(late + LOCAL_RETRY_MS);
+    assert!(s
+        .begin_original_rebuild(path("one", "us-sjc", 3), late + LOCAL_RETRY_MS)
+        .is_ok());
 }

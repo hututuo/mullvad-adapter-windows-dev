@@ -458,6 +458,8 @@ mod tests {
             metadata_error: None,
             chain_node: None,
             retry_in_seconds: None,
+            recovery: None,
+            backup_verified_at: None,
             account: Account::default(),
             operation: None,
             last_error: None,

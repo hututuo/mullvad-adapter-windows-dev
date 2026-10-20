@@ -86,7 +86,7 @@ def main():
         version = subprocess.run([str(binary), "-v"], check=True, capture_output=True, timeout=10, env=clean_env)
         if f'Mihomo Meta {manifest["version"]} '.encode() not in version.stdout:
             raise RuntimeError("engine version mismatch")
-        for mode in ("ipv4", "ipv6", "ss", "chain", "front"):
+        for mode in ("ipv4", "ipv6", "ss", "chain", "chain-probe", "front"):
             fixture = subprocess.run([str(args.fixture_generator.resolve()), mode], check=True, capture_output=True, timeout=10, env=clean_env).stdout
             if not 0 < len(fixture) <= 16384:
                 raise RuntimeError("invalid synthetic fixture size")

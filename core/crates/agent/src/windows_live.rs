@@ -636,6 +636,8 @@ pub fn serve(scope: &str) -> io::Result<()> {
         metadata_error: None,
         chain_node: None,
         retry_in_seconds: None,
+        recovery: None,
+        backup_verified_at: None,
         account: Account::default(),
         operation: None,
         last_error: None,
@@ -673,6 +675,7 @@ pub fn serve(scope: &str) -> io::Result<()> {
     let (_front, front_events, mailbox) = connection_lifecycle::mailbox();
     let (mut connections, tunnel_mailbox) =
         crate::live_connection::Connections::new(root.path().to_owned(), logs.clone());
+    connections.restore_history(store.clone());
     match store.load(RecordKind::ChainProxy) {
         Ok(bytes) => match adapter_engine_mihomo::chain::UpstreamSs::decode(bytes.expose()) {
             Ok(chain) => {
@@ -938,6 +941,9 @@ pub fn serve(scope: &str) -> io::Result<()> {
         }
         update_candidates(&mut dashboard, &pings);
         while let Some(reply) = front_events.poll() {
+            if reply.request_id == 0 && dashboard.active_relay.is_some() {
+                connections.recheck_soon();
+            }
             dashboard.front_selected = match reply.status {
                 FrontStatus::Reject => "reject",
                 FrontStatus::SlotA => "slot_a",
@@ -953,6 +959,7 @@ pub fn serve(scope: &str) -> io::Result<()> {
             catalogue.as_ref(),
             matches!(effect, Some(adapter_domain::Effect::Verify(_, _))),
         );
+        connections.update_progress(&mut dashboard);
         if let Ok(done) = api_results.try_recv() {
             if pending_work.as_deref() == Some(done.id.as_str()) {
                 dashboard.operation = quick
@@ -1290,6 +1297,32 @@ pub fn serve(scope: &str) -> io::Result<()> {
                                 }) =>
                         {
                             failure("disconnect_before_chain_change")
+                        }
+                        AppCommand::RecoveryAction { action } => {
+                            startup_pending = false;
+                            if pending_work.is_some() || quick.is_some() || queued_connect.is_some()
+                            {
+                                failure("operation_busy")
+                            } else if let (Some(identity), Some(catalogue)) =
+                                (identity.as_ref(), catalogue.as_ref())
+                            {
+                                match connections.recovery_action(
+                                    &mut owner,
+                                    &mut dashboard,
+                                    identity,
+                                    catalogue,
+                                    action,
+                                ) {
+                                    Ok(operation_id) => AppReply::Accepted { operation_id },
+                                    Err(code) => failure(code),
+                                }
+                            } else {
+                                failure(if identity.is_none() {
+                                    "identity_missing"
+                                } else {
+                                    "metadata_missing"
+                                })
+                            }
                         }
                         command @ (AppCommand::Connect | AppCommand::ConnectRelay { .. }) => {
                             startup_pending = false;

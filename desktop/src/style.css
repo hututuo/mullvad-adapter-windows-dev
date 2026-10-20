@@ -750,3 +750,25 @@ footer {
 .setup-step-content .panel-heading { gap:12px; flex-wrap:wrap; }
 .setup-step-content p { line-height:1.75; }
 @media(max-width:880px){ .setup-steps > li { gap:12px; } }
+
+.recovery-panel { border-color:#a9c9bb; }
+.recovery-steps { display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;list-style:none;margin:8px 0 22px;padding:0; }
+.recovery-steps li { display:flex;gap:7px;align-items:center;color:#7a8d83;font-size:12px;min-height:40px;padding:8px;border-radius:8px;background:#f2f6f3; }
+.recovery-steps li span { flex:none;display:grid;place-items:center;width:22px;height:22px;border:1px solid #ccd9d1;border-radius:50%;font-size:11px; }
+.recovery-steps li.current { color:#0e5f50;background:#dff0e8;font-weight:650; }
+.recovery-steps li.current span { background:#126f62;border-color:#126f62;color:white; }
+.recovery-steps li.done { color:#3b7561; }
+.recovery-detail { display:grid;grid-template-columns:1.05fr .85fr 1.4fr;gap:22px;min-height:88px; }
+.recovery-detail>div { display:flex;flex-direction:column;gap:7px;min-width:0; }
+.recovery-detail small { color:var(--muted);font-size:12px; }
+.recovery-detail strong { font-size:15px;overflow-wrap:anywhere; }
+.recovery-detail span { font-size:12px;line-height:1.65;color:var(--muted);overflow-wrap:anywhere; }
+.recovery-feedback { height:52px;overflow:auto;display:flex;align-items:center;padding:8px 12px;margin:12px 0;color:#446454;background:#f1f6f2;border-radius:7px;font-size:12px;line-height:1.65; }
+.backup-route-summary { display:flex;align-items:center;justify-content:space-between;gap:18px; }
+.backup-route-summary>div { min-width:0; }
+.backup-route-summary strong { font-size:16px;overflow-wrap:anywhere; }
+.backup-route-summary p { font-size:12px;line-height:1.65;color:var(--muted);margin:7px 0 0; }
+.backup-route-summary button { flex:none; }
+.backup-route-result { height:44px;overflow:auto;margin:12px 0 0;font-size:12px;line-height:1.7;color:#527263; }
+.backup-route .clash-advanced { margin-top:10px;padding-top:8px; }
+@media(max-width:880px){.recovery-detail{grid-template-columns:1fr 1fr;}.recovery-detail>div:last-child{grid-column:1/-1}.recovery-steps{grid-template-columns:1fr 1fr}.backup-route-summary{align-items:flex-start;}}

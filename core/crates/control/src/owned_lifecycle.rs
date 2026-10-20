@@ -54,6 +54,30 @@ impl BoundCancellation {
     }
 }
 impl BoundNetwork {
+    /// A short SS-only auxiliary probe may share a physical attachment, without
+    /// occupying the WG operation registry or acquiring any selection authority.
+    /// This cannot mint an OperationTicket or authorize a candidate commit.
+    pub fn for_auxiliary_probe(
+        observation: &ObservedOwner,
+        binding: PhysicalBinding,
+    ) -> io::Result<Self> {
+        let evidence = observation
+            .binding_evidence()
+            .filter(|e| e.bindings.contains(&binding))
+            .filter(|_| observation.binding_settled())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "fresh settled physical binding required",
+                )
+            })?;
+        Ok(Self {
+            binding,
+            hint: observation.change_hint(),
+            revision: evidence.revision,
+            cancel: Cancellation(Arc::new(AtomicBool::new(false))),
+        })
+    }
     pub fn cancellation_monitor(&self) -> BoundCancellation {
         BoundCancellation {
             hint: self.hint.clone(),

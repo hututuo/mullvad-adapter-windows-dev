@@ -21,7 +21,8 @@ import {
 import "./style.css";
 import { ClashPage } from "./clash-page";
 import { SetupPage } from "./setup-page";
-import { ChainRoute } from "./chain-route";
+import { ChainRoute, useChainBackup } from "./chain-route";
+import { RecoveryPanel } from "./recovery-panel";
 import { canCreateDevice } from "./device-creation";
 type Page = "setup" | "cities" | "account" | "clash" | "relays" | "diagnostics";
 const pages: { id: Page; name: string; mark: string }[] = [
@@ -189,6 +190,7 @@ function App() {
     return ()=>{window.removeEventListener("blur",hide);document.removeEventListener("visibilitychange",visibility);if(timeout)clearTimeout(timeout);};
   },[privateKey]);
   async function act(command: Command) {
+    if(command.kind==="disconnect"||command.kind==="cancel_operation")backup.cancel();
     if (stopping.current) return;
     if (flight.current) {
       setMessage("正在同步状态，请稍后再试。");
@@ -315,8 +317,9 @@ function App() {
       setError(true);
     }
   }, [data?.last_report_path, data?.boot_id, data?.operation, data?.last_error]);
+  const backup = useChainBackup(data);
   const chosen = data?.cities.find((c) => c.id === data.settings.selected_city),
-    busy = pending || !!data?.operation,
+    busy = pending || !!data?.operation || ["testing_backup","restoring_previous","returning_direct"].includes(data?.recovery?.stage??""),
     quickState = data?.quick_test;
   useEffect(() => {
     if (page === "diagnostics" && data && !settings)
@@ -453,68 +456,10 @@ function App() {
                 );
               })}
             </div>
+            {data && <RecoveryPanel data={data} busy={busy} onAction={act} />}
+            {data && <ChainRoute data={data} disabled={busy} backup={backup} onSettings={async next=>{await act({kind:"save_settings",settings:next});setSettings({...next});}} />}
             <section className="panel">
-              <div className="panel-heading">
-                <div>
-                  <p className="eyebrow">CURRENT CONNECTION</p>
-                  <h2>{chosen?.name ?? (data?.settings.selected_city ? "节点目录尚未加载" : "尚未选择城市")}</h2>
-                </div>
-                <span
-                  className={`pill ${data?.status === "connected" ? "positive" : ""}`}
-                >
-                  {data?.status === "retry_wait" ? `${data.retry_in_seconds ?? "—"} 秒后自动重试` : data ? (statusText[data.status] ?? data.status) : "等待后台"}
-                </span>
-              </div>
-              <div className="connection-facts">
-                <div><small>当前承载</small><strong>{!data?.active_relay ? "等待连接" : data.connection?.chained ? "独立节点 → Mullvad" : "SS 直连 Mullvad"}</strong></div>
-                <div>
-                  <small>主节点</small>
-                  <strong>{data?.active_relay ?? "尚未建立"}</strong>
-                </div>
-                <div>
-                  <small>设备身份</small>
-                  <strong>{data?.device_name ?? "尚未导入"}</strong>
-                </div>
-                <div>
-                  <small>本机网络</small>
-                  <strong>
-                    {data?.physical_attachment === "available"
-                      ? "已有本地接入"
-                      : data?.physical_attachment === "unavailable"
-                        ? "已断开，等待恢复"
-                        : "正在确认"}
-                  </strong>
-                </div>
-              </div>
-              <div className="panel-actions">
-                <button
-                  className="primary"
-                  disabled={!data || busy || !chosen}
-                  onClick={() =>
-                    void act({
-                      kind: data?.status === "retry_wait" || data?.active_relay && data.status==="connected" ? "disconnect" : "connect",
-                    })
-                  }
-                >
-                  {data?.status === "retry_wait" ? "停止自动恢复" : data?.active_relay && data.status==="connected" ? "断开连接" : data?.active_relay ? "重连当前节点" : "连接当前城市"}
-                </button>
-                {data?.status === "retry_wait" && <button disabled={busy} onClick={() => void act({kind:"connect"})}>立即重试</button>}
-                <button
-                  disabled={!chosen || busy}
-                  onClick={() =>
-                    chosen && void act({ kind: "quick_test", city: chosen.id })
-                  }
-                >
-                  快速检查
-                </button>
-                <button
-                  className="quiet"
-                  disabled={!data || busy}
-                  onClick={() => setChooser(true)}
-                >
-                  管理城市
-                </button>
-              </div>
+              <div className="panel-heading"><h2>同城备选</h2><button className="quiet" disabled={!data || busy} onClick={()=>setChooser(true)}>管理城市</button></div>
               <p className="hint">
                 备用由低成本检查和有时效的历史筛选。ICMP
                 通过不表示隧道可用，切换前完整验证；不常驻第二条同身份通道。
@@ -525,7 +470,7 @@ function App() {
                     (c) => c.city === chosen?.id,
                   )[index];
                   return (
-                    <div className="backup-card" key={index}>
+                    <button className="backup-card" key={index} disabled={busy || !candidate} aria-label={candidate ? `重试节点 ${candidate.hostname}` : `备选 ${index+1} 暂无节点`} onClick={()=>candidate && void act({kind:"connect_relay",hostname:candidate.hostname})}>
                       <small>备选 {index + 1} · 切换前验证</small>
                       <strong>{candidate?.hostname ?? "等待快速检查"}</strong>
                       <span>
@@ -538,7 +483,7 @@ function App() {
                           ? timeText(candidate.measured_at)
                           : "只选择当前城市内的节点"}
                       </small>
-                    </div>
+                    </button>
                   );
                 })}
               </div>
@@ -1044,7 +989,7 @@ function App() {
                 </form>
               </section>
             )}
-            {data && <ChainRoute data={data} disabled={busy} onSettings={async next => {
+            {data && <ChainRoute data={data} disabled={busy} backup={backup} onSettings={async next => {
               const latest = current.current;
               if (!latest) return;
               setSettings(draft => draft ? {...draft, tunnel_route:next.tunnel_route} : draft);

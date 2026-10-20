@@ -1,6 +1,7 @@
 //! Pure Mihomo configuration contracts. No process, file, socket or live peer use.
 mod carrier;
 pub mod chain;
+pub mod chain_probe;
 #[cfg(any(test, windows, feature = "windows-api-check"))]
 mod device_identity;
 #[cfg(any(test, windows, feature = "windows-api-check"))]

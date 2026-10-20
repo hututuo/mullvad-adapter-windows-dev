@@ -38,6 +38,8 @@ pub struct Settings {
     pub connect_on_start: bool,
     #[serde(default)]
     pub tunnel_route: TunnelRoute,
+    #[serde(default)]
+    pub chain_selection: Option<String>,
     pub required_multihop: bool,
     pub required_pq: bool,
 }
@@ -51,6 +53,7 @@ impl Default for Settings {
             automatic_recovery: true,
             connect_on_start: true,
             tunnel_route: TunnelRoute::Auto,
+            chain_selection: None,
             required_multihop: false,
             required_pq: false,
         }
@@ -70,6 +73,10 @@ pub enum TunnelRoute {
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.favorite_cities.len() > 3
+            || self
+                .chain_selection
+                .as_ref()
+                .is_some_and(|s| s.is_empty() || s.len() > 256 || s.chars().any(char::is_control))
             || !(1024..=65533).contains(&self.front_port)
             || [17920, 17921, 17930, 17931].contains(&self.front_port)
             || [17920, 17921, 17930, 17931].contains(&self.front_port.saturating_add(2))
@@ -171,6 +178,9 @@ pub enum AppCommand {
     ConnectRelay {
         hostname: String,
     },
+    RecoveryAction {
+        action: RecoveryAction,
+    },
     Disconnect,
     CancelOperation,
     QuickTest {
@@ -201,6 +211,30 @@ pub enum AppCommand {
     },
     ExportReport,
     Shutdown,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryAction {
+    RetryCurrent,
+    RetryCity,
+    TestBackup,
+    ChainFallback,
+    ReturnDirect,
+}
+
+/// Current owner-produced plan, never inferred by the renderer from log text.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryProgress {
+    pub stage: String,
+    pub relay: Option<String>,
+    pub inlet: Option<String>,
+    pub attempt: u32,
+    pub elapsed_seconds: u64,
+    pub budget_seconds: u64,
+    pub wait_seconds: u64,
+    pub next: String,
+    pub direct_return_in_seconds: Option<u64>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct City {
@@ -378,6 +412,10 @@ pub struct Dashboard {
     pub chain_node: Option<String>,
     #[serde(default)]
     pub retry_in_seconds: Option<u64>,
+    #[serde(default)]
+    pub recovery: Option<RecoveryProgress>,
+    #[serde(default)]
+    pub backup_verified_at: Option<u64>,
     pub account: Account,
     pub operation: Option<String>,
     pub last_error: Option<String>,

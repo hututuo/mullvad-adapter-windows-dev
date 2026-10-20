@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 pub const SETTLE_MS: u64 = 2_000;
-pub const RECOVERY_BUDGET_MS: u64 = 45_000;
+pub const RECOVERY_BUDGET_MS: u64 = 180_000;
 pub const PROBE_TTL_MS: u64 = 5_000;
 pub const LOCAL_RETRY_MS: u64 = 250;
 /// Prototype hard I/O-attempt ceiling, not a measured recovery-performance promise.
@@ -391,6 +391,18 @@ impl State {
         observed_at: u64,
         now: u64,
     ) -> Effect {
+        self.original_rebuilt_retry(attempt, result, observed_at, now, None)
+    }
+    /// Continue the exact original path only after current, fresh negative data
+    /// evidence and confirmed cleanup by the resource owner. No budget refill.
+    pub fn original_rebuilt_retry(
+        &mut self,
+        attempt: &CandidateAttempt,
+        result: RebuildResult,
+        observed_at: u64,
+        now: u64,
+        retry_delay_ms: Option<u64>,
+    ) -> Effect {
         if self.stage != Stage::RebuildOriginal
             || self.validate_candidate(attempt, observed_at, now).is_err()
         {
@@ -423,8 +435,50 @@ impl State {
                 self.readiness = Some(canary.readiness());
                 Effect::Disconnected
             }
-            RebuildResult::Canary { .. } => self.fallback(now),
+            RebuildResult::Canary { .. } => {
+                if let Some(delay) = retry_delay_ms.filter(|delay| *delay <= 5_000) {
+                    if !self.budget_expired(now) {
+                        self.deferred_stage = Some(Stage::RebuildOriginal);
+                        self.deferred_until = Some(now.saturating_add(delay));
+                        self.stage = Stage::Deferred;
+                        return Effect::Deferred(delay);
+                    }
+                }
+                self.fallback(now)
+            }
         }
+    }
+    /// End an unstarted original phase to reserve time for later routes. The
+    /// caller cannot discard a registered candidate or renew the round.
+    pub fn finish_original_phase(&mut self, now: u64) -> Effect {
+        if self.paused
+            || self.candidate.is_some()
+            || !matches!(self.stage, Stage::RebuildOriginal | Stage::Deferred)
+        {
+            return Effect::Stale;
+        }
+        self.deferred_stage = None;
+        self.deferred_until = None;
+        self.fallback(now)
+    }
+    /// A drained local/stale/cancelled attempt has no negative node evidence.
+    /// Retain its intended phase even when the old attempt deadline has elapsed.
+    pub fn retry_after_local_cleanup(&mut self, attempt: &CandidateAttempt, now: u64) -> Effect {
+        if !self.current(&attempt.owner) || self.candidate.as_ref() != Some(attempt) {
+            return Effect::Stale;
+        }
+        self.candidate = None;
+        if self.stage == Stage::RebuildOriginal {
+            if self.budget_expired(now) {
+                self.stage = Stage::Disconnected;
+                return Effect::Disconnected;
+            }
+            self.deferred_stage = Some(Stage::RebuildOriginal);
+            self.stage = Stage::Deferred;
+            self.deferred_until = Some(now.saturating_add(LOCAL_RETRY_MS));
+            return Effect::Deferred(LOCAL_RETRY_MS);
+        }
+        Effect::Stale
     }
     fn budget_expired(&self, now: u64) -> bool {
         self.recovery_started.map_or(true, |start| {

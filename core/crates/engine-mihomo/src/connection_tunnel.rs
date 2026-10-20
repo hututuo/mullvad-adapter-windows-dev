@@ -363,6 +363,25 @@ impl Manager {
                     Ok(Assessment::Bound(proof))
                         if !network.is_cancelled() && held.worker.verify_bound_report(&proof) =>
                     {
+                        // Healthy backend, broken local selector: repair only
+                        // the front. Never rebuild WG or consume an SS here.
+                        if front.controller().selected().ok() != Some(held.slot) {
+                            if network.is_cancelled() {
+                                return Ok(Reply::Failed {
+                                    id,
+                                    code: "active_probe_cancelled",
+                                });
+                            }
+                            let _ = front.controller().select(held.slot);
+                            if network.is_cancelled()
+                                || front.controller().selected().ok() != Some(held.slot)
+                            {
+                                return Ok(Reply::Failed {
+                                    id,
+                                    code: "active_front_repair_failed",
+                                });
+                            }
+                        }
                         Ok(Reply::Verified {
                             id,
                             proof: Arc::new(proof),

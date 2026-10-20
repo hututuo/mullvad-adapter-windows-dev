@@ -61,7 +61,7 @@ TUN需有独立API规则。配置了本机代理时不会静默回退或重放�
 保留物理断网暂停、稳定恢复2秒后验证原路径、原路径重建后才同城备选的策略。
 失败 active Verify 有15秒重试间隔，避免恢复不可启动时每个主循环都重测。
 进程创建锁排队每10ms检查取消/截止/路由；持锁后再检查。CreateProcessW本身
-不可取消，失败清理仍有 carrier 与进程树的独立预算。45秒是启动 fallback 的
+不可取消，失败清理仍有 carrier 与进程树的独立预算。180秒是启动恢复新尝试的
 预算，不是端到端恢复保证；完整健康检查自身最长约14秒，健康后间隔15秒。
 这些是源码预算，不是这次故障注入实测。没有自动睡眠、物理断网或电源策略测试。
 
@@ -85,17 +85,23 @@ Windows 保留用户连接的城市及显式节点意图。一轮恢复耗尽后
 - [Mullvad relay selection](https://github.com/mullvad/mullvadvpn-app/blob/main/docs/relay-selector.md)
 - [Mullvad SS implementation](https://github.com/mullvad/mullvadvpn-app/blob/main/tunnel-obfuscation/src/shadowsocks.rs)
 
-### Same-relay SS inlet recovery
+### 直连优先恢复与备用路线
 
-Windows keeps the established SS default as its first choice. After a fresh owned data-plane failure and confirmed worker/carrier cleanup, it can try at most four metadata-authorized inlet combinations on that same relay before moving through the existing same-city relay queue. Dedicated extra IPv4 addresses may use 443 or the established default port; primary relay addresses remain restricted to the official SS port ranges. Addresses are read from current metadata, not machine constants. No UDP53 candidate is added.
+第一次确认的数据面失败保留现有 worker，约2秒后复测，连续两次失败才启动恢复；
+本机离线、证据过期、取消和本地错误不计节点失败。后端仍健康时优先修复本地 front。
+恢复先串行重建原节点原 SS，失败清理后间隔1秒、5秒短重试；再试原节点最多两个
+备用 SS，按本机真实成功历史排序。最多两个其他同城节点，每个最多两个 SS。
+每轮使用固定节点集合；所有直连选择实际用尽后才进入链式，不再逐入口交错。
+整体新尝试预算180秒，单次仍有90秒硬上限及独立清理预算，不是恢复耗时保证。
+本机历史只帮助排序，不取代新鲜健康检查或官方目录授权。
 
-Original-path recovery still starts with the exact saved inlet. New alternatives are fallback attempts, retain the existing 45-second round start budget, and cannot run concurrently under one WG identity. Stale evidence, cancellation, physical-offline state and local setup errors do not consume an inlet. DNS-only or single-service degradation does not advance this inlet queue. A healthy committed path is retained; no spare tunnel is probed in the background. Metadata refresh cannot resurrect failed endpoints or grow one round beyond twelve measured inlet failures.
-
-With an independent SS upstream configured, automatic mode tries that same Mullvad
-inlet through the chain after measured direct failure, then alternates bounded
-direct/chain attempts. Both routes share the four-per-relay/twelve-per-round cap.
-The original committed route is rebuilt first. A healthy chain is retained rather
-than periodically switching its IP or probing another tunnel to prefer direct.
+链式从实际 Clash 配置和受限的本地 provider 缓存自动准备，按节点名称提示优先
+美国、新加坡，再英国；实际物理 UDP 收发验证决定能否采用。后台不启动第二条同
+身份 WG。主页面一个“测试备用路线”完成准备、完整隧道流量验证和原路线恢复，
+不要求逐个节点操作。高级设置可固定兼容节点，偏好保存在本机策略中。
+Auto链式连接后120秒开始串行尝试回到直连，失败恢复刚才的链式，并按5/15/30分钟
+退避；固定链式策略不主动回直连。所有试切均先确认旧worker停止，不承诺无损。
+当前阶段、relay/SS、耗时、下一步、手动重试与停止都显示在城市主页。
 
 ## 启动与系统流量接入
 

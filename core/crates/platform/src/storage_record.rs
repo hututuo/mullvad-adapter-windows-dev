@@ -17,6 +17,7 @@ pub enum RecordKind {
     IdentityBackup = 6,
     ApiAddresses = 7,
     ChainProxy = 8,
+    RecoveryHistory = 9,
 }
 impl RecordKind {
     pub fn filename(self) -> &'static str {
@@ -29,6 +30,7 @@ impl RecordKind {
             Self::IdentityBackup => "identity-backup.dpapi",
             Self::ApiAddresses => "api-addresses.dpapi",
             Self::ChainProxy => "chain-proxy.dpapi",
+            Self::RecoveryHistory => "recovery-history.dpapi",
         }
     }
 }

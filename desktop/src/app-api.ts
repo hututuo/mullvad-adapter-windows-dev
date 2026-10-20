@@ -7,6 +7,7 @@ export type Settings = {
   automatic_recovery: boolean;
   connect_on_start: boolean;
   tunnel_route: "direct" | "chain" | "auto";
+  chain_selection?: string | null;
   required_multihop: boolean;
   required_pq: boolean;
 };
@@ -42,6 +43,8 @@ export function probeText(value: boolean | null, outcome?: ProbeOutcome) {
   }[outcome];
   return value === null ? "未测" : value ? "通过" : "未通过";
 }
+export type RecoveryAction = "retry_current" | "retry_city" | "test_backup" | "chain_fallback" | "return_direct";
+export type RecoveryProgress = { stage:string; relay:string|null; inlet:string|null; attempt:number; elapsed_seconds:number; budget_seconds:number; wait_seconds:number; next:string; direct_return_in_seconds:number|null };
 export type Dashboard = {
   sequence: number;
   boot_id: string;
@@ -66,6 +69,8 @@ export type Dashboard = {
   metadata_error?: string | null;
   chain_node?: string | null;
   retry_in_seconds?: number | null;
+  recovery?: RecoveryProgress | null;
+  backup_verified_at?: number | null;
   account: {
     authenticated: boolean;
     expiry: string | null;
@@ -100,6 +105,7 @@ export type Dashboard = {
 };
 export type Command =
   | { kind: "connect_relay"; hostname: string }
+  | { kind: "recovery_action"; action: RecoveryAction }
   | {
       kind:
         | "dashboard"
@@ -147,6 +153,7 @@ export const statusText: Record<string, string> = {
   starting_front: "正在准备本地入口",
   connecting: "正在验证连接",
   connected: "已连接",
+  confirming_path: "正在复测原路径",
   degraded_dns: "连接可用，DNS 待恢复",
   degraded_service: "连接可用，服务待恢复",
   waiting_network: "等待本机网络恢复",
@@ -157,6 +164,14 @@ export const statusText: Record<string, string> = {
   stopping: "正在安全断开",
 };
 const errors: Record<string, string> = {
+  active_data_failed: "当前数据检查失败，先复测原路径；确认连续失败后才恢复。",
+  active_probe_failed: "原路径检查未通过，正在按当前城市的恢复顺序处理。",
+  active_front_repair_failed: "后端仍可用，正在优先修复本地转发入口。",
+
+  clash_chain_no_compatible_nodes: "Clash 中暂未找到兼容的备用节点，直连恢复继续运行。",
+  clash_chain_no_working_route: "本次没有找到能承载隧道的备用节点，已保留原配置；后台会稍后再试。",
+  route_trial_failed: "本次路线测试未通过；已尝试恢复原路线，可查看当前恢复进度。",
+
   backend_unavailable: "后台暂不可达，正在重新连接。",
   backend_start_failed: "后台启动失败，请导出诊断记录。",
   backend_version_mismatch: "界面与后台版本不一致，请先退出旧后台再启动这版应用。",
@@ -199,7 +214,7 @@ const errors: Record<string, string> = {
   bootstrap_missing: "请在设置中指定可用的本地外网代理端口。",
   metadata_refresh_busy: "官方目录正在后台更新，现有连接保持运行。",
   metadata_refresh_unavailable: "目录更新暂不可用，已保留缓存，稍后自动重试。",
-  chain_not_configured: "请先在诊断与设置中保存一个独立链式节点。",
+  chain_not_configured: "正在从本机 Clash 准备备用；也可以点“测试备用路线”自动检查。",
   chain_configuration_invalid: "本机链式节点配置无法核验，请重新从 Clash 选择。",
   chain_write_failed: "链式节点未能安全保存，请重试；现有连接保持运行。",
   disconnect_before_chain_change: "当前链式连接仍使用原节点。请先断开，再更换链式节点；不会在后台替换原路径。",

@@ -62,6 +62,8 @@ pub struct ConnectionResource {
     front: Front,
     mailbox: FrontMailbox,
     tunnel: Option<crate::connection_tunnel::Manager>,
+    config: FrontConfig,
+    lifetime: Cancellation,
 }
 impl ConnectionResource {
     pub fn build(
@@ -93,6 +95,8 @@ impl ConnectionResource {
             front,
             mailbox,
             tunnel: None,
+            config,
+            lifetime,
         }))
     }
     pub fn attach_tunnels(
@@ -117,7 +121,31 @@ impl ConnectionResource {
 impl Resource for ConnectionResource {
     fn check(&mut self) -> Result<(), Failure> {
         if !matches!(self.front.process().wait(Duration::ZERO), Ok(None)) {
-            return Err(Failure::Worker);
+            // Confirm only this exact front's absence, then recreate the local
+            // entry with REJECT. The existing WG worker remains owned/alive;
+            // its next fresh Verify can reselect it without changing the exit.
+            self.front.stop().map_err(|_| Failure::Stop)?;
+            let c = &self.config;
+            self.front = Front::start(
+                &c.executable,
+                &c.runtime,
+                &Listener {
+                    mixed_port: c.mixed_port,
+                    controller_port: c.controller_port,
+                    controller_secret: &c.controller_secret,
+                },
+                c.slot_a,
+                c.slot_b,
+                || self.lifetime.is_cancelled(),
+            )
+            .map_err(|e| match e {
+                crate::lifecycle::StartError::Cleanup => Failure::Stop,
+                _ => Failure::Worker,
+            })?;
+            let _ = self.mailbox.replies.try_send(FrontReply {
+                request_id: 0,
+                status: FrontStatus::Reject,
+            });
         }
         if let Some(tunnel) = &mut self.tunnel {
             tunnel.poll(&self.front)?;

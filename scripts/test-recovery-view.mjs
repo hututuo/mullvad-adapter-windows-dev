@@ -1,0 +1,11 @@
+import assert from 'node:assert/strict';
+import {recoveryView} from '../desktop/src/recovery-view.ts';
+const d={identity_configured:true,physical_attachment:'available',status:'disconnected',settings:{selected_city:'us-sjc'},active_relay:null,operation:null,recovery:{stage:'original_inlet',relay:'us-sjc-wg-002',inlet:'192.0.2.1:443',attempt:2,next:'same_relay_inlets'}};
+assert.equal(recoveryView(d,false).target,'us-sjc-wg-002');
+assert.equal(recoveryView(d,false).canRetry,true);
+assert.equal(recoveryView({...d,physical_attachment:'unavailable'},false).canRetry,false);
+assert.equal(recoveryView(d,true).canRetry,false);
+for(const stage of ['testing_backup','restoring_previous','returning_direct'])assert.equal(recoveryView({...d,recovery:{...d.recovery,stage}},false).canRetry,false);
+assert.equal(recoveryView({...d,operation:'automatic_recovery'},true).canStop,true);
+assert.equal(recoveryView({...d,status:'connected',active_relay:'r',connection:{chained:true},recovery:{...d.recovery,stage:'chain_connected'}},false).chained,true);
+console.log('recovery view: target, offline, trial, busy and stop guards PASS');

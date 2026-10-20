@@ -5,24 +5,51 @@ use std::{
     net::SocketAddrV4,
 };
 
-// At most three same-city relays, four measured inlet failures each per budget.
-const MAX_FAILED: usize = 12;
+// Original: exact inlet + two alternatives. Other city relays: two each.
+// Chain is a separate final phase, with two inlets per relay: 7 + 6 total.
+const MAX_FAILED: usize = 13;
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryRow {
+    relay: String,
+    endpoint: SocketAddrV4,
+    chained: bool,
+    successes: u32,
+    failures: u32,
+    last_success: u64,
+}
 #[derive(Default)]
 pub(crate) struct InletTrials {
     failed: HashSet<(String, SocketAddrV4, bool)>,
     selected: HashMap<(String, bool), ShadowsocksInlet>,
+    primary: Option<String>,
+    history: Vec<HistoryRow>,
 }
 impl InletTrials {
     pub(crate) fn clear(&mut self) {
         self.failed.clear();
         self.selected.clear();
+        self.primary = None;
+    }
+    pub(crate) fn primary(&mut self, relay: &str) {
+        self.primary = Some(relay.into());
     }
     pub(crate) fn selected(&self, relay: &str) -> Option<ShadowsocksInlet> {
         self.selected_route(relay, false)
     }
-    fn exhausted(&self, relay: &str) -> bool {
+    fn exhausted(&self, relay: &str, chained: bool) -> bool {
+        let limit = if !chained && self.primary.as_deref() == Some(relay) {
+            3
+        } else {
+            2
+        };
         self.failed.len() >= MAX_FAILED
-            || self.failed.iter().filter(|(r, _, _)| r == relay).count() >= 4
+            || self
+                .failed
+                .iter()
+                .filter(|(r, _, c)| r == relay && *c == chained)
+                .count()
+                >= limit
     }
     pub(crate) fn choose(
         &mut self,
@@ -49,7 +76,7 @@ impl InletTrials {
         allowed: &[ShadowsocksInlet],
         chained: bool,
     ) -> Option<ShadowsocksInlet> {
-        if self.exhausted(relay) {
+        if self.exhausted(relay, chained) {
             return None;
         }
         // Cancel/stale/local-error retries retain the exact inlet, even when
@@ -63,7 +90,22 @@ impl InletTrials {
             self.selected.insert((relay.into(), chained), selected);
             return Some(selected);
         }
-        let next = allowed.iter().copied().find(|inlet| {
+        let mut ranked = allowed.to_vec();
+        ranked.sort_by_key(|inlet| {
+            let row = self.history.iter().find(|row| {
+                row.relay == relay
+                    && row.chained == chained
+                    && row.endpoint == SocketAddrV4::new(inlet.address, inlet.port)
+            });
+            std::cmp::Reverse(row.map_or((false, 0, 0), |row| {
+                (
+                    row.successes > 0 && row.failures < 2,
+                    row.successes.saturating_sub(row.failures),
+                    row.last_success,
+                )
+            }))
+        });
+        let next = ranked.into_iter().find(|inlet| {
             !self.failed.contains(&(
                 relay.to_owned(),
                 SocketAddrV4::new(inlet.address, inlet.port),
@@ -86,11 +128,82 @@ impl InletTrials {
         let Ok(endpoint) = inlet.parse::<SocketAddrV4>() else {
             return false;
         };
-        if endpoint.port() == 0 || self.exhausted(relay) {
+        if endpoint.port() == 0 || self.exhausted(relay, chained) {
             return false;
         }
         self.selected.remove(&(relay.to_owned(), chained));
-        self.failed.insert((relay.into(), endpoint, chained))
+        let inserted = self.failed.insert((relay.into(), endpoint, chained));
+        if inserted {
+            self.note(relay, endpoint, chained, false);
+        }
+        inserted
+    }
+    fn note(&mut self, relay: &str, endpoint: SocketAddrV4, chained: bool, success: bool) {
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        if !self
+            .history
+            .iter()
+            .any(|r| r.relay == relay && r.endpoint == endpoint && r.chained == chained)
+        {
+            if self.history.len() >= 128 {
+                self.history.sort_by_key(|r| r.last_success);
+                self.history.remove(0);
+            }
+            self.history.push(HistoryRow {
+                relay: relay.into(),
+                endpoint,
+                chained,
+                successes: 0,
+                failures: 0,
+                last_success: 0,
+            });
+        }
+        let row = self
+            .history
+            .iter_mut()
+            .find(|r| r.relay == relay && r.endpoint == endpoint && r.chained == chained)
+            .unwrap();
+        if success {
+            row.successes = row.successes.saturating_add(1).min(64);
+            row.failures = 0;
+            row.last_success = at;
+        } else {
+            row.failures = row.failures.saturating_add(1).min(64);
+        }
+    }
+    pub(crate) fn succeeded(&mut self, relay: &str, inlet: &str, chained: bool) {
+        if let Ok(endpoint) = inlet.parse() {
+            self.note(relay, endpoint, chained, true);
+        }
+    }
+    pub(crate) fn history_bytes(&self) -> Option<Vec<u8>> {
+        serde_json::to_vec(&self.history)
+            .ok()
+            .filter(|b| b.len() <= 32768)
+    }
+    pub(crate) fn restore_history(&mut self, bytes: &[u8]) {
+        if bytes.len() > 32768 {
+            return;
+        }
+        let Ok(rows) = serde_json::from_slice::<Vec<HistoryRow>>(bytes) else {
+            return;
+        };
+        if rows.len() <= 128
+            && rows.iter().all(|r| {
+                !r.relay.is_empty()
+                    && r.relay.len() <= 128
+                    && r.relay
+                        .bytes()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+                    && r.endpoint.port() != 0
+                    && r.successes <= 64
+                    && r.failures <= 64
+            })
+        {
+            self.history = rows;
+        }
     }
 }
 #[cfg(test)]
@@ -151,25 +264,39 @@ mod tests {
         }
     }
     #[test]
-    fn changed_metadata_cannot_expand_a_round_without_bound() {
+    fn changed_metadata_cannot_expand_a_round_or_each_city_relay() {
         let mut t = InletTrials::default();
-        for relay in ["a", "b", "c"] {
-            for n in 1..=4 {
-                assert!(t.reject(relay, &format!("192.0.2.1:{n}")));
+        t.primary("a");
+        for (r, limit) in [("a", 3), ("b", 2), ("c", 2)] {
+            for n in 1..=limit {
+                assert!(t.reject_route(r, &format!("192.0.2.1:{n}"), false));
             }
+            assert_eq!(t.choose_route(r, &[inlet(443)], false), None);
+            for n in 1..=2 {
+                assert!(t.reject_route(r, &format!("192.0.2.1:{n}"), true));
+            }
+            assert_eq!(t.choose_route(r, &[inlet(443)], true), None);
         }
+        assert_eq!(t.failed.len(), 13);
         assert_eq!(t.choose("new", &[inlet(443)]), None);
-        assert!(!t.reject("new", "192.0.2.1:13"));
         t.clear();
-        for n in 1..=4 {
-            assert!(t.reject("a", &format!("192.0.2.1:{n}")));
-        }
+        assert_eq!(t.choose("a", &[inlet(443)]), Some(inlet(443)));
+    }
+    #[test]
+    fn measured_success_history_survives_round_clear_but_never_authorizes_withdrawn_inlets() {
+        let mut t = InletTrials::default();
+        t.succeeded("r", "192.0.2.1:443", false);
+        let saved = t.history_bytes().unwrap();
+        let mut restored = InletTrials::default();
+        restored.restore_history(&saved);
         assert_eq!(
-            t.choose("a", &[inlet(443)]),
-            None,
-            "new metadata cannot add fifth choice for one relay"
+            restored.choose("r", &[inlet(20484), inlet(443)]),
+            Some(inlet(443))
         );
-        assert_eq!(t.choose("b", &[inlet(443)]), Some(inlet(443)));
+        restored.clear();
+        assert_eq!(restored.choose("r", &[inlet(20484)]), Some(inlet(20484)));
+        restored.restore_history(b"{invalid}");
+        assert_eq!(restored.history.len(), 1);
     }
     #[test]
     fn cancellation_preserves_authorized_choice_across_metadata_reorder() {
