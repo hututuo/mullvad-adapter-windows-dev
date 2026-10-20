@@ -48,3 +48,20 @@ Expose current phase, actual target relay/inlet, attempts, elapsed/start budget,
 wait and next action on the city page. Offer retry-current, a new same-city round,
 chain fallback, direct return and stop. In-flight/preempted attempts cannot be
 silently replaced. Fixed-height feedback must avoid banner-driven layout jumps.
+
+### Requirement: automatic backup qualification does not starve later regions
+
+The native SS-only qualification pass SHALL admit at most two compatible leaves
+per preference class (US, Singapore, UK, other), at most eight leaves total. Each
+admitted leaf SHALL receive its own 12-second data/start deadline and confirmed
+cleanup; a failed prefix SHALL NOT consume a shorter shared deadline that prevents
+later admitted regions from ever being checked. Cleanup uncertainty SHALL stop
+the pass. This pass SHALL NOT acquire a WG identity lease or interrupt the active
+WG tunnel. On replacing the saved chain configuration, prior full-test status
+SHALL be cleared rather than attributed to the new configuration.
+
+#### Scenario: unavailable US and Singapore leaves precede a working UK leaf
+
+- WHEN the earlier admitted US and Singapore leaves time out
+- THEN the same pass still attempts its admitted UK leaves
+- AND a new pass does not repeatedly omit those leaves due to a shared 45s cap.

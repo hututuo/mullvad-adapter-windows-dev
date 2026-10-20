@@ -989,10 +989,16 @@ pub fn serve(scope: &str) -> io::Result<()> {
                     Ok(ApiValue::Chain(chain)) => {
                         {
                             use sha2::{Digest, Sha256};
-                            dashboard.chain_fingerprint = chain
+                            let fingerprint = chain
                                 .encode()
                                 .ok()
                                 .map(|bytes| format!("{:x}", Sha256::digest(&bytes)));
+                            if fingerprint != dashboard.chain_fingerprint {
+                                dashboard.backup_verified_at = None;
+                                dashboard.backup_test_status = None;
+                                dashboard.backup_test_restored = false;
+                            }
+                            dashboard.chain_fingerprint = fingerprint;
                         }
                         dashboard.chain_revision = dashboard.chain_revision.saturating_add(1);
                         dashboard.chain_node = Some(chain.name().into());

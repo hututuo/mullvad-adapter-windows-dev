@@ -474,8 +474,9 @@ fn automatic_chain(
         return Err("clash_chain_no_compatible_nodes".into());
     }
     // Bound work without hiding compatible choices from the advanced selector.
-    // Round-robin within preference classes prevents one huge region using all
-    // slots, while still trying US before Singapore before UK.
+    // Each region gets at most two slots, while still trying US before SG/UK.
+    // Every admitted candidate receives its own bounded probe. A shorter shared
+    // deadline would starve UK on every call when the first US/SG probes time out.
     let mut candidates = Vec::new();
     for region in 0..=3 {
         candidates.extend(
@@ -527,13 +528,11 @@ fn automatic_chain(
     let network = BoundNetwork::for_auxiliary_probe(&observation, binding)
         .map_err(|_| "physical_binding_unavailable")?;
     let private = AppRoot::open("WindowsClash").map_err(|_| "clash_private_store_unavailable")?;
-    let deadline = Instant::now() + Duration::from_secs(45);
     for choice in candidates {
         if network.is_cancelled() {
             return Err("network_binding_changed".into());
         }
-        if super::STOPPING.load(std::sync::atomic::Ordering::Acquire) || Instant::now() >= deadline
-        {
+        if super::STOPPING.load(std::sync::atomic::Ordering::Acquire) {
             break;
         }
         let selected = chain_source::selected(root, dashboard.settings.front_port, &choice.name)?;
@@ -556,7 +555,7 @@ fn automatic_chain(
             &probe_runtime,
             &proxy,
             &network,
-            deadline.min(Instant::now() + Duration::from_secs(12)),
+            Instant::now() + Duration::from_secs(12),
         );
         match measured {
             Err(adapter_engine_mihomo::chain_probe::ProbeError::Cleanup) => {
