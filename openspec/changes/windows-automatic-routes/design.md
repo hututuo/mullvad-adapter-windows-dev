@@ -24,3 +24,12 @@ No external proxy-group mutation or generic SOCKS endpoint is trusted as the
 carrier's physical witness. First support is IPv4 UDP standard SS without plugins;
 provider path/transform restrictions are explicit. Import is a local snapshot,
 not an automatic refresh of the user's third-party subscription.
+
+An imported FQDN is resolved anew per worker. The bounded primary resolver lane
+first reads real A/CNAME data through the unique actual local Clash configuration's
+pipe, then falls back to a separate fixed system-resolution lane. A stuck system
+lookup cannot hold the primary lane beyond its deadline or accumulate threads. Pipe-only DNS avoids proxy credentials
+and arbitrary HTTP bootstrap destinations. Question/alias ownership, body/row
+limits and the shared public-IPv4 filter remain admission requirements. DNS failure
+is a distinct local setup error; it does not consume a Mullvad inlet. Only the
+resulting actual public IP enters the unchanged physical route/socket proof.

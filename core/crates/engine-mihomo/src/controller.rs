@@ -382,6 +382,7 @@ mod tests {
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_write_timeout(Some(Duration::from_secs(1)))
                         .unwrap();

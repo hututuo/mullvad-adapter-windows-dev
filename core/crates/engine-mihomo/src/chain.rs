@@ -71,8 +71,45 @@ impl UpstreamSs {
 pub use adapter_platform::chain_endpoint::public_ipv4;
 use adapter_platform::chain_endpoint::{public_server, MAX_NAME, MAX_PASSWORD};
 
-/// One bounded resolver lane per process. A stalled system resolver cannot
-/// accumulate detached lookup threads or hold the connection owner's loop.
+/// Isolate potentially uninterruptible system DNS from the bounded Clash lane.
+/// There are at most two fixed threads and two one-job queues in this process;
+/// a stuck system call cannot prevent a later successful Clash DNS query.
+#[cfg(any(windows, feature = "windows-api-check", test))]
+struct SystemLookup(std::sync::mpsc::SyncSender<SystemJob>);
+#[cfg(any(windows, feature = "windows-api-check", test))]
+type SystemJob = (
+    String,
+    u16,
+    std::time::Instant,
+    std::sync::mpsc::SyncSender<Option<Ipv4Addr>>,
+);
+#[cfg(any(windows, feature = "windows-api-check", test))]
+impl SystemLookup {
+    fn start(lookup: impl Fn(&str, u16) -> Option<Ipv4Addr> + Send + 'static) -> io::Result<Self> {
+        let (send, receive) = std::sync::mpsc::sync_channel::<SystemJob>(1);
+        std::thread::Builder::new()
+            .name("chain-system-resolver".into())
+            .spawn(move || {
+                while let Ok((host, port, deadline, reply)) = receive.recv() {
+                    if std::time::Instant::now() < deadline {
+                        let result = lookup(&host, port);
+                        let _ = reply.try_send(result);
+                    }
+                }
+            })?;
+        Ok(Self(send))
+    }
+    fn resolve(&self, host: String, port: u16, deadline: std::time::Instant) -> Option<Ipv4Addr> {
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        self.0.try_send((host, port, deadline, send)).ok()?;
+        receive
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .ok()
+            .flatten()
+    }
+}
+
+/// One bounded primary lane per process; the state owner never waits on DNS.
 #[cfg(any(windows, feature = "windows-api-check"))]
 pub(crate) fn resolve_ipv4(
     proxy: &UpstreamSs,
@@ -83,8 +120,9 @@ pub(crate) fn resolve_ipv4(
         sync::{mpsc, OnceLock},
         time::{Duration, Instant},
     };
-    type Job = (String, u16, mpsc::SyncSender<Option<Ipv4Addr>>);
+    type Job = (String, u16, Instant, mpsc::SyncSender<Option<Ipv4Addr>>);
     static RESOLVER: OnceLock<Option<mpsc::SyncSender<Job>>> = OnceLock::new();
+    static SYSTEM: OnceLock<Option<SystemLookup>> = OnceLock::new();
     if let Ok(ip) = proxy.server().parse::<Ipv4Addr>() {
         return if public_ipv4(ip) {
             Ok(ip)
@@ -96,17 +134,43 @@ pub(crate) fn resolve_ipv4(
         .get_or_init(|| {
             let (sender, jobs) = mpsc::sync_channel::<Job>(1);
             std::thread::Builder::new()
-                .name("chain-system-resolver".into())
+                .name("chain-dns-bootstrap".into())
                 .spawn(move || {
-                    while let Ok((host, port, reply)) = jobs.recv() {
-                        let address = (host.as_str(), port).to_socket_addrs().ok().and_then(
-                            |mut addresses| {
-                                addresses.find_map(|a| match a.ip() {
-                                    IpAddr::V4(ip) if public_ipv4(ip) => Some(ip),
-                                    _ => None,
+                    while let Ok((host, port, deadline, reply)) = jobs.recv() {
+                        if Instant::now() >= deadline {
+                            let _ = reply.try_send(None);
+                            continue;
+                        }
+                        // Clash fake-IP is not a physical endpoint. Ask its
+                        // credential-free local DNS control API for real A data
+                        // before system resolution; retain the hostname and
+                        // repeat this lookup for every new worker.
+                        let address = adapter_clash_integration::chain_dns::current_windows_ipv4(
+                            &host,
+                            deadline
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_secs(2)),
+                        )
+                        .ok()
+                        .or_else(|| {
+                            if Instant::now() >= deadline {
+                                return None;
+                            }
+                            SYSTEM
+                                .get_or_init(|| {
+                                    SystemLookup::start(|host, port| {
+                                        (host, port).to_socket_addrs().ok()?.find_map(|a| {
+                                            match a.ip() {
+                                                IpAddr::V4(ip) if public_ipv4(ip) => Some(ip),
+                                                _ => None,
+                                            }
+                                        })
+                                    })
+                                    .ok()
                                 })
-                            },
-                        );
+                                .as_ref()?
+                                .resolve(host.clone(), port, deadline)
+                        });
                         let _ = reply.try_send(address);
                     }
                 })
@@ -116,10 +180,10 @@ pub(crate) fn resolve_ipv4(
         .as_ref()
         .ok_or_else(super::invalid)?;
     let (reply, result) = mpsc::sync_channel(1);
-    sender
-        .try_send((proxy.server().into(), proxy.port(), reply))
-        .map_err(|_| super::invalid())?;
     let deadline = Instant::now() + Duration::from_secs(4);
+    sender
+        .try_send((proxy.server().into(), proxy.port(), deadline, reply))
+        .map_err(|_| super::invalid())?;
     while !network.is_cancelled() && Instant::now() < deadline {
         match result.recv_timeout(Duration::from_millis(20)) {
             Ok(Some(ip)) => return Ok(ip),
@@ -133,6 +197,52 @@ pub(crate) fn resolve_ipv4(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stalled_system_dns_has_a_deadline_and_bounded_queue() {
+        use std::{
+            sync::mpsc,
+            time::{Duration, Instant},
+        };
+        let (entered, started) = mpsc::sync_channel(1);
+        let (release, blocked) = mpsc::sync_channel(1);
+        let blocked = std::sync::Mutex::new(blocked);
+        let lane = SystemLookup::start(move |_, _| {
+            let _ = entered.try_send(());
+            blocked
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            Some(Ipv4Addr::new(203, 0, 113, 7))
+        })
+        .unwrap();
+        let start = Instant::now();
+        assert!(lane
+            .resolve(
+                "node.example".into(),
+                443,
+                start + Duration::from_millis(25)
+            )
+            .is_none());
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        // A caller can return, including when one queued job is also waiting.
+        assert!(lane
+            .resolve(
+                "node.example".into(),
+                443,
+                Instant::now() + Duration::from_millis(25)
+            )
+            .is_none());
+        assert!(lane
+            .resolve(
+                "node.example".into(),
+                443,
+                Instant::now() + Duration::from_millis(25)
+            )
+            .is_none());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        release.send(()).unwrap();
+    }
     #[test]
     fn native_secret_roundtrip_and_validation() {
         let value = br#"{"name":"independent","server":"198.51.100.9","port":443,"cipher":"aes-128-gcm","password":"synthetic"}"#;

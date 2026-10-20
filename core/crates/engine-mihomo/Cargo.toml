@@ -14,6 +14,7 @@ adapter-domain.workspace = true
 adapter-probe = { path = "../probe" }
 getrandom = "=0.4.3"
 adapter-platform.workspace = true
+adapter-clash-integration = { path = "../clash-integration" }
 ureq = { version = "=3.4.2", default-features = false, features = ["json", "rustls"] }
 serde.workspace = true
 serde_json.workspace = true

@@ -220,6 +220,7 @@ impl Connections {
                 | "worker_runtime_unavailable"
                 | "physical_binding_unavailable"
                 | "worker_route_unavailable"
+                | "worker_chain_resolution_failed"
                 | "worker_start_failed"
                 | "worker_controller_unavailable"
                 | "worker_start_deadline"

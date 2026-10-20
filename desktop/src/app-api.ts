@@ -183,6 +183,7 @@ const errors: Record<string, string> = {
   original_inlet_withdrawn: "原入口已从官方目录撤下，正在当前城市内恢复。",
   worker_configuration_rejected: "连接配置未通过校验；请导出诊断文件。",
   worker_route_unavailable: "当前物理出口暂不可用，等待网络稳定。",
+  worker_chain_resolution_failed: "备用节点没有解析到真实公网 IPv4；已拒绝假 IP，将稍后重试。",
   peer_reservation_unavailable: "本机已有通道正在使用这个设备身份，请先断开。",
   worker_start_failed: "隧道进程未能启动，请查看诊断。",
   worker_controller_unavailable: "无法确认隧道进程已就绪，入口保持阻止。",

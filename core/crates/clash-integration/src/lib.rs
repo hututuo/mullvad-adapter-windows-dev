@@ -11,6 +11,7 @@ use std::{
     time::Duration,
 };
 
+pub mod chain_dns;
 pub mod portable;
 pub mod profile_service;
 
@@ -275,13 +276,19 @@ pub struct LocalController {
 pub type HttpController = LocalController;
 impl LocalController {
     pub fn from_config(v: &Value, front: u16) -> Result<Self> {
+        Self::with_timeout(v, front, Duration::from_secs(5))
+    }
+    fn with_timeout(v: &Value, front: u16, wait: Duration) -> Result<Self> {
+        if wait.is_zero() {
+            return Err(err("controller_unavailable"));
+        }
         let endpoint = control_endpoint(v, front, cfg!(windows))?;
         let config = ureq::Agent::config_builder()
             .proxy(None)
             .max_redirects(0)
             .max_idle_connections(0)
-            .timeout_global(Some(Duration::from_secs(5)))
-            .timeout_connect(Some(Duration::from_secs(1)))
+            .timeout_global(Some(wait.min(Duration::from_secs(5))))
+            .timeout_connect(Some(wait.min(Duration::from_secs(1))))
             .http_status_as_error(false)
             .build();
         if let ControlEndpoint::Pipe(name) = &endpoint {
@@ -336,6 +343,25 @@ impl LocalController {
     pub fn transport_kind(&self) -> &'static str {
         self.transport
     }
+    fn read_json(&self, path: &str, limit: u64) -> Result<Value> {
+        let mut request = self.agent.get(format!("{}{path}", self.base));
+        if let Some(auth) = &self.authorization {
+            request = request.header("Authorization", auth.clone());
+        }
+        let mut r = request.call().map_err(|_| err("controller_unavailable"))?;
+        if r.status().as_u16() != 200 {
+            return Err(err(if matches!(r.status().as_u16(), 401 | 403) {
+                "controller_auth"
+            } else {
+                "controller_response"
+            }));
+        }
+        r.body_mut()
+            .with_config()
+            .limit(limit)
+            .read_json()
+            .map_err(|_| err("controller_response"))
+    }
 }
 impl Controller for LocalController {
     fn validate(&self, path: &Path) -> Result<()> {
@@ -381,23 +407,7 @@ impl Controller for LocalController {
         }
     }
     fn get(&self, path: &str) -> Result<Value> {
-        let mut request = self.agent.get(format!("{}{path}", self.base));
-        if let Some(auth) = &self.authorization {
-            request = request.header("Authorization", auth.clone());
-        }
-        let mut r = request.call().map_err(|_| err("controller_unavailable"))?;
-        if r.status().as_u16() != 200 {
-            return Err(err(if matches!(r.status().as_u16(), 401 | 403) {
-                "controller_auth"
-            } else {
-                "controller_response"
-            }));
-        }
-        r.body_mut()
-            .with_config()
-            .limit(MAX)
-            .read_json()
-            .map_err(|_| err("controller_response"))
+        self.read_json(path, MAX)
     }
     fn put(&self, path: &str, body: &Value) -> Result<()> {
         let mut request = self.agent.put(format!("{}{path}", self.base));

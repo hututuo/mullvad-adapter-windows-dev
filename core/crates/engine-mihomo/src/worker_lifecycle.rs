@@ -26,6 +26,7 @@ pub struct WorkerRequest<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerStartError {
     Cancelled,
+    ChainResolution,
     Route,
     Configuration,
     Peer,
@@ -40,6 +41,7 @@ impl WorkerStartError {
     pub fn code(self) -> &'static str {
         match self {
             Self::Cancelled => "worker_start_cancelled",
+            Self::ChainResolution => "worker_chain_resolution_failed",
             Self::Route => "worker_route_unavailable",
             Self::Configuration => "worker_configuration_rejected",
             Self::Peer => "peer_reservation_unavailable",
@@ -128,7 +130,7 @@ impl Worker {
         let chain_endpoint = chain
             .map(|proxy| crate::chain::resolve_ipv4(proxy, &network))
             .transpose()
-            .map_err(|_| WorkerStartError::Route)?;
+            .map_err(|_| WorkerStartError::ChainResolution)?;
         let destination = if let Some(ip) = chain_endpoint {
             IpAddr::V4(ip)
         } else {

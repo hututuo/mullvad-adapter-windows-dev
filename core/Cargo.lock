@@ -63,6 +63,7 @@ dependencies = [
 name = "adapter-engine-mihomo"
 version = "0.1.0"
 dependencies = [
+ "adapter-clash-integration",
  "adapter-control",
  "adapter-domain",
  "adapter-platform",

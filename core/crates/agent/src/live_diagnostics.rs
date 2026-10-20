@@ -105,6 +105,7 @@ fn safe_event(value: &LogEvent) -> bool {
                 | "candidate_start_failed"
                 | "worker_start_cancelled"
                 | "worker_route_unavailable"
+                | "worker_chain_resolution_failed"
                 | "worker_configuration_rejected"
                 | "peer_reservation_unavailable"
                 | "worker_start_failed"

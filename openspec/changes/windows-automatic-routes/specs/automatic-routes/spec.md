@@ -31,6 +31,11 @@
   bounce a healthy chain back to direct or start a second live WG peer.
 - WHEN chain mode is forced without valid local configuration or public physical
   destination proof, THEN fail explicitly. Final OUT contains only Mullvad.
+- WHEN system DNS returns Clash fake-IP for an imported hostname, THEN use the
+  unique actual local Clash pipe's credential-free DNS read for linked real A
+  records within the existing resolver deadline, or fail explicitly. Never admit
+  fake/private addresses, pin a resolved IP in saved credentials, borrow a generic
+  proxy as physical proof, or refresh the target of an established worker.
 
 ## AR4: Honest daily traffic boundary
 - WHEN the adapter opens, THEN do not silently alter system proxy/TUN or Clash
