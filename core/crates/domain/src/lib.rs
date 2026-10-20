@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 pub const SETTLE_MS: u64 = 2_000;
-pub const RECOVERY_BUDGET_MS: u64 = 180_000;
+pub const RECOVERY_BUDGET_MS: u64 = 300_000;
 pub const PROBE_TTL_MS: u64 = 5_000;
 pub const LOCAL_RETRY_MS: u64 = 250;
 /// Prototype hard I/O-attempt ceiling, not a measured recovery-performance promise.

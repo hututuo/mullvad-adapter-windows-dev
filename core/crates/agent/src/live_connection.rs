@@ -27,6 +27,9 @@ struct RouteTrial {
     kind: TrialKind,
     previous: Option<Path>,
     restoring: bool,
+    tested: bool,
+    verified_backup: Option<Path>,
+    rescue: bool,
 }
 struct Pending {
     ticket: OperationTicket,
@@ -305,7 +308,15 @@ impl Connections {
                 },
                 previous,
                 restoring: false,
+                tested: false,
+                verified_backup: None,
+                rescue: false,
             });
+            if action == A::TestBackup {
+                dashboard.backup_test_id = dashboard.backup_test_id.saturating_add(1);
+                dashboard.backup_test_status = Some("testing".into());
+                dashboard.backup_test_restored = false;
+            }
         }
         match self.connect(
             owner,
@@ -320,6 +331,9 @@ impl Connections {
                 self.route_trial = None;
                 self.forced_route = None;
                 self.restore_target = None;
+                if action == A::TestBackup {
+                    dashboard.backup_test_status = Some("failed".into());
+                }
                 Err(code)
             }
         }
@@ -355,11 +369,27 @@ impl Connections {
                 self.queue_restore(owner, previous);
                 return true;
             }
+        } else if trial.kind == TrialKind::TestBackup && trial.tested && !trial.rescue {
+            // If the old direct route has stopped working during the test,
+            // retain the just-verified chain as a second serial rollback target.
+            trial.rescue = true;
+            if let Some(backup) = trial.verified_backup.clone() {
+                let _ = self
+                    .logs
+                    .event("connection", "restore_previous_failed_use_verified_backup");
+                self.queue_restore(owner, backup);
+                return true;
+            }
         }
+        let is_test = trial.kind == TrialKind::TestBackup;
         self.route_trial = None;
         self.forced_route = None;
         self.restore_target = None;
         self.manual_candidates = None;
+        if is_test {
+            dashboard.backup_test_status = Some("failed".into());
+            dashboard.backup_test_restored = false;
+        }
         dashboard.last_error = Some("route_trial_failed".into());
         self.schedule_retry(dashboard);
         false
@@ -377,11 +407,22 @@ impl Connections {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0, |d| d.as_secs()),
                 );
+                trial.tested = true;
+                trial.verified_backup = Some(path.clone());
                 trial.restoring = true;
                 if let Some(previous) = trial.previous.clone() {
                     self.queue_restore(owner, previous);
                     return;
                 }
+            }
+            if trial.kind == TrialKind::TestBackup {
+                dashboard.backup_test_status =
+                    Some(if trial.tested { "passed" } else { "failed" }.into());
+                dashboard.backup_test_restored = trial.previous.as_ref().is_some_and(|previous| {
+                    previous.relay == path.relay
+                        && previous.inlet == path.inlet
+                        && previous.transport == path.transport
+                });
             }
             self.route_trial = None;
             self.forced_route = None;
@@ -527,6 +568,7 @@ impl Connections {
         self.pending.is_some()
     }
     pub(crate) fn recheck_soon(&mut self) {
+        self.active_failures.clear();
         self.next_health = Instant::now();
     }
     fn finish_recovery(
@@ -536,6 +578,9 @@ impl Connections {
         code: &'static str,
     ) {
         debug_assert!(self.pending.is_none());
+        if self.route_trial.is_some() && self.trial_failed(owner, dashboard) {
+            return;
+        }
         self.inlet_trials.clear();
         self.chain_relays.clear();
         self.recovering = None;
@@ -692,12 +737,16 @@ impl Connections {
             let mut relays = vec![picked.hostname().to_owned()];
             if relay.is_none() {
                 for candidate in dashboard.city_candidates.iter().filter(|c| c.city == city) {
-                    if relays.len() < 3 && !relays.contains(&candidate.hostname) {
+                    if relays.len() < crate::recovery_plan::MAX_CITY_RELAYS
+                        && !relays.contains(&candidate.hostname)
+                    {
                         relays.push(candidate.hostname.clone());
                     }
                 }
                 for candidate in catalogue.active_in_city(&city) {
-                    if relays.len() < 3 && !relays.iter().any(|r| r == candidate.hostname()) {
+                    if relays.len() < crate::recovery_plan::MAX_CITY_RELAYS
+                        && !relays.iter().any(|r| r == candidate.hostname())
+                    {
                         relays.push(candidate.hostname().into());
                     }
                 }
@@ -989,6 +1038,9 @@ impl Connections {
         dashboard: &mut Dashboard,
     ) -> Result<(), &'static str> {
         self.retry_round.cancel();
+        if dashboard.backup_test_status.as_deref() == Some("testing") {
+            dashboard.backup_test_status = Some("cancelled".into());
+        }
         self.clear_plan();
         dashboard.retry_in_seconds = None;
         if self.frozen {
@@ -1142,14 +1194,14 @@ impl Connections {
             }
         }
         for relay in catalogue.active_in_city(&city) {
-            if relays.len() >= 3 {
+            if relays.len() >= crate::recovery_plan::MAX_CITY_RELAYS {
                 break;
             }
             if !relays.iter().any(|r| r == relay.hostname()) {
                 relays.push_back(relay.hostname().into());
             }
         }
-        relays.truncate(3);
+        relays.truncate(crate::recovery_plan::MAX_CITY_RELAYS);
         let now = owner.now();
         if owner.state_mut().request_original_rebuild(now).is_err() {
             return;
@@ -1205,16 +1257,33 @@ impl Connections {
                     Instant::now() + Duration::from_millis(adapter_domain::RECOVERY_BUDGET_MS);
             }
             if dashboard.active_relay.is_some() {
+                // A retained worker gets a fresh Verify before any old queued
+                // rebuild. The previous network window cannot force Fallback
+                // while Domain is waiting to verify the original path.
+                if self.route_trial.is_none() {
+                    self.recovering = None;
+                    self.manual_candidates = None;
+                    self.deferred = None;
+                    self.plan.clear();
+                }
                 self.next_health = Instant::now();
             } else if self.recovering.is_some() {
                 let now = owner.now();
                 let _ = owner.state_mut().request_original_rebuild(now);
-                self.deferred = self.last_relay.clone();
-                self.next_attempt = Instant::now();
-                if let Some((deadline, _)) = &mut self.recovering {
-                    *deadline =
-                        Instant::now() + Duration::from_millis(adapter_domain::RECOVERY_BUDGET_MS);
+                let relays = self.plan.relays.clone();
+                self.plan.start(
+                    relays.clone(),
+                    dashboard.settings.tunnel_route == adapter_protocol::app::TunnelRoute::Chain,
+                );
+                if let Some(primary) = self.plan.original_relay() {
+                    self.inlet_trials.primary(primary);
                 }
+                self.deferred = None;
+                self.next_attempt = Instant::now();
+                self.recovering = Some((
+                    Instant::now() + Duration::from_millis(adapter_domain::RECOVERY_BUDGET_MS),
+                    relays.into(),
+                ));
             } else if self.manual_candidates.is_none() {
                 // Only a confirmed offline->stable-online Effect::Verify gets
                 // here, never a binding hint. A prior exhausted round must not
@@ -1576,6 +1645,33 @@ impl Connections {
                         self.record(dashboard, "network_binding_changed", "failed", None);
                         continue;
                     }
+                    if !current {
+                        let p = self.pending.take().unwrap();
+                        owner.finish_operation(&p.ticket);
+                        if let Some(attempt) = &p.attempt {
+                            if owner.state().current(&attempt.owner) {
+                                let now = owner.now();
+                                owner.state_mut().retry_after_local_cleanup(attempt, now);
+                                if automatic {
+                                    self.defer_stale_candidate(attempt.path.relay.clone());
+                                } else {
+                                    self.retry_manual_candidate(attempt.path.relay.clone(), true);
+                                }
+                            }
+                        }
+                        dashboard.operation = None;
+                        dashboard.front_selected = "reject".into();
+                        dashboard.readiness = None;
+                        dashboard.status = if owner.state().paused {
+                            "waiting_network"
+                        } else {
+                            "disconnected"
+                        }
+                        .into();
+                        dashboard.last_error = Some("candidate_evidence_stale".into());
+                        self.record(dashboard, "candidate_evidence_stale", "failed", None);
+                        continue;
+                    }
                     if negative.is_none() {
                         let p = self.pending.take().unwrap();
                         owner.finish_operation(&p.ticket);
@@ -1776,7 +1872,7 @@ impl Connections {
                     let attempt_current = p
                         .attempt
                         .as_ref()
-                        .is_some_and(|a| owner.state().candidate_is_current(a, now));
+                        .is_some_and(|a| owner.state().current(&a.owner));
                     if binding_changed {
                         if let Some(attempt) = &p.attempt {
                             if automatic {
@@ -1829,6 +1925,7 @@ impl Connections {
                             } else if !automatic
                                 && p.rejected.is_some()
                                 && attempt_current
+                                && !binding_changed
                                 && !self.disconnecting
                             {
                                 self.retry_manual_candidate(attempt.path.relay.clone(), true);

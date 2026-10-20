@@ -8,7 +8,7 @@ the operation registry additionally fences physical binding changes during drain
 Domain explicitly continues original rebuilds without manual-preempt budget reset.
 
 `InletTrials` caps endpoint failures independently by route (primary direct 3,
-other direct 2, chain 2; 13 distinct total). Bounded passive success summaries are
+other direct 2, chain 2; 21 distinct total). Bounded passive success summaries are
 DPAPI-protected and saved on a separate one-job worker; they rank only currently
 authorized choices. No full WG standby measurement runs in the background.
 

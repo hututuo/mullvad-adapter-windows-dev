@@ -9,3 +9,13 @@ for(const stage of ['testing_backup','restoring_previous','returning_direct'])as
 assert.equal(recoveryView({...d,operation:'automatic_recovery'},true).canStop,true);
 assert.equal(recoveryView({...d,status:'connected',active_relay:'r',connection:{chained:true},recovery:{...d.recovery,stage:'chain_connected'}},false).chained,true);
 console.log('recovery view: target, offline, trial, busy and stop guards PASS');
+
+const {backupResult}=await import('../desktop/src/backup-result.ts');
+const t={...d,backup_test_id:2,backup_test_status:'testing',backup_test_restored:false,backup_verified_at:42};
+assert.equal(backupResult(t,2),null);
+assert.equal(backupResult({...t,backup_test_status:'passed'},1),null);
+assert.match(backupResult({...t,backup_test_status:'passed'},2),/当前已使用链式/);
+assert.match(backupResult({...t,backup_test_status:'passed',backup_test_restored:true},2),/已恢复测试前/);
+assert.match(backupResult({...t,backup_test_status:'cancelled'},2),/已停止/);
+assert.match(backupResult({...t,backup_test_status:'failed',backup_test_restored:true},2),/未通过，已恢复/);
+console.log('backup result: exact test id, in-progress, restored, rescue and cancellation PASS');

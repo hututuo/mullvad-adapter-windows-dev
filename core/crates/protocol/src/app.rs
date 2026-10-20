@@ -411,11 +411,21 @@ pub struct Dashboard {
     #[serde(default)]
     pub chain_node: Option<String>,
     #[serde(default)]
+    pub chain_fingerprint: Option<String>,
+    #[serde(default)]
+    pub chain_revision: u64,
+    #[serde(default)]
     pub retry_in_seconds: Option<u64>,
     #[serde(default)]
     pub recovery: Option<RecoveryProgress>,
     #[serde(default)]
     pub backup_verified_at: Option<u64>,
+    #[serde(default)]
+    pub backup_test_id: u64,
+    #[serde(default)]
+    pub backup_test_status: Option<String>,
+    #[serde(default)]
+    pub backup_test_restored: bool,
     pub account: Account,
     pub operation: Option<String>,
     pub last_error: Option<String>,

@@ -1,5 +1,6 @@
 //! Bounded ordering and debounce, independent of process I/O and WG ownership.
 use std::time::{Duration, Instant};
+pub(crate) const MAX_CITY_RELAYS: usize = 5;
 
 #[derive(Default)]
 pub(crate) struct ActiveFailures {
@@ -40,7 +41,7 @@ impl RoundPlan {
     }
     pub(crate) fn start(&mut self, relays: Vec<String>, chain_only: bool) {
         self.clear();
-        self.relays = relays.into_iter().take(3).collect();
+        self.relays = relays.into_iter().take(MAX_CITY_RELAYS).collect();
         self.started = Some(Instant::now());
         self.chain_phase = chain_only;
         self.chain_entered = chain_only;
@@ -122,9 +123,19 @@ mod tests {
     #[test]
     fn short_retry_never_moves_endpoint_or_repeats_forever() {
         let mut p = RoundPlan::default();
-        p.start(vec!["a".into(), "b".into(), "c".into(), "d".into()], false);
+        p.start(
+            vec![
+                "a".into(),
+                "b".into(),
+                "c".into(),
+                "d".into(),
+                "e".into(),
+                "f".into(),
+            ],
+            false,
+        );
         p.attempted("a", "192.0.2.1:443", false);
-        assert_eq!(p.relays.len(), 3);
+        assert_eq!(p.relays.len(), 5);
         assert_eq!(p.short_retry("b", "192.0.2.1:443", false), None);
         assert_eq!(p.short_retry("a", "192.0.2.1:443", true), None);
         assert_eq!(

@@ -85,7 +85,7 @@ fn update_candidates(dashboard: &mut Dashboard, pings: &BTreeMap<String, PingObs
         });
         dashboard
             .city_candidates
-            .extend(candidates.into_iter().take(2));
+            .extend(candidates.into_iter().take(4));
     }
 }
 
@@ -635,9 +635,14 @@ pub fn serve(scope: &str) -> io::Result<()> {
         metadata_refreshing: false,
         metadata_error: None,
         chain_node: None,
+        chain_fingerprint: None,
+        chain_revision: 0,
         retry_in_seconds: None,
         recovery: None,
         backup_verified_at: None,
+        backup_test_id: 0,
+        backup_test_status: None,
+        backup_test_restored: false,
         account: Account::default(),
         operation: None,
         last_error: None,
@@ -679,6 +684,13 @@ pub fn serve(scope: &str) -> io::Result<()> {
     match store.load(RecordKind::ChainProxy) {
         Ok(bytes) => match adapter_engine_mihomo::chain::UpstreamSs::decode(bytes.expose()) {
             Ok(chain) => {
+                {
+                    use sha2::{Digest, Sha256};
+                    dashboard.chain_fingerprint = chain
+                        .encode()
+                        .ok()
+                        .map(|bytes| format!("{:x}", Sha256::digest(&bytes)));
+                }
                 dashboard.chain_node = Some(chain.name().into());
                 connections.set_chain(Some(std::sync::Arc::new(chain)));
             }
@@ -975,6 +987,14 @@ pub fn serve(scope: &str) -> io::Result<()> {
                 });
                 match done.result {
                     Ok(ApiValue::Chain(chain)) => {
+                        {
+                            use sha2::{Digest, Sha256};
+                            dashboard.chain_fingerprint = chain
+                                .encode()
+                                .ok()
+                                .map(|bytes| format!("{:x}", Sha256::digest(&bytes)));
+                        }
+                        dashboard.chain_revision = dashboard.chain_revision.saturating_add(1);
                         dashboard.chain_node = Some(chain.name().into());
                         connections.set_chain(Some(chain));
                         dashboard.last_error = None;
@@ -1326,6 +1346,9 @@ pub fn serve(scope: &str) -> io::Result<()> {
                         }
                         command @ (AppCommand::Connect | AppCommand::ConnectRelay { .. }) => {
                             startup_pending = false;
+                            if dashboard.backup_test_status.as_deref() == Some("testing") {
+                                dashboard.backup_test_status = Some("cancelled".into());
+                            }
                             let relay = match &command {
                                 AppCommand::ConnectRelay { hostname } => Some(hostname.as_str()),
                                 _ => None,

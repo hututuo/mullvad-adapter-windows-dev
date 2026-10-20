@@ -6,8 +6,8 @@ use std::{
 };
 
 // Original: exact inlet + two alternatives. Other city relays: two each.
-// Chain is a separate final phase, with two inlets per relay: 7 + 6 total.
-const MAX_FAILED: usize = 13;
+// Chain is a separate final phase, with two inlets per relay: 11 + 10 total.
+const MAX_FAILED: usize = 21;
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HistoryRow {
@@ -267,7 +267,7 @@ mod tests {
     fn changed_metadata_cannot_expand_a_round_or_each_city_relay() {
         let mut t = InletTrials::default();
         t.primary("a");
-        for (r, limit) in [("a", 3), ("b", 2), ("c", 2)] {
+        for (r, limit) in [("a", 3), ("b", 2), ("c", 2), ("d", 2), ("e", 2)] {
             for n in 1..=limit {
                 assert!(t.reject_route(r, &format!("192.0.2.1:{n}"), false));
             }
@@ -277,7 +277,7 @@ mod tests {
             }
             assert_eq!(t.choose_route(r, &[inlet(443)], true), None);
         }
-        assert_eq!(t.failed.len(), 13);
+        assert_eq!(t.failed.len(), 21);
         assert_eq!(t.choose("new", &[inlet(443)]), None);
         t.clear();
         assert_eq!(t.choose("a", &[inlet(443)]), Some(inlet(443)));

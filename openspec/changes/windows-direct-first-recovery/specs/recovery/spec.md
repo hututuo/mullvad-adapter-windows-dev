@@ -16,9 +16,9 @@ three serial starts of that exact inlet (first immediately, then at least one an
 five seconds after the preceding failed attempt has cleaned up), followed by at
 most two other authorized inlets on that relay. Use measured success history for
 ranking; history is never current readiness or metadata authorization.
-THEN try at most two other relays in the selected city, at most two direct inlets
+THEN try at most four other relays in the selected city, at most two direct inlets
 each. Direct and chain use one immutable, bounded relay set for that round.
-No new attempt starts beyond the 180-second round budget. An in-flight attempt
+No new attempt starts beyond the 300-second round budget. An in-flight attempt
 has its existing 90-second hard ceiling plus confirmed-cleanup time. These are
 ceilings, not a promise to reconnect within 180 seconds. Local/stale retries and
 metadata refresh cannot renew the round or manufacture endpoint failures.

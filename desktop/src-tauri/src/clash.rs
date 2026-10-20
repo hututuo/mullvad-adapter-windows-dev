@@ -14,6 +14,7 @@ pub struct Request {
     chain_fingerprint: Option<String>,
 }
 static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static CHAIN_PROBE_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(windows)]
 static PROFILE_SERVICE: std::sync::Mutex<
     Option<adapter_clash_integration::profile_service::Service>,
@@ -88,7 +89,14 @@ fn execute(_input: Request) -> Result<Value, String> {
 #[cfg(windows)]
 fn execute(input: Request) -> Result<Value, String> {
     use std::path::PathBuf;
-    let _gate = GATE.try_lock().map_err(|_| "clash_busy")?;
+    // Read-only SS qualification must not occupy profile/import transactions.
+    // Re-read source fingerprints and backend intent before applying its result.
+    let _gate = if input.kind == "chain_auto" {
+        CHAIN_PROBE_GATE.try_lock()
+    } else {
+        GATE.try_lock()
+    }
+    .map_err(|_| "clash_busy")?;
     if super::STOPPING.load(std::sync::atomic::Ordering::Acquire) {
         return Err("backend_stopping".into());
     }
@@ -424,7 +432,34 @@ fn automatic_chain(
     use std::time::{Duration, Instant};
     if dashboard.connection.as_ref().is_some_and(|c| c.chained) && dashboard.active_relay.is_some()
     {
-        return Ok(json!({"selected":dashboard.chain_node,"kept":true}));
+        let name = dashboard
+            .chain_node
+            .as_deref()
+            .ok_or("chain_not_configured")?;
+        if selected_name
+            .or(dashboard.settings.chain_selection.as_deref())
+            .is_some_and(|wanted| wanted != name)
+        {
+            return Err("disconnect_before_chain_change".into());
+        }
+        let selected = chain_source::selected(root, dashboard.settings.front_port, name)?;
+        if fingerprint.is_some_and(|fp| fp != selected.fingerprint) {
+            return Err("clash_config_changed".into());
+        }
+        let bytes=adapter_protocol::app::SecretText::new(serde_json::to_string(&json!({"name":selected.name,"server":selected.server,"port":selected.port,"cipher":selected.cipher,"password":selected.password})).map_err(|_|"clash_chain_configuration_invalid")?).into_value();
+        let proxy = adapter_engine_mihomo::chain::UpstreamSs::decode(bytes.as_bytes())
+            .map_err(|_| "clash_chain_configuration_invalid")?;
+        use sha2::{Digest, Sha256};
+        let encoded = proxy
+            .encode()
+            .map_err(|_| "clash_chain_configuration_invalid")?;
+        let expected = format!("{:x}", Sha256::digest(&encoded));
+        if dashboard.chain_fingerprint.as_deref() != Some(expected.as_str()) {
+            return Err("disconnect_before_chain_change".into());
+        }
+        return Ok(
+            json!({"selected":name,"kept":true,"fingerprint":expected,"revision":dashboard.chain_revision}),
+        );
     }
     if dashboard.operation.is_some() {
         return Err("operation_busy".into());
@@ -549,15 +584,47 @@ fn automatic_chain(
         if latest.operation.is_some() {
             return Err("operation_busy".into());
         }
-        return match super::transact(adapter_protocol::app::AppCommand::ConfigureChain {
+        let encoded = proxy
+            .encode()
+            .map_err(|_| "clash_chain_configuration_invalid")?;
+        let expected = format!("{:x}", Sha256::digest(&encoded));
+        match super::transact(adapter_protocol::app::AppCommand::ConfigureChain {
             proxy: adapter_protocol::app::SecretText::from_protected(bytes),
         })? {
-            adapter_protocol::app::AppReply::Accepted { .. } => {
-                Ok(json!({"accepted":true,"selected":choice.name,"udp_verified":true}))
+            adapter_protocol::app::AppReply::Accepted { .. } => {}
+            adapter_protocol::app::AppReply::Error { code } => return Err(code),
+            _ => return Err("invalid_response".into()),
+        }
+        let confirm_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < confirm_deadline
+            && !super::STOPPING.load(std::sync::atomic::Ordering::Acquire)
+        {
+            match super::transact(adapter_protocol::app::AppCommand::Dashboard) {
+                Ok(adapter_protocol::app::AppReply::Dashboard { dashboard: done }) => {
+                    if done.boot_id != dashboard.boot_id {
+                        return Err("boot_changed_reconcile".into());
+                    }
+                    if done.chain_revision > latest.chain_revision
+                        && done.chain_fingerprint.as_deref() == Some(expected.as_str())
+                    {
+                        return Ok(
+                            json!({"accepted":true,"selected":choice.name,"udp_verified":true,"fingerprint":expected,"revision":done.chain_revision}),
+                        );
+                    }
+                    if matches!(
+                        done.last_error.as_deref(),
+                        Some("chain_write_failed" | "chain_configuration_invalid")
+                    ) {
+                        return Err("chain_write_failed".into());
+                    }
+                }
+                Err(code) if code == "operation_busy" => {}
+                Err(code) => return Err(code),
+                _ => return Err("invalid_response".into()),
             }
-            adapter_protocol::app::AppReply::Error { code } => Err(code),
-            _ => Err("invalid_response".into()),
-        };
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        return Err("chain_write_unconfirmed".into());
     }
     Err("clash_chain_no_working_route".into())
 }

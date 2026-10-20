@@ -190,7 +190,22 @@ function App() {
     return ()=>{window.removeEventListener("blur",hide);document.removeEventListener("visibilitychange",visibility);if(timeout)clearTimeout(timeout);};
   },[privateKey]);
   async function act(command: Command) {
-    if(command.kind==="disconnect"||command.kind==="cancel_operation")backup.cancel();
+    if(command.kind==="disconnect"||command.kind==="cancel_operation") {
+      backup.cancel();
+      actionRequested.current=null;
+      const until=performance.now()+8_000;
+      do {
+        try {
+          const reply=await request(command);
+          if(reply.kind==="error" && reply.code==="operation_busy") {await new Promise(resolve=>window.setTimeout(resolve,80));continue;}
+          accept(reply);setMessage(reply.kind==="error"?errorText(reply.code):"停止请求已受理，正在确认后台清理。");setError(reply.kind==="error");return;
+        } catch(e) {
+          if(typeof e==="string" && e==="operation_busy") {await new Promise(resolve=>window.setTimeout(resolve,80));continue;}
+          setMessage(bridgeError(e));setError(true);return;
+        }
+      }while(performance.now()<until);
+      setMessage("停止请求暂未送达，请再点击一次；当前状态仍会继续更新。");setError(true);return;
+    }
     if (stopping.current) return;
     if (flight.current) {
       setMessage("正在同步状态，请稍后再试。");
@@ -465,7 +480,7 @@ function App() {
                 通过不表示隧道可用，切换前完整验证；不常驻第二条同身份通道。
               </p>
               <div className="backup-grid" aria-label="同城备选">
-                {[0, 1].map((index) => {
+                {[0, 1, 2, 3].map((index) => {
                   const candidate = data?.city_candidates.filter(
                     (c) => c.city === chosen?.id,
                   )[index];
@@ -992,8 +1007,8 @@ function App() {
             {data && <ChainRoute data={data} disabled={busy} backup={backup} onSettings={async next => {
               const latest = current.current;
               if (!latest) return;
-              setSettings(draft => draft ? {...draft, tunnel_route:next.tunnel_route} : draft);
-              await act({kind:"save_settings", settings:{...latest.settings, tunnel_route:next.tunnel_route}});
+              setSettings(draft => draft ? {...draft, tunnel_route:next.tunnel_route,chain_selection:next.chain_selection} : draft);
+              await act({kind:"save_settings", settings:{...latest.settings, tunnel_route:next.tunnel_route,chain_selection:next.chain_selection}});
             }}/>}
           </>
         )}

@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { errorText, request, timeText, type Dashboard, type Settings } from "./app-api";
+import {backupResult} from "./backup-result";
 type Choice={name:string;fingerprint:string};
-type AutoResult={selected?:string;accepted?:boolean;kept?:boolean};
+type AutoResult={selected?:string;accepted?:boolean;kept?:boolean;fingerprint?:string;revision?:number};
 const pause=(ms:number)=>new Promise<void>(resolve=>window.setTimeout(resolve,ms));
 export function useChainBackup(data:Dashboard|null) {
   const [working,setWorking]=useState(false),[notice,setNotice]=useState(""),[choices,setChoices]=useState<Choice[]>([]),[selected,setSelected]=useState("");
@@ -33,13 +34,14 @@ export function useChainBackup(data:Dashboard|null) {
   async function test() {
     if(flight.current||!current.current)return;
     flight.current=true;setWorking(true);setNotice("正在自动选择备用并验证实际流量…");
-    const token=generation.current,boot=current.current.boot_id,previous=current.current.backup_verified_at;
+    const token=generation.current,boot=current.current.boot_id;
+    let baseline=current.current.backup_test_id??0;
     try {
       const result=await prepare(!!selected),saveDeadline=performance.now()+12_000;
       let saved=false;
       while(alive.current&&performance.now()<saveDeadline){
         const r=await request({kind:"dashboard"});
-        if(r.kind==="dashboard"&&r.dashboard.boot_id===boot&&r.dashboard.chain_node===result.selected&&!r.dashboard.operation){saved=true;break;}
+        if(r.kind==="dashboard"&&r.dashboard.boot_id===boot&&r.dashboard.chain_node===result.selected&&r.dashboard.chain_fingerprint===result.fingerprint&&(r.dashboard.chain_revision??0)===(result.revision??0)&&!r.dashboard.operation){baseline=r.dashboard.backup_test_id??0;saved=true;break;}
         if(r.kind==="error"&&r.code!=="operation_busy")throw r.code;
         await pause(300);
       }
@@ -55,10 +57,8 @@ export function useChainBackup(data:Dashboard|null) {
         if(!d||d.boot_id!==boot)throw "boot_changed_reconcile";
         const stage=d.recovery?.stage;
         started ||= stage==="testing_backup"||stage==="restoring_previous";
-        const verified=d.backup_verified_at!=null&&d.backup_verified_at!==previous;
-        if(d.status==="connected"&&!d.operation&&stage!=="testing_backup"&&stage!=="restoring_previous"&&(verified||started)){
-          setNotice(verified?"备用路线实际流量已通过，已恢复日常连接。":"备用路线未通过，已恢复测试前的路线；原配置仍保留。");return;
-        }
+        const resultText=backupResult(d,baseline+1);
+        if(resultText){setNotice(resultText);return;}
         if(started&&!d.operation&&!["testing_backup","restoring_previous"].includes(stage??"")&&d.status==="retry_wait")throw "route_trial_failed";
       }
       if(alive.current)setNotice("测试仍在后台处理，请查看上方连接与恢复进度。");
@@ -67,7 +67,7 @@ export function useChainBackup(data:Dashboard|null) {
   }
   // Independent SS-only maintenance does not open another WG identity.
   useEffect(()=>{
-    if(!data||!("__TAURI_INTERNALS__" in window)||data.settings.tunnel_route==="direct"||data.physical_attachment!=="available"||data.operation||data.status!=="connected"||data.connection?.chained||flight.current||performance.now()<next.current)return;
+    if(!data||!("__TAURI_INTERNALS__" in window)||data.settings.tunnel_route==="direct"||data.physical_attachment!=="available"||data.operation||!["connected","disconnected","retry_wait"].includes(data.status)||data.connection?.chained||flight.current||performance.now()<next.current)return;
     next.current=performance.now()+5*60*1000;void maintain();
   },[data?.sequence]);
   return {working,notice,choices,selected,setSelected,loadChoices,maintain,test,cancel:()=>{generation.current+=1;}};

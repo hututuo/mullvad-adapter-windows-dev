@@ -68,9 +68,14 @@ export type Dashboard = {
   metadata_refreshing?: boolean;
   metadata_error?: string | null;
   chain_node?: string | null;
+  chain_fingerprint?: string|null;
+  chain_revision?: number;
   retry_in_seconds?: number | null;
   recovery?: RecoveryProgress | null;
   backup_verified_at?: number | null;
+  backup_test_id?: number;
+  backup_test_status?: "testing"|"passed"|"failed"|"cancelled"|null;
+  backup_test_restored?: boolean;
   account: {
     authenticated: boolean;
     expiry: string | null;
