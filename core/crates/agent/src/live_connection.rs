@@ -47,6 +47,7 @@ pub(crate) struct Connections {
     chain: Option<Arc<adapter_engine_mihomo::chain::UpstreamSs>>,
     chain_relays: BTreeSet<String>,
     chain_mode: adapter_protocol::app::TunnelRoute,
+    retry_round: crate::recovery_retry::RecoveryRetry,
 }
 impl Connections {
     pub(crate) fn new(
@@ -75,6 +76,7 @@ impl Connections {
                 chain: None,
                 chain_relays: Default::default(),
                 chain_mode: adapter_protocol::app::TunnelRoute::Auto,
+                retry_round: Default::default(),
             },
             mailbox,
         )
@@ -128,6 +130,7 @@ impl Connections {
         }
     }
     pub(crate) fn freeze(&mut self) {
+        self.retry_round.cancel();
         self.frozen = true;
         self.inlet_trials.clear();
         self.chain_relays.clear();
@@ -136,6 +139,7 @@ impl Connections {
         self.deferred = None;
     }
     pub(crate) fn identity_changed(&mut self, owner: &mut ResourceOwner) {
+        self.retry_round.cancel();
         self.inlet_trials.clear();
         self.chain_relays.clear();
         self.recovering = None;
@@ -185,9 +189,48 @@ impl Connections {
         dashboard.readiness = None;
         dashboard.last_error = Some(code.into());
         let _ = self.logs.event("connection", code);
+        self.schedule_retry(dashboard);
+    }
+    fn schedule_retry(&mut self, dashboard: &mut Dashboard) {
+        if !dashboard.settings.automatic_recovery {
+            return;
+        }
+        if let Some(city) = self
+            .retry_round
+            .city()
+            .filter(|city| Some(*city) == dashboard.settings.selected_city.as_deref())
+            .map(str::to_owned)
+        {
+            if self.retry_round.exhausted(Instant::now(), &city) {
+                dashboard.retry_in_seconds = self.retry_round.remaining(Instant::now());
+                if dashboard.physical_attachment == "available" {
+                    dashboard.status = "retry_wait".into();
+                }
+                let _ = self.logs.event("connection", "recovery_retry_scheduled");
+            }
+        }
+    }
+    pub(crate) fn defer_start_failure(&mut self, dashboard: &mut Dashboard, code: &str) {
+        // Local failures stay local: do not quarantine/consume an SS inlet. An
+        // uncertain stop or invalid identity/configuration must not auto-loop.
+        if matches!(
+            code,
+            "operation_busy"
+                | "tunnel_command_busy"
+                | "worker_runtime_unavailable"
+                | "physical_binding_unavailable"
+                | "worker_route_unavailable"
+                | "worker_start_failed"
+                | "worker_controller_unavailable"
+                | "worker_start_deadline"
+                | "candidate_probe_failed"
+        ) {
+            self.schedule_retry(dashboard);
+        }
     }
     /// Called only for an accepted user intent, never for scheduler retries.
-    pub(crate) fn begin_user_selection(&mut self) {
+    pub(crate) fn begin_user_selection(&mut self, city: Option<&str>, relay: Option<&str>) {
+        self.retry_round.user_connect(city, relay);
         self.inlet_trials.clear();
         self.chain_relays.clear();
         self.manual_candidates = None;
@@ -528,6 +571,8 @@ impl Connections {
         owner: &mut ResourceOwner,
         dashboard: &mut Dashboard,
     ) -> Result<(), &'static str> {
+        self.retry_round.cancel();
+        dashboard.retry_in_seconds = None;
         if self.frozen {
             return Err("cleanup_uncertain");
         }
@@ -706,6 +751,7 @@ impl Connections {
         if owner.state_mut().request_original_rebuild(now).is_err() {
             return;
         }
+        self.retry_round.round_started();
         self.inlet_trials.clear();
         self.chain_relays.clear();
         self.next_attempt = Instant::now();
@@ -722,6 +768,10 @@ impl Connections {
         catalogue: Option<&adapter_catalogue::Catalogue>,
         restored: bool,
     ) {
+        dashboard.retry_in_seconds = self.retry_round.remaining(Instant::now());
+        if dashboard.retry_in_seconds.is_none() && dashboard.status == "retry_wait" {
+            dashboard.status = "disconnected".into();
+        }
         if self.frozen {
             return;
         }
@@ -918,6 +968,12 @@ impl Connections {
                     let path = p.attempt.unwrap().path;
                     dashboard.front_selected =
                         if path.slot == "a" { "slot_a" } else { "slot_b" }.into();
+                    if self
+                        .retry_round
+                        .connection_succeeded(&path.city, &path.relay)
+                    {
+                        dashboard.retry_in_seconds = None;
+                    }
                     dashboard.active_relay = Some(path.relay);
                     self.last_relay = dashboard.active_relay.clone();
                     self.inlet_trials.clear();
@@ -986,6 +1042,12 @@ impl Connections {
                     owner.finish_operation(&p.ticket);
                     dashboard.operation = None;
                     if ready {
+                        if owner.state().path.as_ref().is_some_and(|path| {
+                            self.retry_round
+                                .connection_succeeded(&path.city, &path.relay)
+                        }) {
+                            dashboard.retry_in_seconds = None;
+                        }
                         self.record_measured(
                             dashboard,
                             if proof
@@ -1148,6 +1210,7 @@ impl Connections {
                                 .is_some_and(|(_, _, _, exact)| *exact)
                         {
                             self.manual_candidates = None;
+                            self.schedule_retry(dashboard);
                         }
                         owner.state_mut().manual_preempt();
                     }
@@ -1251,6 +1314,8 @@ impl Connections {
                         if let Some(c) = catalogue {
                             self.recovery(owner, dashboard, c);
                         }
+                    } else if self.manual_candidates.is_none() && p.attempt.is_some() {
+                        self.defer_start_failure(dashboard, code);
                     }
                 }
                 Reply::Lost { .. } => unreachable!(),
@@ -1326,6 +1391,48 @@ impl Connections {
             return;
         }
         if Instant::now() < self.next_attempt {
+            return;
+        }
+        if self.manual_candidates.is_none()
+            && self.recovering.is_none()
+            && self.retry_round.take_due(
+                Instant::now(),
+                dashboard.settings.selected_city.as_deref(),
+                dashboard.settings.automatic_recovery,
+            )
+        {
+            // This is a NEW bounded round after a monotonic backoff, never a
+            // continuation/refill of the exhausted round. Retain the old inlet
+            // preference and city, and run the same full prepare/commit gate.
+            self.inlet_trials.clear();
+            self.chain_relays.clear();
+            if let (Some(identity), Some(catalogue)) = (identity, catalogue) {
+                let exact = self.retry_round.exact_relay().map(str::to_owned);
+                if exact.is_none() {
+                    if let Some(path) = owner.state().path.as_ref() {
+                        let saved = serde_json::json!({"city":path.city,"relay":path.relay,
+                            "inlet":path.inlet,"transport":path.transport});
+                        if let Ok(bytes) = serde_json::to_vec(&saved) {
+                            self.remember_startup_path(&bytes, catalogue, dashboard);
+                        }
+                    }
+                }
+                let _ = self.logs.event("connection", "recovery_retry_started");
+                dashboard.retry_in_seconds = None;
+                if let Err(code) = self.connect(
+                    owner,
+                    dashboard,
+                    identity,
+                    catalogue,
+                    exact.as_deref(),
+                    false,
+                ) {
+                    dashboard.last_error = Some(code.into());
+                    self.defer_start_failure(dashboard, code);
+                }
+            } else {
+                self.schedule_retry(dashboard);
+            }
             return;
         }
         if let Some((deadline, city, queue, _)) = &mut self.manual_candidates {
@@ -1488,7 +1595,7 @@ mod tests {
             c.manual_candidates.as_ref().unwrap().2,
             VecDeque::from(["exact-relay".to_string()])
         );
-        c.begin_user_selection();
+        c.begin_user_selection(Some("city"), None);
         assert!(c.manual_candidates.is_none());
     }
 
@@ -1542,7 +1649,7 @@ mod tests {
             "cannot change original inlet before domain fallback"
         );
         assert!(c.deferred.is_none());
-        c.begin_user_selection();
+        c.begin_user_selection(Some("city"), None);
         assert_eq!(
             c.inlet_trials
                 .choose(&path.relay, &cat.shadowsocks_inlets(relay)),
@@ -1574,7 +1681,7 @@ mod tests {
         );
         assert_eq!(queue, &VecDeque::from([String::from("same-city-backup")]));
         assert!(connections.next_attempt > Instant::now());
-        connections.begin_user_selection();
+        connections.begin_user_selection(Some("city"), None);
         assert!(connections.deferred.is_none() && connections.recovering.is_none());
     }
 }

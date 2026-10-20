@@ -462,7 +462,7 @@ function App() {
                 <span
                   className={`pill ${data?.status === "connected" ? "positive" : ""}`}
                 >
-                  {data ? (statusText[data.status] ?? data.status) : "等待后台"}
+                  {data?.status === "retry_wait" ? `${data.retry_in_seconds ?? "—"} 秒后自动重试` : data ? (statusText[data.status] ?? data.status) : "等待后台"}
                 </span>
               </div>
               <div className="connection-facts">
@@ -492,12 +492,13 @@ function App() {
                   disabled={!data || busy || !chosen}
                   onClick={() =>
                     void act({
-                      kind: data?.active_relay && data.status==="connected" ? "disconnect" : "connect",
+                      kind: data?.status === "retry_wait" || data?.active_relay && data.status==="connected" ? "disconnect" : "connect",
                     })
                   }
                 >
-                  {data?.active_relay && data.status==="connected" ? "断开连接" : data?.active_relay ? "重连当前节点" : "连接当前城市"}
+                  {data?.status === "retry_wait" ? "停止自动恢复" : data?.active_relay && data.status==="connected" ? "断开连接" : data?.active_relay ? "重连当前节点" : "连接当前城市"}
                 </button>
+                {data?.status === "retry_wait" && <button disabled={busy} onClick={() => void act({kind:"connect"})}>立即重试</button>}
                 <button
                   disabled={!chosen || busy}
                   onClick={() =>
@@ -1043,7 +1044,12 @@ function App() {
                 </form>
               </section>
             )}
-            {data && <ChainRoute data={data} disabled={busy} onSettings={async next => { setSettings(next); await act({kind:"save_settings", settings:next}); }}/>}
+            {data && <ChainRoute data={data} disabled={busy} onSettings={async next => {
+              const latest = current.current;
+              if (!latest) return;
+              setSettings(draft => draft ? {...draft, tunnel_route:next.tunnel_route} : draft);
+              await act({kind:"save_settings", settings:{...latest.settings, tunnel_route:next.tunnel_route}});
+            }}/>}
           </>
         )}
         <footer>

@@ -65,6 +65,7 @@ export type Dashboard = {
   metadata_refreshing?: boolean;
   metadata_error?: string | null;
   chain_node?: string | null;
+  retry_in_seconds?: number | null;
   account: {
     authenticated: boolean;
     expiry: string | null;
@@ -150,6 +151,7 @@ export const statusText: Record<string, string> = {
   degraded_service: "连接可用，服务待恢复",
   waiting_network: "等待本机网络恢复",
   network_recovering: "正在验证原连接",
+  retry_wait: "等待自动重试",
   unknown_network: "正在确认本机网络",
   blocked: "连接条件未满足",
   stopping: "正在安全断开",
@@ -243,6 +245,7 @@ export function timeText(seconds: number | null) {
 export const operationText: Record<string, string> = {
   connect: "结束后台测速并准备连接",
   metadata_refresh: "更新官方目录",
+  chain_configure: "保存独立链式节点",
   account_login: "登录账号",
   account_refresh: "刷新账号",
   account_logout: "退出账号",

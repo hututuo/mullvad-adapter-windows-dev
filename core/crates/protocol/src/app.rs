@@ -376,6 +376,8 @@ pub struct Dashboard {
     pub metadata_error: Option<String>,
     #[serde(default)]
     pub chain_node: Option<String>,
+    #[serde(default)]
+    pub retry_in_seconds: Option<u64>,
     pub account: Account,
     pub operation: Option<String>,
     pub last_error: Option<String>,

@@ -37,3 +37,14 @@
   groups. Explain that the selected external Clash configuration owns ingress.
 - WHEN either route is selected, THEN show the actual attempted/committed route,
   and distinguish build, candidate, install and real egress evidence.
+
+## AR5: Exhaustion is followed by bounded cooldown rounds
+- WHEN an authorized connection intent exhausts a round and automatic recovery is
+  enabled, THEN retain its city and explicit relay and schedule a new round after
+  60/180/300 seconds capped, without refilling the running round on host ticks.
+- WHEN the physical network is offline or unsettled, THEN do not dispatch a new
+  round. Transient local setup failures may schedule a cooldown without consuming
+  an inlet; uncertain cleanup or invalid protection/identity must not auto-loop.
+- WHEN a fresh connection succeeds or the user disconnects, THEN cancel pending
+  cooldown. Disconnect also revokes the retained intent. Show a countdown and
+  allow stopping or explicit immediate retry.

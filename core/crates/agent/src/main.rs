@@ -14,6 +14,8 @@ mod live_identity;
 mod live_quick;
 mod live_runtime;
 mod live_status;
+#[cfg(any(windows, feature = "windows-api-check", test))]
+mod recovery_retry;
 #[cfg(any(windows, feature = "windows-api-check"))]
 mod windows_live;
 #[cfg(any(windows, feature = "windows-api-check"))]

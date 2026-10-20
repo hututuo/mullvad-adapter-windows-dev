@@ -98,6 +98,8 @@ fn safe_event(value: &LogEvent) -> bool {
                 | "chain_configuration_invalid"
                 | "chain_write_failed"
                 | "chain_configured"
+                | "recovery_retry_scheduled"
+                | "recovery_retry_started"
                 | "shadowsocks_inlets_exhausted"
                 | "candidate_cancelled"
                 | "candidate_start_failed"
@@ -454,6 +456,7 @@ mod tests {
             metadata_refreshing: false,
             metadata_error: None,
             chain_node: None,
+            retry_in_seconds: None,
             account: Account::default(),
             operation: None,
             last_error: None,

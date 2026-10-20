@@ -635,6 +635,7 @@ pub fn serve(scope: &str) -> io::Result<()> {
         metadata_refreshing: false,
         metadata_error: None,
         chain_node: None,
+        retry_in_seconds: None,
         account: Account::default(),
         operation: None,
         last_error: None,
@@ -929,6 +930,7 @@ pub fn serve(scope: &str) -> io::Result<()> {
                         }
                         .into();
                         dashboard.last_error = Some(code.into());
+                        connections.defer_start_failure(&mut dashboard, code);
                         logs.event("connection", code)?;
                     }
                 }
@@ -1303,7 +1305,10 @@ pub fn serve(scope: &str) -> io::Result<()> {
                             } else if quick.as_ref().is_some_and(|q| q.automatic) {
                                 let operation_id = boot_id()?;
                                 owner.cancel_current_operation();
-                                connections.begin_user_selection();
+                                connections.begin_user_selection(
+                                    dashboard.settings.selected_city.as_deref(),
+                                    relay,
+                                );
                                 queued_connect = Some(QueuedConnect {
                                     relay: relay.map(str::to_owned),
                                 });
@@ -1316,7 +1321,10 @@ pub fn serve(scope: &str) -> io::Result<()> {
                             } else if let (Some(identity), Some(catalogue)) =
                                 (identity.as_ref(), catalogue.as_ref())
                             {
-                                connections.begin_user_selection();
+                                connections.begin_user_selection(
+                                    dashboard.settings.selected_city.as_deref(),
+                                    relay,
+                                );
                                 if !owner.observation().binding_settled() || owner.state().paused {
                                     let operation_id = boot_id()?;
                                     queued_connect = Some(QueuedConnect {
@@ -1339,6 +1347,7 @@ pub fn serve(scope: &str) -> io::Result<()> {
                                         Ok(operation_id) => AppReply::Accepted { operation_id },
                                         Err(code) => {
                                             dashboard.last_error = Some(code.into());
+                                            connections.defer_start_failure(&mut dashboard, code);
                                             failure(code)
                                         }
                                     }
@@ -1572,7 +1581,7 @@ pub fn serve(scope: &str) -> io::Result<()> {
         {
             startup_pending = false;
             queued_connect = Some(QueuedConnect { relay: None });
-            connections.begin_user_selection();
+            connections.begin_user_selection(dashboard.settings.selected_city.as_deref(), None);
             if let (Ok(saved), Some(catalogue)) =
                 (store.load(RecordKind::Connection), catalogue.as_ref())
             {
