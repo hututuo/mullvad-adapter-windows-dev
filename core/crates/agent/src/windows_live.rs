@@ -185,8 +185,8 @@ fn api_worker(
                     };
                     let command = match command {
                         command @ (AppCommand::ConfigureChain { .. }
-                        | AppCommand::RestoreVerifiedChain) => {
-                            let parsed = if let AppCommand::ConfigureChain { proxy } = command {
+                        | AppCommand::RestoreVerifiedChain { .. }) => {
+                            let parsed = if let AppCommand::ConfigureChain { proxy, .. } = command {
                                 let proxy = proxy.into_value();
                                 adapter_engine_mihomo::chain::UpstreamSs::decode(proxy.as_bytes())
                                     .map_err(|_| "chain_configuration_invalid")?
@@ -703,32 +703,42 @@ pub fn serve(scope: &str) -> io::Result<()> {
     } else {
         None
     };
-    if let Some(verified) = saved_chain {
-        if let Ok(encoded) = verified.encode() {
-            let _ = store
-                .prepare(RecordKind::ChainProxy, &encoded)
-                .and_then(|p| p.commit());
+    let startup_chain = if let Some(verified) = saved_chain {
+        if verified
+            .encode()
+            .and_then(|encoded| store.prepare(RecordKind::ChainProxy, &encoded))
+            .and_then(|p| p.commit())
+            .is_err()
+        {
+            dashboard.last_error = Some("chain_write_failed".into());
+            logs.event("api", "chain_write_failed")?;
         }
-    }
-    match store.load(RecordKind::ChainProxy) {
-        Ok(bytes) => match adapter_engine_mihomo::chain::UpstreamSs::decode(bytes.expose()) {
-            Ok(chain) => {
-                {
-                    use sha2::{Digest, Sha256};
-                    dashboard.chain_fingerprint = chain
-                        .encode()
-                        .ok()
-                        .map(|bytes| format!("{:x}", Sha256::digest(&bytes)));
-                }
-                dashboard.chain_node = Some(chain.name().into());
-                dashboard.backup_verified_at =
-                    connections.verified_at(dashboard.chain_fingerprint.as_deref());
-                connections.set_chain(Some(std::sync::Arc::new(chain)));
+        Ok(Some(verified))
+    } else {
+        match store.load(RecordKind::ChainProxy) {
+            Ok(bytes) => adapter_engine_mihomo::chain::UpstreamSs::decode(bytes.expose())
+                .map(|chain| Some(std::sync::Arc::new(chain)))
+                .map_err(|_| "chain_configuration_invalid"),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err("chain_configuration_invalid"),
+        }
+    };
+    match startup_chain {
+        Ok(Some(chain)) => {
+            {
+                use sha2::{Digest, Sha256};
+                dashboard.chain_fingerprint = chain
+                    .encode()
+                    .ok()
+                    .map(|bytes| format!("{:x}", Sha256::digest(&bytes)));
             }
-            Err(_) => dashboard.last_error = Some("chain_configuration_invalid".into()),
-        },
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => dashboard.last_error = Some("chain_configuration_invalid".into()),
+            dashboard.chain_node = Some(chain.name().into());
+            dashboard.backup_verified_at =
+                connections.verified_at(dashboard.chain_fingerprint.as_deref());
+            connections.set_chain(Some(chain));
+        }
+        Ok(None) => {}
+        Err(code) => dashboard.last_error = Some(code.into()),
     }
     let tunnel_store = store.clone();
     let front_runtime = PrivateRuntime::open(&root.path().join("front"))?;
@@ -1348,7 +1358,17 @@ pub fn serve(scope: &str) -> io::Result<()> {
                         {
                             failure("disconnect_before_identity_change")
                         }
-                        AppCommand::ConfigureChain { .. } | AppCommand::RestoreVerifiedChain
+                        AppCommand::ConfigureChain {
+                            expected_revision: Some(revision),
+                            ..
+                        }
+                        | AppCommand::RestoreVerifiedChain {
+                            expected_revision: Some(revision),
+                        } if revision != dashboard.chain_revision => {
+                            failure("clash_config_changed")
+                        }
+                        AppCommand::ConfigureChain { .. }
+                        | AppCommand::RestoreVerifiedChain { .. }
                             if connections.chain_change_busy()
                                 || owner.state().path.as_ref().is_some_and(|p| {
                                     p.transport == "wireguard-over-shadowsocks-chain"
@@ -1617,7 +1637,7 @@ pub fn serve(scope: &str) -> io::Result<()> {
                                     AppCommand::AccountRefresh => "account_refresh",
                                     AppCommand::AccountLogout => "account_logout",
                                     AppCommand::ConfigureChain { .. }
-                                    | AppCommand::RestoreVerifiedChain => "chain_configure",
+                                    | AppCommand::RestoreVerifiedChain { .. } => "chain_configure",
                                     AppCommand::RemoveDevice { .. } => "device_remove",
                                     AppCommand::CreateDevice { .. } => "device_create",
                                     AppCommand::UseCreatedDevice { .. } => "device_activate",

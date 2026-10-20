@@ -213,6 +213,7 @@ fn execute(input: Request) -> Result<Value, String> {
         .map_err(|_| "clash_chain_configuration_invalid")?;
         return match super::transact(adapter_protocol::app::AppCommand::ConfigureChain {
             proxy: adapter_protocol::app::SecretText::new(bytes),
+            expected_revision: Some(dashboard.chain_revision),
         })? {
             adapter_protocol::app::AppReply::Accepted { .. } => Ok(json!({"accepted":true})),
             adapter_protocol::app::AppReply::Error { code } => Err(code),
@@ -446,7 +447,34 @@ fn automatic_chain(
     let preferred_name = selected_name.or(dashboard.settings.chain_selection.as_deref());
     let preserve_verified = dashboard.backup_verified_at.is_some()
         && excluded.is_empty()
+        && selected_name.is_none()
         && preferred_name.is_none_or(|name| dashboard.chain_node.as_deref() == Some(name));
+    if preserve_verified && !active_chain {
+        let name = dashboard
+            .chain_node
+            .as_deref()
+            .ok_or("chain_not_configured")?;
+        let saved_fingerprint = dashboard
+            .chain_fingerprint
+            .as_deref()
+            .ok_or("chain_not_configured")?;
+        // The successful encrypted snapshot owns its credentials. A changed or
+        // removed provider must not replace it during read-only maintenance.
+        // The source hash is only a cursor for a later explicit full test.
+        let source_fingerprint = (|| -> Option<String> {
+            let selected =
+                chain_source::selected(root, dashboard.settings.front_port, name).ok()?;
+            let bytes=adapter_protocol::app::SecretText::new(serde_json::to_string(&json!({"name":selected.name,"server":selected.server,"port":selected.port,"cipher":selected.cipher,"password":selected.password})).ok()?).into_value();
+            let proxy = adapter_engine_mihomo::chain::UpstreamSs::decode(bytes.as_bytes()).ok()?;
+            use sha2::{Digest, Sha256};
+            let encoded = proxy.encode().ok()?;
+            (format!("{:x}", Sha256::digest(&encoded)) == saved_fingerprint)
+                .then_some(selected.fingerprint)
+        })();
+        return Ok(
+            json!({"selected":name,"kept":true,"fingerprint":saved_fingerprint,"source_fingerprint":source_fingerprint,"revision":dashboard.chain_revision}),
+        );
+    }
     if active_chain || preserve_verified {
         let name = dashboard
             .chain_node
@@ -595,6 +623,8 @@ fn automatic_chain(
         };
         if latest.boot_id != dashboard.boot_id
             || latest.settings.chain_selection != dashboard.settings.chain_selection
+            || latest.chain_revision != dashboard.chain_revision
+            || latest.chain_fingerprint != dashboard.chain_fingerprint
         {
             return Err("clash_config_changed".into());
         }
@@ -607,6 +637,7 @@ fn automatic_chain(
         let expected = format!("{:x}", Sha256::digest(&encoded));
         match super::transact(adapter_protocol::app::AppCommand::ConfigureChain {
             proxy: adapter_protocol::app::SecretText::from_protected(bytes),
+            expected_revision: Some(dashboard.chain_revision),
         })? {
             adapter_protocol::app::AppReply::Accepted { .. } => {}
             adapter_protocol::app::AppReply::Error { code } => return Err(code),

@@ -327,3 +327,29 @@ fn retained_worker_revalidation_is_not_a_rebuild_and_trial_gaps_reject_chain_cha
         "original_inlet"
     );
 }
+
+#[test]
+fn failed_snapshot_write_cannot_mark_new_credentials_as_saved() {
+    use sha2::{Digest, Sha256};
+    let mut f = fixture(TrialKind::TestBackup);
+    let old = Arc::new(adapter_engine_mihomo::chain::UpstreamSs::decode(br#"{"name":"previous","server":"ss.example.com","port":443,"cipher":"aes-128-gcm","password":"old-fixture"}"#).unwrap());
+    let next = Arc::new(adapter_engine_mihomo::chain::UpstreamSs::decode(br#"{"name":"candidate","server":"ss.example.com","port":443,"cipher":"aes-128-gcm","password":"new-fixture"}"#).unwrap());
+    let old_fp = format!("{:x}", Sha256::digest(&*old.encode().unwrap()));
+    let next_fp = format!("{:x}", Sha256::digest(&*next.encode().unwrap()));
+    f.connections.verified_chain =
+        Some(crate::verified_chain::VerifiedChain { proxy: old, at: 42 });
+    f.connections.set_chain(Some(next));
+    f.dashboard.chain_fingerprint = Some(next_fp);
+    f.dashboard.backup_verified_at = Some(99);
+    assert!(
+        f.connections.chain_store.is_none(),
+        "synthetic write has no store"
+    );
+    f.connections.record_verified_chain(&mut f.dashboard);
+    assert_eq!(f.dashboard.backup_verified_at, None);
+    assert_eq!(f.connections.verified_at(Some(&old_fp)), Some(42));
+    assert_eq!(
+        f.dashboard.last_error.as_deref(),
+        Some("chain_write_failed")
+    );
+}

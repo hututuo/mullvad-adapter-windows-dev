@@ -115,7 +115,6 @@ export type Command =
       kind:
         | "dashboard"
         | "refresh_catalogue"
-        | "restore_verified_chain"
         | "connect"
         | "disconnect"
         | "cancel_operation"
@@ -125,6 +124,7 @@ export type Command =
         | "shutdown";
     }
   | { kind: "save_settings"; settings: Settings }
+  | { kind: "restore_verified_chain"; expected_revision: number }
   | { kind: "select_city" | "quick_test" | "full_test"; city: string }
   | { kind: "relays"; city: string | null; page: number }
   | { kind: "account_login"; account: string }

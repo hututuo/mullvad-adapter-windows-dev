@@ -198,12 +198,13 @@ impl Connections {
                 .and_then(|write| write.commit())
                 .is_ok()
         });
-        dashboard.backup_verified_at = Some(at);
         if saved {
             self.verified_chain = Some(verified);
         } else {
+            dashboard.last_error = Some("chain_write_failed".into());
             let _ = self.logs.event("api", "chain_write_failed");
         }
+        dashboard.backup_verified_at = self.verified_at(dashboard.chain_fingerprint.as_deref());
     }
     fn active_negative(
         &mut self,

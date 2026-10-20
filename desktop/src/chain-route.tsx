@@ -72,11 +72,11 @@ export function useChainBackup(data:Dashboard|null) {
         finalText=backupResult(done,baseline+1)!;
         passed=done.backup_test_status==="passed";
         failedSafely=done.backup_test_status==="failed"&&done.backup_test_restored===true;
-        if(pinned||passed||!result.source_fingerprint||!canContinueBackup(done,{
+        if(pinned||passed||!canContinueBackup(done,{
           boot,source:initial.source_sha,id:baseline+1,fingerprint:result.fingerprint,revision:result.revision??0,
           relay:saved.connection?.relay??null,inlet:saved.connection?.inlet??null,
         }))break;
-        excluded.push(result.source_fingerprint);
+        excluded.push(result.source_fingerprint??result.fingerprint);
       }
     }catch(e){finalText=errorText(typeof e==="string"?e:"clash_not_found");}
     finally {
@@ -85,7 +85,7 @@ export function useChainBackup(data:Dashboard|null) {
       const d=current.current;
       if(!passed&&!pinned&&failedSafely&&alive.current&&token===generation.current&&d?.boot_id===boot&&d.source_sha===initial.source_sha&&!d.settings.chain_selection&&d.physical_attachment==="available"&&d.backup_test_status==="failed"&&d.backup_test_restored===true&&d.status==="connected"&&!d.operation&&!d.connection?.chained) {
         try {
-          const revision=d.chain_revision??0,r=await request({kind:"restore_verified_chain"});
+          const revision=d.chain_revision??0,r=await request({kind:"restore_verified_chain",expected_revision:revision});
           if(r.kind==="accepted") {
             const until=performance.now()+12_000;let restored=false;
             while(alive.current&&token===generation.current&&performance.now()<until){

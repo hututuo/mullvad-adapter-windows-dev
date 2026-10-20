@@ -166,9 +166,14 @@ pub enum AppCommand {
     /// Only the native Clash reader constructs this credential-bearing value.
     ConfigureChain {
         proxy: SecretText,
+        #[serde(default)]
+        expected_revision: Option<u64>,
     },
     /// Restore only the separately protected, whole-tunnel-verified snapshot.
-    RestoreVerifiedChain,
+    RestoreVerifiedChain {
+        #[serde(default)]
+        expected_revision: Option<u64>,
+    },
     Relays {
         city: Option<String>,
         page: u16,
