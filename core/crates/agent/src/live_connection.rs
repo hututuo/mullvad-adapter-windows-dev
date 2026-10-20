@@ -549,6 +549,15 @@ impl Connections {
         self.record(dashboard, code, "connected", proof.fresh_canary());
     }
     fn abort(&mut self, owner: &ResourceOwner, code: &'static str, dashboard: &mut Dashboard) {
+        self.abort_with_canary(owner, code, dashboard, None);
+    }
+    fn abort_with_canary(
+        &mut self,
+        owner: &ResourceOwner,
+        code: &'static str,
+        dashboard: &mut Dashboard,
+        canary: Option<adapter_domain::Canary>,
+    ) {
         owner.cancel_current_operation();
         if let Some(pending) = &mut self.pending {
             pending.retry_stale |= code == "candidate_evidence_stale";
@@ -563,7 +572,7 @@ impl Connections {
                 pending.aborting = true;
             }
         }
-        self.record(dashboard, code, "failed", None);
+        self.record(dashboard, code, "failed", canary);
         dashboard.last_error = Some(code.into());
         dashboard.readiness = None;
     }
@@ -905,7 +914,18 @@ impl Connections {
                         } else {
                             "candidate_not_ready"
                         };
-                        self.abort(owner, code, dashboard);
+                        // These failed checks were actually measured. Preserve
+                        // fresh negative facts in the failed-phase log instead
+                        // of erasing them during cleanup. They never authorize
+                        // promotion or survive an invalid operation fence.
+                        let canary = if !aborting
+                            && matches!(checked, Err(adapter_control::candidate_evidence::SelectionCheckError::NotReady(_)))
+                            && self.pending.as_ref().is_some_and(|p| owner.is_operation_current(&p.ticket))
+                        {
+                            use adapter_control::candidate_evidence::ReadinessEvidence;
+                            proof.fresh_canary()
+                        } else { None };
+                        self.abort_with_canary(owner, code, dashboard, canary);
                     } else if self.client.submit(Command::Promote { id, proof }).is_ok() {
                         self.pending.as_mut().unwrap().promoting = true;
                     } else {
