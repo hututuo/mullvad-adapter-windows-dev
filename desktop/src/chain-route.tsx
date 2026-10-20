@@ -1,9 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { errorText, request, timeText, type Dashboard, type Settings } from "./app-api";
-import {backupResult} from "./backup-result";
+import {backupResult,canContinueBackup} from "./backup-result";
 type Choice={name:string;fingerprint:string};
-type AutoResult={selected?:string;accepted?:boolean;kept?:boolean;fingerprint?:string;revision?:number};
+type AutoResult={selected?:string;accepted?:boolean;kept?:boolean;fingerprint?:string;source_fingerprint?:string;revision?:number};
 const pause=(ms:number)=>new Promise<void>(resolve=>window.setTimeout(resolve,ms));
 export function useChainBackup(data:Dashboard|null) {
   const [working,setWorking]=useState(false),[notice,setNotice]=useState(""),[choices,setChoices]=useState<Choice[]>([]),[selected,setSelected]=useState("");
@@ -12,16 +12,16 @@ export function useChainBackup(data:Dashboard|null) {
   current.current=data;
   useEffect(()=>{setSelected(data?.settings.chain_selection??"");},[data?.settings.chain_selection]);
   useEffect(()=>{alive.current=true;return()=>{alive.current=false;};},[]);
-  async function prepare(manual:boolean) {
+  async function prepare(manual:boolean,excluded:string[]=[]) {
     const choice=manual?choices.find(c=>c.name===selected):undefined;
-    return invoke<AutoResult>("clash_request",{input:{kind:"chain_auto",directory:null,...(choice?{chain_name:choice.name,chain_fingerprint:choice.fingerprint}:{})}});
+    return invoke<AutoResult>("clash_request",{input:{kind:"chain_auto",directory:null,exclude_fingerprints:excluded,...(choice?{chain_name:choice.name,chain_fingerprint:choice.fingerprint}:{})}});
   }
   async function maintain(manual=false) {
     if(flight.current||!current.current)return;
     flight.current=true;setWorking(true);
     try {
       const result=await prepare(manual);
-      if(alive.current)setNotice(result.kept?"当前正在使用已保存的备用路线，继续维护这条连接。":`已自动准备备用：${result.selected??"本机节点"}。直连恢复全部失败后才启用。`);
+      if(alive.current)setNotice(result.kept?"保留已验证的备用路线，直连恢复全部失败后才启用。":`已自动准备备用：${result.selected??"本机节点"}。直连恢复全部失败后才启用。`);
       next.current=performance.now()+30*60*1000;
     }catch(e){next.current=performance.now()+5*60*1000;if(alive.current)setNotice(errorText(typeof e==="string"?e:"clash_not_found"));}
     finally{flight.current=false;if(alive.current)setWorking(false);}
@@ -34,36 +34,71 @@ export function useChainBackup(data:Dashboard|null) {
   async function test() {
     if(flight.current||!current.current)return;
     flight.current=true;setWorking(true);setNotice("正在自动选择备用并验证实际流量…");
-    const token=generation.current,boot=current.current.boot_id;
-    let baseline=current.current.backup_test_id??0;
+    const token=generation.current,initial=current.current,boot=initial.boot_id;
+    const pinned=!!(selected||initial.settings.chain_selection),excluded:string[]=[],roundDeadline=performance.now()+420_000;
+    let failedSafely=false,passed=false,finalText="没有找到可用的备用路线，当前连接保持原路径。";
+    function checkIntent() {
+      if(token!==generation.current||!alive.current)throw "connection_cancelled";
+      if(current.current?.boot_id!==boot||current.current?.source_sha!==initial.source_sha)throw "boot_changed_reconcile";
+      if((current.current.settings.chain_selection??null)!==(initial.settings.chain_selection??null))throw "clash_config_changed";
+      if(current.current.physical_attachment!=="available")throw "waiting_network";
+    }
     try {
-      const result=await prepare(!!selected),saveDeadline=performance.now()+12_000;
-      let saved=false;
-      while(alive.current&&performance.now()<saveDeadline){
-        const r=await request({kind:"dashboard"});
-        if(r.kind==="dashboard"&&r.dashboard.boot_id===boot&&r.dashboard.chain_node===result.selected&&r.dashboard.chain_fingerprint===result.fingerprint&&(r.dashboard.chain_revision??0)===(result.revision??0)&&!r.dashboard.operation){baseline=r.dashboard.backup_test_id??0;saved=true;break;}
-        if(r.kind==="error"&&r.code!=="operation_busy")throw r.code;
-        await pause(300);
+      for(let attempt=0;attempt<6&&performance.now()<roundDeadline;attempt++) {
+        checkIntent();
+        setNotice(attempt?"上一条未通过，原连接已恢复；正在自动检查下一条备用…":"正在自动选择备用并验证实际流量…");
+        const result=await prepare(pinned,excluded),saveDeadline=performance.now()+12_000;
+        let saved:Dashboard|null=null;
+        while(alive.current&&performance.now()<saveDeadline){
+          checkIntent();const r=await request({kind:"dashboard"});
+          if(r.kind==="dashboard"&&r.dashboard.boot_id===boot&&r.dashboard.chain_node===result.selected&&r.dashboard.chain_fingerprint===result.fingerprint&&(r.dashboard.chain_revision??0)===(result.revision??0)&&!r.dashboard.operation){saved=r.dashboard;break;}
+          if(r.kind==="error"&&r.code!=="operation_busy")throw r.code;
+          await pause(300);
+        }
+        checkIntent();
+        if(!saved||!result.fingerprint)throw "operation_busy";
+        if(performance.now()>=roundDeadline)break;
+        const baseline=saved.backup_test_id??0;
+        const r=await request({kind:"recovery_action",action:"test_backup"});
+        if(r.kind==="error")throw r.code;
+        failedSafely=false;
+        setNotice(`正在验证备用 ${result.selected??"本机节点"} 的实际流量，完成后恢复原路径。`);
+        const deadline=performance.now()+210_000;let done:Dashboard|null=null;
+        while(alive.current&&performance.now()<deadline){
+          await pause(1000);checkIntent();const d=current.current;
+          if(d&&backupResult(d,baseline+1)){done=d;break;}
+        }
+        if(!done){finalText="测试仍在后台处理，请查看上方连接与恢复进度。";break;}
+        finalText=backupResult(done,baseline+1)!;
+        passed=done.backup_test_status==="passed";
+        failedSafely=done.backup_test_status==="failed"&&done.backup_test_restored===true;
+        if(pinned||passed||!result.source_fingerprint||!canContinueBackup(done,{
+          boot,source:initial.source_sha,id:baseline+1,fingerprint:result.fingerprint,revision:result.revision??0,
+          relay:saved.connection?.relay??null,inlet:saved.connection?.inlet??null,
+        }))break;
+        excluded.push(result.source_fingerprint);
       }
-      if(token!==generation.current)throw "connection_cancelled";
-      if(!saved)throw "operation_busy";
-      if(!alive.current||current.current?.boot_id!==boot)throw "boot_changed_reconcile";
-      const r=await request({kind:"recovery_action",action:"test_backup"});
-      if(r.kind==="error")throw r.code;
-      setNotice("正在检查备用隧道的真实流量，完成后恢复测试前的路线。");
-      const deadline=performance.now()+210_000;let started=false;
-      while(alive.current&&performance.now()<deadline){
-        await pause(1000);if(token!==generation.current)throw "connection_cancelled";const d=current.current;
-        if(!d||d.boot_id!==boot)throw "boot_changed_reconcile";
-        const stage=d.recovery?.stage;
-        started ||= stage==="testing_backup"||stage==="restoring_previous";
-        const resultText=backupResult(d,baseline+1);
-        if(resultText){setNotice(resultText);return;}
-        if(started&&!d.operation&&!["testing_backup","restoring_previous"].includes(stage??"")&&d.status==="retry_wait")throw "route_trial_failed";
+    }catch(e){finalText=errorText(typeof e==="string"?e:"clash_not_found");}
+    finally {
+      // Testing candidates must not erase a previously verified standby. Never
+      // alter configuration during an in-flight trial, cancellation or live chain.
+      const d=current.current;
+      if(!passed&&!pinned&&failedSafely&&alive.current&&token===generation.current&&d?.boot_id===boot&&d.source_sha===initial.source_sha&&!d.settings.chain_selection&&d.physical_attachment==="available"&&d.backup_test_status==="failed"&&d.backup_test_restored===true&&d.status==="connected"&&!d.operation&&!d.connection?.chained) {
+        try {
+          const revision=d.chain_revision??0,r=await request({kind:"restore_verified_chain"});
+          if(r.kind==="accepted") {
+            const until=performance.now()+12_000;let restored=false;
+            while(alive.current&&token===generation.current&&performance.now()<until){
+              await pause(300);const state=await request({kind:"dashboard"});
+              if(state.kind==="dashboard"&&state.dashboard.boot_id===boot&&!state.dashboard.operation&&(state.dashboard.chain_revision??0)>revision&&state.dashboard.backup_verified_at){restored=true;break;}
+            }
+            finalText=restored?"本轮未找到更好的备用；已保留上次完整通过的路线，当前直连正常。":"原路径已恢复；上次备用配置的恢复尚未确认，请查看当前状态。";
+          }
+        }catch{/* The separate encrypted snapshot remains available after restart. */}
       }
-      if(alive.current)setNotice("测试仍在后台处理，请查看上方连接与恢复进度。");
-    }catch(e){if(alive.current)setNotice(errorText(typeof e==="string"?e:"clash_not_found"));}
-    finally{flight.current=false;next.current=performance.now()+30*60*1000;if(alive.current)setWorking(false);}
+      flight.current=false;next.current=performance.now()+(passed?30:5)*60*1000;
+      if(alive.current){setNotice(finalText);setWorking(false);}
+    }
   }
   // Independent SS-only maintenance does not open another WG identity.
   useEffect(()=>{

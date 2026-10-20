@@ -12,6 +12,8 @@ pub struct Request {
     selection: Option<adapter_clash_integration::portable::Selection>,
     chain_name: Option<String>,
     chain_fingerprint: Option<String>,
+    #[serde(default)]
+    exclude_fingerprints: Vec<String>,
 }
 static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static CHAIN_PROBE_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -174,6 +176,7 @@ fn execute(input: Request) -> Result<Value, String> {
             &dashboard,
             input.chain_name.as_deref(),
             input.chain_fingerprint.as_deref(),
+            &input.exclude_fingerprints,
         );
     }
     if input.kind == "chain_list" {
@@ -423,6 +426,7 @@ fn automatic_chain(
     dashboard: &adapter_protocol::app::Dashboard,
     selected_name: Option<&str>,
     fingerprint: Option<&str>,
+    excluded: &[String],
 ) -> Result<Value, String> {
     use adapter_clash_integration::chain_source;
     use adapter_control::{observer::ObservedOwner, owned_lifecycle::BoundNetwork};
@@ -430,8 +434,20 @@ fn automatic_chain(
         windows::boot_id, windows_paths::AppRoot, windows_runtime::PrivateRuntime,
     };
     use std::time::{Duration, Instant};
-    if dashboard.connection.as_ref().is_some_and(|c| c.chained) && dashboard.active_relay.is_some()
+    if excluded.len() > 8
+        || excluded
+            .iter()
+            .any(|fp| fp.len() != 64 || !fp.bytes().all(|b| b.is_ascii_hexdigit()))
     {
+        return Err("clash_chain_choice_missing".into());
+    }
+    let active_chain = dashboard.connection.as_ref().is_some_and(|c| c.chained)
+        && dashboard.active_relay.is_some();
+    let preferred_name = selected_name.or(dashboard.settings.chain_selection.as_deref());
+    let preserve_verified = dashboard.backup_verified_at.is_some()
+        && excluded.is_empty()
+        && preferred_name.is_none_or(|name| dashboard.chain_node.as_deref() == Some(name));
+    if active_chain || preserve_verified {
         let name = dashboard
             .chain_node
             .as_deref()
@@ -454,22 +470,24 @@ fn automatic_chain(
             .encode()
             .map_err(|_| "clash_chain_configuration_invalid")?;
         let expected = format!("{:x}", Sha256::digest(&encoded));
-        if dashboard.chain_fingerprint.as_deref() != Some(expected.as_str()) {
+        if active_chain && dashboard.chain_fingerprint.as_deref() != Some(expected.as_str()) {
             return Err("disconnect_before_chain_change".into());
         }
-        return Ok(
-            json!({"selected":name,"kept":true,"fingerprint":expected,"revision":dashboard.chain_revision}),
-        );
+        if dashboard.chain_fingerprint.as_deref() == Some(expected.as_str()) {
+            return Ok(
+                json!({"selected":name,"kept":true,"fingerprint":expected,"source_fingerprint":selected.fingerprint,"revision":dashboard.chain_revision}),
+            );
+        }
     }
     if dashboard.operation.is_some() {
         return Err("operation_busy".into());
     }
     let mut choices = chain_source::list(root, dashboard.settings.front_port)?;
     choices.sort_by_key(|c| (chain_preference(&c.name), c.name.clone()));
-    let preferred_name = selected_name.or(dashboard.settings.chain_selection.as_deref());
     if let Some(name) = preferred_name {
         choices.retain(|c| c.name == name && fingerprint.is_none_or(|fp| c.fingerprint == fp));
     }
+    choices.retain(|c| !excluded.contains(&c.fingerprint));
     if choices.is_empty() {
         return Err("clash_chain_no_compatible_nodes".into());
     }
@@ -607,7 +625,7 @@ fn automatic_chain(
                         && done.chain_fingerprint.as_deref() == Some(expected.as_str())
                     {
                         return Ok(
-                            json!({"accepted":true,"selected":choice.name,"udp_verified":true,"fingerprint":expected,"revision":done.chain_revision}),
+                            json!({"accepted":true,"selected":choice.name,"udp_verified":true,"fingerprint":expected,"source_fingerprint":choice.fingerprint,"revision":done.chain_revision}),
                         );
                     }
                     if matches!(

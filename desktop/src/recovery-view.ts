@@ -1,6 +1,7 @@
 import type { Dashboard } from "./app-api";
 const stages: Record<string, [string, number]> = {
   local_front:["正在修复本地转发入口",0], idle:["等待连接",-1], waiting_network:["等待本机网络稳定",-1], confirming:["复测原路径，暂不换节点",0],
+  verifying_original:["正在复验原路径",0],
   original_inlet:["短重试原节点、原 SS 入口",0], same_relay_inlets:["尝试原节点的备用 SS 入口",1],
   same_city:["尝试同城备用节点",2], chain_fallback:["直连路线已用尽，启用链式保底",3],
   testing_backup:["正在测试备用路线的实际流量",3], restoring_previous:["正在恢复测试前的路线",3],

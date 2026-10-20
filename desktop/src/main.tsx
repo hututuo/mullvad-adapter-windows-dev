@@ -334,7 +334,7 @@ function App() {
   }, [data?.last_report_path, data?.boot_id, data?.operation, data?.last_error]);
   const backup = useChainBackup(data);
   const chosen = data?.cities.find((c) => c.id === data.settings.selected_city),
-    busy = pending || !!data?.operation || ["testing_backup","restoring_previous","returning_direct"].includes(data?.recovery?.stage??""),
+    busy = pending || backup.working || !!data?.operation || ["testing_backup","restoring_previous","returning_direct"].includes(data?.recovery?.stage??""),
     quickState = data?.quick_test;
   useEffect(() => {
     if (page === "diagnostics" && data && !settings)

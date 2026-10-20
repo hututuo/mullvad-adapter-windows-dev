@@ -97,6 +97,7 @@ fn safe_event(value: &LogEvent) -> bool {
                 | "chain_not_configured"
                 | "chain_configuration_invalid"
                 | "chain_write_failed"
+                | "chain_verified_missing"
                 | "chain_configured"
                 | "recovery_retry_scheduled"
                 | "recovery_retry_started"

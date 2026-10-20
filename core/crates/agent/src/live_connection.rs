@@ -30,6 +30,7 @@ struct RouteTrial {
     tested: bool,
     verified_backup: Option<Path>,
     rescue: bool,
+    alternate_used: bool,
 }
 struct Pending {
     ticket: OperationTicket,
@@ -69,6 +70,8 @@ pub(crate) struct Connections {
     forced_route: Option<bool>,
     restore_target: Option<Path>,
     history_save: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    chain_store: Option<adapter_platform::windows_store::PrivateStore>,
+    verified_chain: Option<crate::verified_chain::VerifiedChain>,
 }
 impl Connections {
     pub(crate) fn new(
@@ -105,6 +108,8 @@ impl Connections {
                 forced_route: None,
                 restore_target: None,
                 history_save: None,
+                chain_store: None,
+                verified_chain: None,
             },
             mailbox,
         )
@@ -125,6 +130,11 @@ impl Connections {
     }
     pub(crate) fn restore_history(&mut self, store: adapter_platform::windows_store::PrivateStore) {
         use adapter_platform::storage_record::RecordKind;
+        self.verified_chain = store
+            .load(RecordKind::VerifiedChain)
+            .ok()
+            .and_then(|bytes| crate::verified_chain::VerifiedChain::decode(bytes.expose()).ok());
+        self.chain_store = Some(store.clone());
         if let Ok(bytes) = store.load(RecordKind::RecoveryHistory) {
             self.inlet_trials.restore_history(bytes.expose());
         }
@@ -146,6 +156,53 @@ impl Connections {
     fn save_history(&self) {
         if let (Some(send), Some(bytes)) = (&self.history_save, self.inlet_trials.history_bytes()) {
             let _ = send.try_send(bytes);
+        }
+    }
+    pub(crate) fn verified_at(&self, fingerprint: Option<&str>) -> Option<u64> {
+        self.verified_chain
+            .as_ref()
+            .filter(|v| v.matches(fingerprint))
+            .map(|v| v.at)
+    }
+    pub(crate) fn saved_verified_chain(
+        &self,
+    ) -> Option<Arc<adapter_engine_mihomo::chain::UpstreamSs>> {
+        self.verified_chain.as_ref().map(|v| v.proxy.clone())
+    }
+    pub(crate) fn chain_change_busy(&self) -> bool {
+        self.pending.is_some()
+            || self.route_trial.is_some()
+            || self.recovering.is_some()
+            || self.manual_candidates.is_some()
+            || self.deferred.is_some()
+    }
+    fn record_verified_chain(&mut self, dashboard: &mut Dashboard) {
+        let Some(proxy) = self.chain.clone() else {
+            return;
+        };
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let verified = crate::verified_chain::VerifiedChain { proxy, at };
+        // A tiny atomic encrypted write after promotion, never a network wait
+        // or WG start. Keep the old snapshot if preparing/committing fails.
+        let saved = self.chain_store.as_ref().is_some_and(|store| {
+            verified
+                .encode()
+                .and_then(|bytes| {
+                    store.prepare(
+                        adapter_platform::storage_record::RecordKind::VerifiedChain,
+                        &bytes,
+                    )
+                })
+                .and_then(|write| write.commit())
+                .is_ok()
+        });
+        dashboard.backup_verified_at = Some(at);
+        if saved {
+            self.verified_chain = Some(verified);
+        } else {
+            let _ = self.logs.event("api", "chain_write_failed");
         }
     }
     fn active_negative(
@@ -190,6 +247,11 @@ impl Connections {
             return None;
         }
         if self.route_trial.is_some() {
+            if !canary.alive()
+                && self.advance_trial_inlet(&attempt.path, catalogue, pending.automatic)
+            {
+                return Some(true);
+            }
             return Some(self.trial_failed(owner, dashboard));
         }
         let delay = if !canary.alive() {
@@ -311,6 +373,7 @@ impl Connections {
                 tested: false,
                 verified_backup: None,
                 rescue: false,
+                alternate_used: false,
             });
             if action == A::TestBackup {
                 dashboard.backup_test_id = dashboard.backup_test_id.saturating_add(1);
@@ -352,6 +415,28 @@ impl Connections {
         self.recovering = None;
         self.deferred = None;
         self.next_attempt = Instant::now();
+    }
+    /// Only a fresh measured data failure, after owned cleanup, may spend this
+    /// one extra SS entry. Local/start/cancellation errors must not rotate it.
+    fn advance_trial_inlet(
+        &mut self,
+        path: &Path,
+        catalogue: Option<&adapter_catalogue::Catalogue>,
+        automatic: bool,
+    ) -> bool {
+        if !self
+            .route_trial
+            .as_ref()
+            .is_some_and(|t| !t.restoring && !t.rescue && !t.alternate_used)
+        {
+            return false;
+        }
+        let advanced = self.advance_inlet(path, catalogue, automatic, true);
+        self.save_history();
+        if advanced {
+            self.route_trial.as_mut().unwrap().alternate_used = true;
+        }
+        advanced
     }
     fn trial_failed(&mut self, owner: &mut ResourceOwner, dashboard: &mut Dashboard) -> bool {
         let Some(trial) = self.route_trial.as_mut() else {
@@ -400,13 +485,11 @@ impl Connections {
         dashboard: &mut Dashboard,
         path: &Path,
     ) {
+        if path.transport == "wireguard-over-shadowsocks-chain" {
+            self.record_verified_chain(dashboard);
+        }
         if let Some(trial) = self.route_trial.as_mut() {
             if !trial.restoring && trial.kind == TrialKind::TestBackup {
-                dashboard.backup_verified_at = Some(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_secs()),
-                );
                 trial.tested = true;
                 trial.verified_backup = Some(path.clone());
                 trial.restoring = true;
@@ -465,6 +548,11 @@ impl Connections {
             } else {
                 ("connected", "monitor")
             }
+        } else if dashboard.status == "network_recovering"
+            && dashboard.active_relay.is_some()
+            && self.plan.started.is_none()
+        {
+            ("verifying_original", "original_retry")
         } else if self.plan.started.is_none()
             && dashboard.active_relay.is_none()
             && dashboard.operation.is_none()
@@ -2295,3 +2383,7 @@ mod tests {
         assert!(connections.deferred.is_none() && connections.recovering.is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "live_trial_tests.rs"]
+mod trial_tests;

@@ -18,6 +18,7 @@ pub enum RecordKind {
     ApiAddresses = 7,
     ChainProxy = 8,
     RecoveryHistory = 9,
+    VerifiedChain = 10,
 }
 impl RecordKind {
     pub fn filename(self) -> &'static str {
@@ -31,6 +32,7 @@ impl RecordKind {
             Self::ApiAddresses => "api-addresses.dpapi",
             Self::ChainProxy => "chain-proxy.dpapi",
             Self::RecoveryHistory => "recovery-history.dpapi",
+            Self::VerifiedChain => "verified-chain.dpapi",
         }
     }
 }
@@ -145,6 +147,9 @@ mod tests {
             RecordKind::DeviceDraft,
             RecordKind::IdentityBackup,
             RecordKind::ApiAddresses,
+            RecordKind::ChainProxy,
+            RecordKind::RecoveryHistory,
+            RecordKind::VerifiedChain,
         ] {
             let valid = encode(kind, b"value").unwrap();
             let borrowed = decode(kind, valid.expose()).unwrap();

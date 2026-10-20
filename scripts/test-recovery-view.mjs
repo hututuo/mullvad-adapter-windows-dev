@@ -19,3 +19,13 @@ assert.match(backupResult({...t,backup_test_status:'passed',backup_test_restored
 assert.match(backupResult({...t,backup_test_status:'cancelled'},2),/已停止/);
 assert.match(backupResult({...t,backup_test_status:'failed',backup_test_restored:true},2),/未通过，已恢复/);
 console.log('backup result: exact test id, in-progress, restored, rescue and cancellation PASS');
+
+const {canContinueBackup}=await import('../desktop/src/backup-result.ts');
+const restored={...t,boot_id:'boot',source_sha:'sha',status:'connected',backup_test_status:'failed',backup_test_restored:true,chain_fingerprint:'fp',chain_revision:3,connection:{relay:'r',inlet:'i',chained:false}};
+const fence={boot:'boot',source:'sha',id:2,fingerprint:'fp',revision:3,relay:'r',inlet:'i'};
+assert.equal(canContinueBackup(restored,fence),true);
+for(const patch of [{boot_id:'new'},{source_sha:'new'},{backup_test_id:1},{backup_test_status:'passed'},{backup_test_status:'cancelled'},{backup_test_restored:false},{chain_fingerprint:'new'},{chain_revision:4},{operation:'connect'},{status:'retry_wait'},{physical_attachment:'unknown'},{settings:{...restored.settings,chain_selection:'pinned'}},{connection:{...restored.connection,chained:true}},{connection:{...restored.connection,inlet:'other'}},{connection:{...restored.connection,relay:'other'}}]) {
+  assert.equal(canContinueBackup({...restored,...patch},fence),false,JSON.stringify(patch));
+}
+assert.equal(recoveryView({...d,status:'network_recovering',active_relay:'r',recovery:{...d.recovery,stage:'verifying_original'}},false).title,'正在复验原路径');
+console.log('backup continuation: exact candidate, restored path, boot, source, cancellation, network and manual-pin fences PASS');

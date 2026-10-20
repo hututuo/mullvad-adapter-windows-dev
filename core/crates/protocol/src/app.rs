@@ -167,6 +167,8 @@ pub enum AppCommand {
     ConfigureChain {
         proxy: SecretText,
     },
+    /// Restore only the separately protected, whole-tunnel-verified snapshot.
+    RestoreVerifiedChain,
     Relays {
         city: Option<String>,
         page: u16,

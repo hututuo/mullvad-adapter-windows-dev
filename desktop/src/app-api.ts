@@ -115,6 +115,7 @@ export type Command =
       kind:
         | "dashboard"
         | "refresh_catalogue"
+        | "restore_verified_chain"
         | "connect"
         | "disconnect"
         | "cancel_operation"
@@ -222,6 +223,7 @@ const errors: Record<string, string> = {
   chain_not_configured: "正在从本机 Clash 准备备用；也可以点“测试备用路线”自动检查。",
   chain_configuration_invalid: "本机链式节点配置无法核验，请重新从 Clash 选择。",
   chain_write_failed: "链式节点未能安全保存，请重试；现有连接保持运行。",
+  chain_verified_missing: "还没有完整测试通过的备用路线。",
   disconnect_before_chain_change: "当前链式连接仍使用原节点。请先断开，再更换链式节点；不会在后台替换原路径。",
   clash_not_found: "尚未找到唯一的本机 Clash 配置，请先在 Clash 接入页确认。",
   bootstrap_unavailable: "本地外网代理不可用，请检查指定端口。",

@@ -184,11 +184,26 @@ fn api_worker(
                         WorkCommand::Api(command) => command,
                     };
                     let command = match command {
-                        AppCommand::ConfigureChain { proxy } => {
-                            let proxy = proxy.into_value();
-                            let parsed =
+                        command @ (AppCommand::ConfigureChain { .. }
+                        | AppCommand::RestoreVerifiedChain) => {
+                            let parsed = if let AppCommand::ConfigureChain { proxy } = command {
+                                let proxy = proxy.into_value();
                                 adapter_engine_mihomo::chain::UpstreamSs::decode(proxy.as_bytes())
+                                    .map_err(|_| "chain_configuration_invalid")?
+                            } else {
+                                let saved = store
+                                    .load(RecordKind::VerifiedChain)
+                                    .map_err(|_| "chain_verified_missing")?;
+                                let verified =
+                                    crate::verified_chain::VerifiedChain::decode(saved.expose())
+                                        .map_err(|_| "chain_configuration_invalid")?;
+                                let encoded = verified
+                                    .proxy
+                                    .encode()
                                     .map_err(|_| "chain_configuration_invalid")?;
+                                adapter_engine_mihomo::chain::UpstreamSs::decode(&encoded)
+                                    .map_err(|_| "chain_configuration_invalid")?
+                            };
                             let encoded =
                                 parsed.encode().map_err(|_| "chain_configuration_invalid")?;
                             store
@@ -681,6 +696,20 @@ pub fn serve(scope: &str) -> io::Result<()> {
     let (mut connections, tunnel_mailbox) =
         crate::live_connection::Connections::new(root.path().to_owned(), logs.clone());
     connections.restore_history(store.clone());
+    // A crashed/cancelled candidate test must not replace the last whole-route
+    // success on the next boot. An explicit manual pin still owns its choice.
+    let saved_chain = if dashboard.settings.chain_selection.is_none() {
+        connections.saved_verified_chain()
+    } else {
+        None
+    };
+    if let Some(verified) = saved_chain {
+        if let Ok(encoded) = verified.encode() {
+            let _ = store
+                .prepare(RecordKind::ChainProxy, &encoded)
+                .and_then(|p| p.commit());
+        }
+    }
     match store.load(RecordKind::ChainProxy) {
         Ok(bytes) => match adapter_engine_mihomo::chain::UpstreamSs::decode(bytes.expose()) {
             Ok(chain) => {
@@ -692,6 +721,8 @@ pub fn serve(scope: &str) -> io::Result<()> {
                         .map(|bytes| format!("{:x}", Sha256::digest(&bytes)));
                 }
                 dashboard.chain_node = Some(chain.name().into());
+                dashboard.backup_verified_at =
+                    connections.verified_at(dashboard.chain_fingerprint.as_deref());
                 connections.set_chain(Some(std::sync::Arc::new(chain)));
             }
             Err(_) => dashboard.last_error = Some("chain_configuration_invalid".into()),
@@ -994,11 +1025,12 @@ pub fn serve(scope: &str) -> io::Result<()> {
                                 .ok()
                                 .map(|bytes| format!("{:x}", Sha256::digest(&bytes)));
                             if fingerprint != dashboard.chain_fingerprint {
-                                dashboard.backup_verified_at = None;
                                 dashboard.backup_test_status = None;
                                 dashboard.backup_test_restored = false;
                             }
                             dashboard.chain_fingerprint = fingerprint;
+                            dashboard.backup_verified_at =
+                                connections.verified_at(dashboard.chain_fingerprint.as_deref());
                         }
                         dashboard.chain_revision = dashboard.chain_revision.saturating_add(1);
                         dashboard.chain_node = Some(chain.name().into());
@@ -1316,8 +1348,8 @@ pub fn serve(scope: &str) -> io::Result<()> {
                         {
                             failure("disconnect_before_identity_change")
                         }
-                        AppCommand::ConfigureChain { .. }
-                            if connections.busy()
+                        AppCommand::ConfigureChain { .. } | AppCommand::RestoreVerifiedChain
+                            if connections.chain_change_busy()
                                 || owner.state().path.as_ref().is_some_and(|p| {
                                     p.transport == "wireguard-over-shadowsocks-chain"
                                 }) =>
@@ -1584,7 +1616,8 @@ pub fn serve(scope: &str) -> io::Result<()> {
                                     AppCommand::AccountLogin { .. } => "account_login",
                                     AppCommand::AccountRefresh => "account_refresh",
                                     AppCommand::AccountLogout => "account_logout",
-                                    AppCommand::ConfigureChain { .. } => "chain_configure",
+                                    AppCommand::ConfigureChain { .. }
+                                    | AppCommand::RestoreVerifiedChain => "chain_configure",
                                     AppCommand::RemoveDevice { .. } => "device_remove",
                                     AppCommand::CreateDevice { .. } => "device_create",
                                     AppCommand::UseCreatedDevice { .. } => "device_activate",
