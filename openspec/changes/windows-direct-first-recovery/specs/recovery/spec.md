@@ -20,7 +20,7 @@ THEN try at most four other relays in the selected city, at most two direct inle
 each. Direct and chain use one immutable, bounded relay set for that round.
 No new attempt starts beyond the 300-second round budget. An in-flight attempt
 has its existing 90-second hard ceiling plus confirmed-cleanup time. These are
-ceilings, not a promise to reconnect within 180 seconds. Local/stale retries and
+ceilings, not a promise of recovery latency. Local/stale retries and
 metadata refresh cannot renew the round or manufacture endpoint failures.
 
 ## DF-03 Chain last and serial return
@@ -29,6 +29,10 @@ saved independent SS node as the final chain phase. Elapsed time alone does not
 authorize skipping direct paths. Each relay has at most two chain inlets.
 WHEN Auto is connected through chain, THEN schedule a serial direct trial after
 120 seconds; failures restore the exact prior chain and back off 5/15/30 minutes.
+WHEN a new chain is promoted after a natural recovery and the previous direct
+trial deadline has already elapsed, THEN renew that deadline from this promotion
+using the current backoff. Preserve both the failure count and any still-future
+deadline; do not immediately interrupt the newly restored chain for an old timer.
 Never have two WG tunnels using the same identity. Forced Chain mode is retained.
 Manual disconnect cancels pending recovery and direct-return intent.
 
@@ -48,6 +52,9 @@ Expose current phase, actual target relay/inlet, attempts, elapsed/start budget,
 wait and next action on the city page. Offer retry-current, a new same-city round,
 chain fallback, direct return and stop. In-flight/preempted attempts cannot be
 silently replaced. Fixed-height feedback must avoid banner-driven layout jumps.
+Fresh failure logs must not reuse a previous successful batch's detailed probe
+outcomes. Only details from the same measurement may accompany its canary values;
+manual preemption of background maintenance must remain an exportable event.
 
 ### Requirement: automatic backup qualification does not starve later regions
 

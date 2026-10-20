@@ -1048,12 +1048,24 @@ impl Connections {
         phase: &str,
         canary: Option<adapter_domain::Canary>,
     ) {
+        self.record_with_probes(dashboard, code, phase, canary, None);
+    }
+    fn record_with_probes(
+        &self,
+        dashboard: &mut Dashboard,
+        code: &str,
+        phase: &str,
+        canary: Option<adapter_domain::Canary>,
+        probes: Option<adapter_protocol::app::ProbeMeasurements>,
+    ) {
         if let Some(info) = &mut dashboard.connection {
             info.phase = phase.into();
             if let Some(canary) = canary {
                 info.ip = Some(canary.ip);
                 info.dns = Some(canary.dns);
                 info.https = Some(canary.https);
+                // A bare canary is a new observation, not the previous batch.
+                info.probes = probes;
             } else if phase == "starting" || phase == "failed" {
                 info.ip = None;
                 info.dns = None;
@@ -1084,14 +1096,17 @@ impl Connections {
             }
         }
         let measured = proof.report().outcomes();
-        if let Some(info) = &mut dashboard.connection {
-            info.probes = Some(ProbeMeasurements {
+        self.record_with_probes(
+            dashboard,
+            code,
+            "connected",
+            proof.fresh_canary(),
+            Some(ProbeMeasurements {
                 ip: outcome(measured.ip),
                 dns: outcome(measured.dns),
                 https: outcome(measured.hostname),
-            });
-        }
-        self.record(dashboard, code, "connected", proof.fresh_canary());
+            }),
+        );
     }
     fn abort(&mut self, owner: &ResourceOwner, code: &'static str, dashboard: &mut Dashboard) {
         self.abort_with_canary(owner, code, dashboard, None);

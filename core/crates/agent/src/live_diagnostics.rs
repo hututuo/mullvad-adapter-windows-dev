@@ -164,6 +164,7 @@ fn safe_event(value: &LogEvent) -> bool {
                 | "identity_store_readback_mismatch"
                 | "random_unavailable"
                 | "maintenance_started"
+                | "maintenance_preempted"
                 | "maintenance_complete"
                 | "maintenance_cancelled"
         )
@@ -423,6 +424,7 @@ mod tests {
             ("connection", "active_binding_changed"),
             ("connection", "active_local_rebuild"),
             ("connection", "active_data_failed"),
+            ("connection", "maintenance_preempted"),
             ("connection", "same_relay_inlet_retry"),
             ("connection", "shadowsocks_inlets_exhausted"),
         ] {
@@ -496,6 +498,7 @@ mod tests {
             "route_trial_failed",
             "route_trial_failed_restore_previous",
             "restore_previous_failed_use_verified_backup",
+            "maintenance_preempted",
         ];
         for code in transitions {
             logs.event("connection", code).unwrap();

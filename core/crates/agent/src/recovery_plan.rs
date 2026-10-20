@@ -99,7 +99,9 @@ impl DirectReturn {
         *self = Self::default();
     }
     pub(crate) fn connected(&mut self, now: Instant) {
-        if self.due.is_none() {
+        // A newly restored chain needs a stable window before another trial.
+        // Preserve an outstanding future retry and the accumulated backoff.
+        if self.due.is_none_or(|at| now >= at) {
             self.due = Some(now + Duration::from_secs([120, 300, 900, 1800][self.failures.min(3)]));
         }
     }
@@ -176,5 +178,25 @@ mod tests {
         assert_eq!(p.remaining(now), Some(300));
         p.clear();
         assert!(!p.due(now + Duration::from_secs(3600)));
+    }
+    #[test]
+    fn restored_chain_refreshes_expired_return_intent_without_resetting_backoff() {
+        let now = Instant::now();
+        let mut p = DirectReturn::default();
+        p.connected(now);
+        let restored = now + Duration::from_secs(140);
+        assert!(p.due(restored));
+        p.connected(restored);
+        assert_eq!(p.remaining(restored), Some(120));
+        assert!(!p.due(restored));
+
+        p.failed(restored);
+        p.connected(restored + Duration::from_secs(20));
+        assert_eq!(p.remaining(restored), Some(300));
+        let restored_late = restored + Duration::from_secs(350);
+        p.connected(restored_late);
+        assert_eq!(p.remaining(restored_late), Some(300));
+        p.failed(restored_late);
+        assert_eq!(p.remaining(restored_late), Some(900));
     }
 }

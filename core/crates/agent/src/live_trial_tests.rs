@@ -145,6 +145,94 @@ fn kinds() -> [(TrialKind, &'static str); 3] {
 }
 
 #[test]
+fn fresh_negative_after_success_remains_loggable_without_old_probe_outcomes() {
+    use adapter_domain::Canary;
+    use adapter_protocol::app::{ProbeMeasurements, ProbeOutcome};
+    let mut f = fixture(TrialKind::TestBackup);
+    f.dashboard.connection = Some(ConnectionInfo {
+        chained: false,
+        relay: f.path.relay.clone(),
+        city: f.path.city.clone(),
+        inlet: f.path.inlet.clone(),
+        interface_index: 5,
+        instance: f.path.instance,
+        phase: "connected".into(),
+        ip: Some(true),
+        dns: Some(true),
+        https: Some(true),
+        probes: Some(ProbeMeasurements {
+            ip: ProbeOutcome::Passed,
+            dns: ProbeOutcome::Passed,
+            https: ProbeOutcome::Passed,
+        }),
+    });
+    f.connections.record(
+        &mut f.dashboard,
+        "active_data_failed",
+        "failed",
+        Some(Canary {
+            ip: false,
+            dns: false,
+            https: false,
+        }),
+    );
+    let negative = f.dashboard.connection.as_ref().unwrap();
+    assert!(
+        negative.valid(),
+        "fresh negative must survive log validation"
+    );
+    assert_eq!(negative.ip, Some(false));
+    assert!(
+        negative.probes.is_none(),
+        "old passed batch is not current evidence"
+    );
+
+    f.connections.record_with_probes(
+        &mut f.dashboard,
+        "degraded_preserved",
+        "connected",
+        Some(Canary {
+            ip: true,
+            dns: false,
+            https: false,
+        }),
+        Some(ProbeMeasurements {
+            ip: ProbeOutcome::Passed,
+            dns: ProbeOutcome::Timeout,
+            https: ProbeOutcome::NotRunDnsFailed,
+        }),
+    );
+    let measured = f.dashboard.connection.as_ref().unwrap();
+    assert!(measured.valid());
+    assert!(matches!(
+        measured.probes.as_ref().unwrap().dns,
+        ProbeOutcome::Timeout
+    ));
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let text = std::fs::read_to_string(f._root.0.join("events.jsonl")).unwrap_or_default();
+        let rows: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        if rows.len() == 2 {
+            assert_eq!(rows[0]["code"], "active_data_failed");
+            assert!(rows[0]["connection"].get("probes").is_none());
+            assert_eq!(rows[1]["connection"]["probes"]["dns"], "timeout");
+            assert!(!f.connections.logs.fault.load(Ordering::Acquire));
+            assert_eq!(f.connections.logs.dropped.load(Ordering::Acquire), 0);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fresh failure and next measured batch must reach disk"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
 fn each_trial_schedules_only_one_other_authorized_ss_without_replacing_its_intent() {
     for (kind, label) in kinds() {
         let mut f = fixture(kind);
