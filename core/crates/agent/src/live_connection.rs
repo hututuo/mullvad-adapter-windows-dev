@@ -16,6 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 use zeroize::Zeroizing;
+const HEALTHY_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, PartialEq)]
 enum TrialKind {
@@ -47,6 +48,8 @@ pub(crate) struct Connections {
     events: connection_tunnel::Events,
     root: PathBuf,
     pending: Option<Pending>,
+    held_reply: Option<Reply>,
+    parameter_wait_since: Option<Instant>,
     next_instance: u64,
     next_health: Instant,
     local_probe_failures: u8,
@@ -85,6 +88,8 @@ impl Connections {
                 events,
                 root,
                 pending: None,
+                held_reply: None,
+                parameter_wait_since: None,
                 next_instance: 0,
                 next_health: Instant::now(),
                 local_probe_failures: 0,
@@ -1411,7 +1416,26 @@ impl Connections {
                 // worker survives cancellation; wait for the probe reply to drain.
             }
         }
-        while let Some(reply) = self.events.poll() {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|p| !p.aborting && owner.is_operation_current(&p.ticket))
+            && owner.observation().parameter_check_pending()
+        {
+            let since = self.parameter_wait_since.get_or_insert_with(Instant::now);
+            if since.elapsed() < Duration::from_secs(2) {
+                // Hold replies, not the owner or data plane, while local fields
+                // are classified. Never renew a measurement's freshness budget.
+                return;
+            }
+            owner.cancel_current_operation();
+            if self.pending.as_ref().is_some_and(|p| p.attempt.is_some()) {
+                self.abort(owner, "candidate_evidence_stale", dashboard);
+            }
+        } else {
+            self.parameter_wait_since = None;
+        }
+        while let Some(reply) = self.held_reply.take().or_else(|| self.events.poll()) {
             if let Reply::Lost { instance } = reply {
                 if owner
                     .state()
@@ -1457,6 +1481,25 @@ impl Connections {
             if p.aborting && !matches!(reply, Reply::Stopped { .. }) {
                 continue;
             }
+            if !p.aborting
+                && owner.is_operation_current(&p.ticket)
+                && owner.observation().parameter_check_pending()
+                && matches!(
+                    reply,
+                    Reply::Prepared { .. }
+                        | Reply::Promoted { .. }
+                        | Reply::Verified { .. }
+                        | Reply::Unready { .. }
+                        | Reply::ActiveUnready { .. }
+                )
+            {
+                let since = self.parameter_wait_since.get_or_insert_with(Instant::now);
+                if since.elapsed() < Duration::from_secs(2) {
+                    self.held_reply = Some(reply);
+                    return;
+                }
+                owner.cancel_current_operation();
+            }
             match reply {
                 Reply::Prepared { proof, .. } => {
                     let aborting = p.aborting;
@@ -1465,6 +1508,11 @@ impl Connections {
                     } else {
                         owner.validate_operation_measurement(&p.ticket, &*proof)
                     };
+                    if matches!(checked, Err(adapter_control::candidate_evidence::SelectionCheckError::PendingNetwork)) {
+                        self.held_reply = Some(Reply::Prepared { id, proof });
+                        self.parameter_wait_since.get_or_insert_with(Instant::now);
+                        return;
+                    }
                     if p.aborting || checked.is_err() {
                         if matches!(
                             checked,
@@ -1524,6 +1572,11 @@ impl Connections {
                     } else {
                         owner.validate_operation_measurement(&p.ticket, &*proof)
                     };
+                    if matches!(checked, Err(adapter_control::candidate_evidence::SelectionCheckError::PendingNetwork)) {
+                        self.held_reply = Some(Reply::Promoted { id, proof });
+                        self.parameter_wait_since.get_or_insert_with(Instant::now);
+                        return;
+                    }
                     let evidence_stale = matches!(
                         checked,
                         Err(adapter_control::candidate_evidence::SelectionCheckError::Stale)
@@ -1608,7 +1661,7 @@ impl Connections {
                     self.deferred = None;
                     self.plan.clear();
                     self.trial_connected(owner, dashboard, &path);
-                    self.next_health = Instant::now() + Duration::from_secs(15);
+                    self.next_health = Instant::now() + HEALTHY_INTERVAL;
                 }
                 Reply::Verified { proof, .. } => {
                     if !owner.is_operation_current(&p.ticket) {
@@ -1689,7 +1742,7 @@ impl Connections {
                             }
                             .into()
                         });
-                        self.next_health = Instant::now() + Duration::from_secs(15);
+                        self.next_health = Instant::now() + HEALTHY_INTERVAL;
                     } else {
                         // Recovery may be disabled or unavailable (e.g. no
                         // catalogue). Never keep an expired timer and enqueue

@@ -469,11 +469,21 @@ impl Worker {
     }
     /// Revalidate the still-owned carrier before selector or durable commit.
     pub fn verify_bound_report(&self, report: &BoundReport) -> bool {
-        report.observed.elapsed() < Duration::from_secs(2)
-            && self.carrier.as_ref().is_some_and(|c| {
-                c.instance() == report.carrier_instance && c.verify(report.window).is_ok()
-            })
-            && self.is_running()
+        self.verify_bound_report_on(report, &self.network)
+    }
+    pub fn verify_bound_report_on(&self, report: &BoundReport, operation: &BoundNetwork) -> bool {
+        operation.binding() == self.network.binding()
+            && operation.cancellation_monitor().check_after_parameters(
+                report.observed + Duration::from_secs(2),
+                || {
+                    report.observed.elapsed() < Duration::from_secs(2)
+                        && self.carrier.as_ref().is_some_and(|c| {
+                            c.instance() == report.carrier_instance
+                                && c.verify(report.window).is_ok()
+                        })
+                        && self.is_running()
+                },
+            )
     }
     /// Verify an already selected process using a NEW call-level operation.
     /// An expired startup guard must not kill the selected data plane or be

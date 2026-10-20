@@ -16,3 +16,11 @@ WHEN official TLS discovery succeeds, THEN persist a bounded validated address l
 
 ## NS-5 Classify health failures
 WHEN IP or HTTPS still succeeds but DNS or a service check fails, THEN preserve the original path with degradation. Local probe errors or stale evidence do not prove a bad relay. Recheck locally; repeated local failure may rebuild the original path, but must not fabricate negative canary evidence or consume another city candidate. Fresh all-data failure may start original-path recovery. Physical binding change requires rebinding the original path. An expired negative candidate result is retried on the same relay within the original budget.
+
+## NS-8 Classify interface parameters without cancelling healthy work
+WHEN a valid interface-parameter notification arrives, THEN keep the selected data plane and existing measurement, while blocking new bound operations and adoption of positive or negative results until the single sampling worker has reread complete interface parameters. Only interface Metric may differ without invalidating continuity; address/route/add/delete/invalid-key notifications, other parameter differences, errors and expired physical evidence retain the hard invalidation path. Compare explicit complete fields, not callback payloads or struct padding.
+
+Classification of an older batch cannot release a newer notification. Waiting cannot extend proof freshness or exceed two seconds. A late notification during witness validation, mailbox consumption, persistence or selector work requires another publication check against the same absolute proof deadline. Cancellation and stop receipts remain drainable. No notification is Internet-readiness evidence; constrained route, source, same-socket and actual canary proofs remain required. Sampling cannot establish the history of a link flap that occurred and reverted between reads.
+
+## NS-9 Quiet healthy monitoring
+WHEN a connection passes its health assessment, THEN keep the connected presentation and schedule its next normal full check about 30 seconds after completion. Preserve the two-second confirmation after a first fresh data-plane failure, and existing separate local-error/recovery backoff. A parameter-only hint must not trigger a full tunnel check or a new retry round.

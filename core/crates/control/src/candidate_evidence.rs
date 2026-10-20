@@ -19,6 +19,7 @@ pub trait ReadinessEvidence: MeasuredEvidence {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectionCheckError {
     Stale,
+    PendingNetwork,
     NotReady(adapter_domain::Readiness),
     UnsupportedProtection,
 }

@@ -52,6 +52,23 @@ impl BoundCancellation {
         }
         self.cancel.is_cancelled()
     }
+    /// I/O-worker publication fence only; never wait on the responsive owner.
+    /// Parameter classification cannot extend the existing proof deadline.
+    pub fn wait_for_parameter_check(&self, deadline: Instant) -> bool {
+        let deadline = deadline.min(Instant::now() + Duration::from_secs(2));
+        while self.hint.parameters_pending() {
+            if self.is_cancelled() || Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        !self.is_cancelled() && Instant::now() < deadline
+    }
+    pub fn check_after_parameters(&self, deadline: Instant, check: impl FnOnce() -> bool) -> bool {
+        self.wait_for_parameter_check(deadline)
+            && check()
+            && self.wait_for_parameter_check(deadline)
+    }
 }
 impl BoundNetwork {
     /// A short SS-only auxiliary probe may share a physical attachment, without
@@ -283,7 +300,12 @@ impl ResourceOwner {
             })
             .ok_or_else(|| io::Error::other("persistent aggregate unavailable"))?;
         let _ = active;
-        if self.operation.is_some() || self.failed || worker_instance == 0 || self.state().paused {
+        if self.operation.is_some()
+            || self.failed
+            || worker_instance == 0
+            || self.state().paused
+            || self.observation.parameter_check_pending()
+        {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "operation unavailable",
@@ -449,6 +471,9 @@ impl ResourceOwner {
         if !self.is_operation_current(ticket) {
             return Err(SelectionCheckError::Stale);
         }
+        if self.observation.parameter_check_pending() {
+            return Err(SelectionCheckError::PendingNetwork);
+        }
         let operation = self.operation.as_ref().ok_or(SelectionCheckError::Stale)?;
         let attempt = operation
             .attempt
@@ -486,6 +511,9 @@ impl ResourceOwner {
         if !self.is_operation_current(ticket) {
             return Err(SelectionCheckError::Stale);
         }
+        if self.observation.parameter_check_pending() {
+            return Err(SelectionCheckError::PendingNetwork);
+        }
         Ok((observed_at, canary))
     }
     pub fn now(&self) -> u64 {
@@ -503,9 +531,13 @@ impl ResourceOwner {
         &mut self,
         build: impl FnOnce(Cancellation) -> Result<BuildOutcome<R>, Failure> + Send + 'static,
     ) -> io::Result<u64> {
-        let binding = self.observation.binding_evidence().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::WouldBlock, "fresh physical binding required")
-        })?;
+        let binding = self
+            .observation
+            .binding_evidence()
+            .filter(|_| !self.observation.parameter_check_pending())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::WouldBlock, "fresh physical binding required")
+            })?;
         self.start_inner(build, Some(binding), None, false)
     }
     /// The selected identity must belong to this owner observation. The worker
@@ -575,6 +607,7 @@ impl ResourceOwner {
             .observation
             .binding_evidence()
             .filter(|e| e.bindings.contains(&binding))
+            .filter(|_| !self.observation.parameter_check_pending())
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -728,6 +761,9 @@ impl ResourceOwner {
         if !self.candidate_evidence_is_current(evidence) {
             return Err(SelectionCheckError::Stale);
         }
+        if self.observation.parameter_check_pending() {
+            return Err(SelectionCheckError::PendingNetwork);
+        }
         // A plain canary cannot certify negotiated PQ or an owned multihop graph.
         // Those Windows commit transactions are not implemented yet.
         if self.state().protection.post_quantum
@@ -740,6 +776,9 @@ impl ResourceOwner {
             .value
             .fresh_canary()
             .ok_or(SelectionCheckError::Stale)?;
+        if self.observation.parameter_check_pending() {
+            return Err(SelectionCheckError::PendingNetwork);
+        }
         if !self.candidate_evidence_is_current(evidence) {
             return Err(SelectionCheckError::Stale);
         }
@@ -1618,6 +1657,110 @@ mod tests {
             .unwrap();
         assert_eq!(next(owner), Event::Ready(id));
         stopped
+    }
+    #[test]
+    fn parameter_classification_gates_publication_without_cancelling_the_operation() {
+        use crate::candidate_evidence::SelectionCheckError;
+        let (mut owner, binding, attempt, _) = candidate_owner();
+        let stopped = persistent_fixture(&mut owner);
+        let (ticket, network) = owner.begin_operation(binding, 2, Some(&attempt)).unwrap();
+        let evidence = FullCanary(
+            Instant::now(),
+            Some(adapter_domain::Canary {
+                ip: true,
+                dns: true,
+                https: true,
+            }),
+        );
+        let hint = owner.observation.change_hint();
+        let revision = hint.parameter_for_test();
+        assert!(owner.is_operation_current(&ticket));
+        assert!(!network.is_cancelled());
+        assert_eq!(
+            owner.validate_operation_measurement(&ticket, &evidence),
+            Err(SelectionCheckError::PendingNetwork)
+        );
+        hint.checked_for_test(revision);
+        assert!(owner
+            .validate_operation_measurement(&ticket, &evidence)
+            .is_ok());
+        assert!(!network.is_cancelled());
+        hint.parameter_for_test();
+        owner.finish_operation(&ticket);
+        assert_eq!(
+            owner
+                .begin_operation(binding, 3, Some(&attempt))
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        hint.notify();
+        assert_eq!(
+            owner.validate_operation_measurement(&ticket, &evidence),
+            Err(SelectionCheckError::Stale)
+        );
+        owner.cancel();
+        next(&mut owner);
+        stopped.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+    #[test]
+    fn parameter_publication_wait_is_bounded_and_hard_changes_still_cancel() {
+        let (mut owner, binding, attempt, _) = candidate_owner();
+        let stopped = persistent_fixture(&mut owner);
+        let (ticket, network) = owner.begin_operation(binding, 2, Some(&attempt)).unwrap();
+        let hint = owner.observation.change_hint();
+        let revision = hint.parameter_for_test();
+        let monitor = network.cancellation_monitor();
+        assert!(!monitor.wait_for_parameter_check(Instant::now() + Duration::from_millis(10)));
+        assert!(
+            !monitor.is_cancelled(),
+            "local classification timeout invented a network cancellation"
+        );
+        let checking = hint.clone();
+        let done = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            checking.checked_for_test(revision);
+        });
+        assert!(monitor.wait_for_parameter_check(Instant::now() + Duration::from_secs(1)));
+        done.join().unwrap();
+        hint.parameter_for_test();
+        hint.notify();
+        assert!(!monitor.wait_for_parameter_check(Instant::now() + Duration::from_secs(1)));
+        assert!(monitor.is_cancelled());
+        owner.finish_operation(&ticket);
+        owner.cancel();
+        next(&mut owner);
+        stopped.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+    #[test]
+    fn a_parameter_hint_during_witness_validation_cannot_publish_early() {
+        let (mut owner, binding, attempt, _) = candidate_owner();
+        let stopped = persistent_fixture(&mut owner);
+        let (ticket, network) = owner.begin_operation(binding, 2, Some(&attempt)).unwrap();
+        let hint = owner.observation.change_hint();
+        let monitor = network.cancellation_monitor();
+        assert!(!monitor.check_after_parameters(
+            Instant::now() + Duration::from_millis(15),
+            || {
+                hint.parameter_for_test();
+                true
+            }
+        ));
+        assert!(!monitor.is_cancelled());
+        hint.checked_for_test(1);
+        assert!(monitor.check_after_parameters(Instant::now() + Duration::from_secs(1), || true));
+        assert!(
+            !monitor.check_after_parameters(Instant::now() + Duration::from_secs(1), || {
+                hint.notify();
+                true
+            })
+        );
+        assert!(monitor.is_cancelled());
+        owner.finish_operation(&ticket);
+        owner.cancel();
+        next(&mut owner);
+        stopped.recv_timeout(Duration::from_secs(1)).unwrap();
     }
     #[test]
     fn persistent_aggregate_starts_offline_and_survives_generation_until_explicit_stop() {

@@ -12,5 +12,9 @@
 - [ ] Native Windows new-source runtime/API/Clash and full installer acceptance.
 - [ ] Alternative TCP transport implementation and original Wi-Fi acceptance (requires that network; not implied by SS/UDP hotspot success).
 
+- [x] NS-8 parameter-hint classification, pending publication fences and same-ticket/late-hint/local-timeout regressions; scoped local control/platform tests and Windows API typecheck.
+- [x] NS-9 healthy check interval 30 seconds, preserving first-negative confirmation and independent error backoffs.
+- [ ] NS-8/9 native Windows CI, exact candidate packaging and separately authorized installed-runtime observation. Synthetic events do not prove sustained original-network stability.
+
 - [x] NS-7 bounded metadata-authorized same-relay SS inlet alternatives before changing relay, preserving exact original rebuild, existing round budget, serial peer ownership and negative-evidence fences.
 - [ ] NS-7 real Windows new-candidate inlet fallback and installation acceptance (component/runtime evidence from older source does not satisfy this).

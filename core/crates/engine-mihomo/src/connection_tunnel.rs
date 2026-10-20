@@ -6,6 +6,7 @@ use crate::{
     worker_lifecycle::{Assessment, BoundReport, UnreadyReport, Worker, WorkerRequest},
     Identity, Listener, Protection, Transport,
 };
+use adapter_control::candidate_evidence::ReadinessEvidence;
 use adapter_control::owned_lifecycle::{BoundCancellation, BoundNetwork, Failure};
 use adapter_platform::{
     storage_record::RecordKind, windows_runtime::PrivateRuntime, windows_store::PrivateStore,
@@ -291,6 +292,9 @@ impl Manager {
                             .is_ok()
                     },
                     || {
+                        if !held.worker.verify_bound_report(&proof) {
+                            return false;
+                        }
                         let stored = (|| -> std::io::Result<()> {
                             self.store
                                 .prepare(RecordKind::Connection, &held.policy)?
@@ -305,6 +309,9 @@ impl Manager {
                             && held.worker.verify_bound_report(&proof)
                     },
                     || {
+                        if !held.worker.verify_bound_report(&proof) {
+                            return false;
+                        }
                         let _ = front.controller().select(held.slot);
                         !held.monitor.is_cancelled()
                             && held.worker.verify_bound_report(&proof)
@@ -360,22 +367,39 @@ impl Manager {
                         id,
                         code: "active_probe_local_failure",
                     }),
-                    Ok(Assessment::Bound(proof))
-                        if !network.is_cancelled() && held.worker.verify_bound_report(&proof) =>
-                    {
+                    Ok(Assessment::Bound(proof)) => {
+                        if !held.worker.verify_bound_report_on(&proof, &network) {
+                            return Ok(Reply::Failed {
+                                id,
+                                code: active_proof_failure(
+                                    network.is_cancelled(),
+                                    proof.fresh_canary().is_some(),
+                                ),
+                            });
+                        }
                         // Healthy backend, broken local selector: repair only
                         // the front. Never rebuild WG or consume an SS here.
                         if front.controller().selected().ok() != Some(held.slot) {
-                            if network.is_cancelled() {
+                            if !held.worker.verify_bound_report_on(&proof, &network) {
                                 return Ok(Reply::Failed {
                                     id,
-                                    code: "active_probe_cancelled",
+                                    code: active_proof_failure(
+                                        network.is_cancelled(),
+                                        proof.fresh_canary().is_some(),
+                                    ),
                                 });
                             }
                             let _ = front.controller().select(held.slot);
-                            if network.is_cancelled()
-                                || front.controller().selected().ok() != Some(held.slot)
-                            {
+                            if !held.worker.verify_bound_report_on(&proof, &network) {
+                                return Ok(Reply::Failed {
+                                    id,
+                                    code: active_proof_failure(
+                                        network.is_cancelled(),
+                                        proof.fresh_canary().is_some(),
+                                    ),
+                                });
+                            }
+                            if front.controller().selected().ok() != Some(held.slot) {
                                 return Ok(Reply::Failed {
                                     id,
                                     code: "active_front_repair_failed",
@@ -387,15 +411,51 @@ impl Manager {
                             proof: Arc::new(proof),
                         })
                     }
-                    Ok(Assessment::Unready(proof)) if !network.is_cancelled() => {
-                        Ok(Reply::ActiveUnready { id, proof })
+                    Ok(Assessment::Unready(proof)) => {
+                        if network.is_cancelled() {
+                            Ok(Reply::Failed {
+                                id,
+                                code: "active_probe_cancelled",
+                            })
+                        } else {
+                            Ok(Reply::ActiveUnready { id, proof })
+                        }
                     }
-                    _ => Ok(Reply::Failed {
-                        id,
-                        code: "active_probe_local_failure",
-                    }),
                 }
             }
         }
+    }
+}
+
+fn active_proof_failure(cancelled: bool, evidence_fresh: bool) -> &'static str {
+    if cancelled {
+        "active_probe_cancelled"
+    } else if !evidence_fresh {
+        "active_evidence_stale"
+    } else {
+        "active_probe_local_failure"
+    }
+}
+
+#[cfg(test)]
+mod classification_tests {
+    #[test]
+    fn expired_publication_after_parameter_wait_is_not_a_local_failure() {
+        assert_eq!(
+            super::active_proof_failure(false, false),
+            "active_evidence_stale"
+        );
+        assert_eq!(
+            super::active_proof_failure(true, false),
+            "active_probe_cancelled"
+        );
+        assert_eq!(
+            super::active_proof_failure(true, true),
+            "active_probe_cancelled"
+        );
+        assert_eq!(
+            super::active_proof_failure(false, true),
+            "active_probe_local_failure"
+        );
     }
 }

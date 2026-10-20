@@ -21,19 +21,44 @@ fn unknown() -> Observation {
     }
 }
 #[derive(Clone)]
-pub struct ChangeHint(Arc<AtomicU64>);
+pub struct ChangeHint {
+    revision: Arc<AtomicU64>,
+    parameters: Arc<AtomicU64>,
+    checked_parameters: Arc<AtomicU64>,
+}
 impl ChangeHint {
+    fn new() -> Self {
+        Self {
+            revision: Arc::new(AtomicU64::new(0)),
+            parameters: Arc::new(AtomicU64::new(0)),
+            checked_parameters: Arc::new(AtomicU64::new(0)),
+        }
+    }
     pub(crate) fn revision(&self) -> u64 {
-        self.0.load(Ordering::Acquire)
+        self.revision.load(Ordering::Acquire)
+    }
+    pub(crate) fn parameters_pending(&self) -> bool {
+        let revision = self.parameters.load(Ordering::Acquire);
+        revision == u64::MAX
+            || self.checked_parameters.load(Ordering::Acquire) != revision
+            || self.parameters.load(Ordering::Acquire) != revision
     }
 
     /// Callback-safe coalescing hint only: never fabricates an outage or runs I/O.
     pub fn notify(&self) {
         let _ = self
-            .0
+            .revision
             .fetch_update(Ordering::Release, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             });
+    }
+    #[cfg(test)]
+    pub(crate) fn parameter_for_test(&self) -> u64 {
+        self.parameters.fetch_add(1, Ordering::AcqRel) + 1
+    }
+    #[cfg(test)]
+    pub(crate) fn checked_for_test(&self, revision: u64) {
+        self.checked_parameters.store(revision, Ordering::Release);
     }
 }
 #[derive(Clone, Copy)]
@@ -110,7 +135,7 @@ impl Worker {
         })
     }
     fn poll(&mut self, now: u64) -> Update {
-        let hint = self.hint.0.load(Ordering::Acquire);
+        let hint = self.hint.revision();
         // Preserve an evidence gap even when a fresh result is queued on this
         // very poll. The owner must reset settling before applying that result.
         let mut reset = self
@@ -249,12 +274,7 @@ impl ObservedOwner {
         sample: impl FnMut() -> Observation + Send + 'static,
         clock: Clock,
     ) -> io::Result<Self> {
-        Self::with_clock_and_hint(
-            state,
-            sample,
-            clock,
-            ChangeHint(Arc::new(AtomicU64::new(0))),
-        )
+        Self::with_clock_and_hint(state, sample, clock, ChangeHint::new())
     }
     fn with_clock_and_hint(
         state: State,
@@ -276,16 +296,19 @@ impl ObservedOwner {
         let start = Instant::now();
         let clock: Clock =
             Arc::new(move || start.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
-        let hint = ChangeHint(Arc::new(AtomicU64::new(0)));
-        let notifications =
-            adapter_platform::windows_network_changes::NetworkChanges::register(hint.0.clone())?;
+        let hint = ChangeHint::new();
+        let mut notifications =
+            adapter_platform::windows_network_changes::NetworkChanges::register(
+                hint.revision.clone(),
+                hint.parameters.clone(),
+                hint.checked_parameters.clone(),
+            )?;
         Self::with_clock_and_hint(
             state,
             move || {
                 // Capture the registration lease on the worker. Deregistration may
                 // wait for callbacks, so owner Drop must not perform it or join.
-                let _keep_registered = &notifications;
-                physical_attachment::windows::observe().unwrap_or_else(|_| unknown())
+                notifications.observe().unwrap_or_else(|_| unknown())
             },
             clock,
             hint,
@@ -310,12 +333,18 @@ impl ObservedOwner {
             let now = (self.clock)();
             now >= since && now - since >= adapter_domain::SETTLE_MS
         }) && self.binding_evidence().is_some()
+            && !self.parameter_check_pending()
+    }
+    /// A parameter notification needs local classification, not cancellation.
+    /// Existing work may finish; no new operation or selection may pass yet.
+    pub fn parameter_check_pending(&self) -> bool {
+        self.worker.hint.parameters_pending()
     }
     pub fn stamp(&self) -> Option<ObservationStamp> {
         self.binding_evidence().map(ObservationStamp)
     }
     pub(crate) fn binding_evidence(&self) -> Option<BindingEvidence> {
-        let revision = self.worker.hint.0.load(Ordering::Acquire);
+        let revision = self.worker.hint.revision();
         let now = (self.clock)();
         let observed = self.worker.last_evidence?;
         if self.continuity == u64::MAX
@@ -336,7 +365,7 @@ impl ObservedOwner {
         let finished = (self.clock)();
         if finished < observed
             || finished.saturating_sub(observed) >= FRESH_MS
-            || self.worker.hint.0.load(Ordering::Acquire) != revision
+            || self.worker.hint.revision() != revision
         {
             return None;
         }
@@ -352,7 +381,7 @@ impl ObservedOwner {
         // This final acquire is the application linearization point. A hint
         // ordered before it invalidates the batch; a concurrent later hint is
         // consumed on the next poll. Callbacks never mutate owner state.
-        if self.worker.hint.0.load(Ordering::Acquire) != update.hint {
+        if self.worker.hint.revision() != update.hint {
             update.reset = true;
             update.observation = None;
             self.worker.last_evidence = None;
@@ -432,6 +461,42 @@ mod tests {
         now.store(at, Ordering::SeqCst);
         let target = owner.worker.completed + 1;
         drain(owner, target);
+    }
+    #[test]
+    fn classified_parameter_hints_preserve_continuity_but_gate_new_work() {
+        let (now, clock) = clock();
+        let mut owner =
+            ObservedOwner::with_clock(State::new("parameters".into()), || observation(1), clock)
+                .unwrap();
+        drain(&mut owner, 1);
+        for at in [500, 1000, 1500, 2000] {
+            sample_at(&mut owner, &now, at);
+        }
+        assert!(owner.binding_settled());
+        let before = owner.stamp();
+        let since = owner.stable_since;
+        let hint = owner.change_hint();
+        let first = hint.parameter_for_test();
+        assert!(owner.parameter_check_pending());
+        assert!(!owner.binding_settled());
+        assert!(owner.stamp() == before);
+        assert_eq!(owner.stable_since, since);
+        let second = hint.parameter_for_test();
+        hint.checked_for_test(first);
+        assert!(
+            owner.parameter_check_pending(),
+            "old classification released a newer hint"
+        );
+        hint.checked_for_test(second);
+        assert!(!owner.parameter_check_pending());
+        assert!(owner.binding_settled());
+        assert!(owner.stamp() == before);
+        hint.parameter_for_test();
+        now.store(4000, Ordering::Release);
+        assert!(
+            owner.stamp().is_none(),
+            "pending hints cannot extend freshness"
+        );
     }
     #[test]
     fn confirmed_outage_invalidates_old_token_and_unknown_preserves_latch() {
