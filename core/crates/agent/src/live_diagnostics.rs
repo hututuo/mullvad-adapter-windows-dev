@@ -990,8 +990,9 @@ mod tests {
     fn uncertain_identity_activation_is_a_retained_closed_diagnostic() {
         let root = temporary();
         let logs = Logs { root: root.clone() };
-        logs.event("api", crate::live_device::ACTIVATION_UNCERTAIN)
-            .unwrap();
+        // This diagnostics module is also compiled in the desktop crate.
+        // Exercise the wire code without importing the agent's device manager.
+        logs.event("api", "identity_activation_uncertain").unwrap();
         let report = logs
             .report(&snapshot(), "33333333-3333-3333-3333-333333333333")
             .unwrap();

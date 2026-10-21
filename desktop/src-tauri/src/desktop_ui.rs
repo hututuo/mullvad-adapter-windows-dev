@@ -109,6 +109,16 @@ pub struct UiState {
     status_item: MenuItem<tauri::Wry>,
     ping_item: MenuItem<tauri::Wry>,
 }
+pub fn capture(app: &tauri::AppHandle, dashboard: &Dashboard) {
+    if let Some(state) = app.try_state::<UiState>() {
+        if let Ok(mut cache) = state.cache.lock() {
+            cache.dashboard = Some((dashboard.clone(), Instant::now()));
+        };
+    }
+}
+fn needs_poll(main_visible: bool, age: Option<Duration>) -> bool {
+    !main_visible && age.is_none_or(|age| age >= Duration::from_secs(7))
+}
 fn current(app: &tauri::AppHandle) -> DesktopStatus {
     let state = app.state::<UiState>();
     let Ok(cache) = state.cache.lock() else {
@@ -438,13 +448,24 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .name("desktop-passive-status".into())
         .spawn(move || loop {
             if !crate::STOPPING.load(std::sync::atomic::Ordering::Acquire) {
-                if let Ok(adapter_protocol::app::AppReply::Dashboard { dashboard }) =
-                    crate::transact(adapter_protocol::app::AppCommand::Dashboard)
-                {
-                    let state = handle.state::<UiState>();
-                    if let Ok(mut cache) = state.cache.lock() {
-                        cache.dashboard = Some((*dashboard, Instant::now()));
-                    };
+                let main_visible = handle
+                    .get_webview_window("main")
+                    .and_then(|w| w.is_visible().ok())
+                    .unwrap_or(true);
+                let age = handle
+                    .state::<UiState>()
+                    .cache
+                    .lock()
+                    .ok()
+                    .and_then(|cache| cache.dashboard.as_ref().map(|(_, at)| at.elapsed()));
+                // Reuse main-window replies. Only poll when hidden and cache is old;
+                // never compete with foreground actions for the bridge gate.
+                if needs_poll(main_visible, age) {
+                    if let Ok(adapter_protocol::app::AppReply::Dashboard { dashboard }) =
+                        crate::transact(adapter_protocol::app::AppCommand::Dashboard)
+                    {
+                        capture(&handle, &dashboard);
+                    }
                 }
                 publish(&handle);
             }
@@ -456,6 +477,14 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn foreground_replies_are_reused_without_an_extra_bridge_poll() {
+        assert!(!needs_poll(true, None));
+        assert!(!needs_poll(true, Some(Duration::from_secs(99))));
+        assert!(!needs_poll(false, Some(Duration::from_secs(3))));
+        assert!(needs_poll(false, None));
+        assert!(needs_poll(false, Some(Duration::from_secs(7))));
+    }
     #[test]
     fn icon_is_a_real_globe_with_status_colour() {
         let a = icon("connected");

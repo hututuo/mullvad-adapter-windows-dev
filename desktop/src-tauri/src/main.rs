@@ -86,11 +86,17 @@ async fn copy_last_report(
     }
 }
 #[tauri::command]
-async fn app_request(command: AppCommand) -> Result<AppReply, String> {
-    // Serialize native bridge only; secrets are never formatted or stored in UI state.
-    tauri::async_runtime::spawn_blocking(move || transact(command))
-        .await
-        .map_err(|_| "bridge_worker_failed".to_owned())?
+async fn app_request(app: tauri::AppHandle, command: AppCommand) -> Result<AppReply, String> {
+    // Reuse verified dashboard replies for passive tray status.
+    tauri::async_runtime::spawn_blocking(move || {
+        let reply = transact(command)?;
+        if let AppReply::Dashboard { dashboard } = &reply {
+            desktop_ui::capture(&app, dashboard);
+        }
+        Ok(reply)
+    })
+    .await
+    .map_err(|_| "bridge_worker_failed".to_owned())?
 }
 #[cfg(windows)]
 fn transact(command: AppCommand) -> Result<AppReply, String> {
