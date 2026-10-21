@@ -75,8 +75,10 @@ export class StatusReadHealth {
     } else { this.transportFailures=0;this.transportSince=null; }
     return true;
   }
-  view(now:number):StatusReadView {
+  view(now:number, stopping=false):StatusReadView {
     const age=this.observed ? Math.max(0,now-this.observed.at) : null;
+    if(stopping)return {fresh:false,kind:"stopping",label:"正在确认后台停止",ageSeconds:age===null?null:Math.floor(age/1000),
+      message:"已暂停状态轮询，正在等待停止结果；未确认前不会当作已退出。"};
     const fresh=age!==null && age<=STATUS_MAX_AGE_MS && (!this.issue || this.issue==="busy" || this.issue==="pending");
     const sustained=this.issue==="transport" && this.transportFailures>=3
       && this.transportSince!==null && now-this.transportSince>=10000;

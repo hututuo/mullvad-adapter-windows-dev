@@ -109,7 +109,7 @@ function App() {
   }, []);
   const statusHealth = useRef(new StatusReadHealth());
   const [statusNow,setStatusNow] = useState(()=>performance.now());
-  const statusView = statusHealth.current.view(statusNow);
+  const statusView = statusHealth.current.view(statusNow,stopping.current);
   useEffect(()=>{const timer=setInterval(()=>setStatusNow(performance.now()),1000);return ()=>clearInterval(timer);},[]);
   const flight = useRef(false),
     mounted = useRef(false),

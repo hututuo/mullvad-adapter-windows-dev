@@ -80,4 +80,10 @@ check('security errors remain distinct; unknown errors never echo private data',
  }
  assert.match(bridgeError('response_read_failed'),/核对|勿重复/);
 });
+check('explicit stopping is expected read suspension, not an outage alarm',()=>{
+ const h=new StatusReadHealth();observe(h,data());
+ const view=h.view(60000,true);assert.equal(view.kind,'stopping');assert.equal(view.fresh,false);
+ assert.doesNotMatch(view.message,/更新延迟|无法读取|断网/);
+ assert.equal(h.view(60000).fresh,false);
+});
 console.log(`status read: ${cases} scenario groups PASS (synthetic; no native app or network)`);
