@@ -82,7 +82,7 @@ export class StatusReadHealth {
       && this.transportSince!==null && now-this.transportSince>=10000;
     const kind=sustained ? "unavailable" : this.issue??(fresh?"ready":this.observed?"stale":"pending");
     const label=({ready:"状态已更新",busy:"稍后重读状态",pending:"正在读取状态",stale:"状态更新延迟",
-      transport:"状态暂未更新",unavailable:"无法读取本机状态",invalid:"状态响应异常",rejected:"本机通信校验未通过"} as Record<string,string>)[kind];
+      transport:"状态暂未更新",unavailable:"无法读取本机状态",invalid:"状态读取异常",rejected:"本机通信校验未通过"} as Record<string,string>)[kind];
     const text=({ready:"状态读取独立运行，不会触发重连或测速。",busy:"本机读取暂忙，稍后自动重试；这不代表隧道断开。",
       pending:"正在等待本机状态；不会因此重试节点。",stale:"连接状态更新延迟，下面保留上次记录；尚不能据此判断断网。",
       transport:"暂未读到本机状态，正在重读；尚不能据此判断隧道中断。",

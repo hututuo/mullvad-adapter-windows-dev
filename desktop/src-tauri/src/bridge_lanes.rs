@@ -5,6 +5,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(crate) fn hello_error(error: &std::io::Error, status_read: bool) -> &'static str {
+    if error.kind() == std::io::ErrorKind::InvalidData {
+        "invalid_handshake"
+    } else if status_read {
+        "status_response_read_failed"
+    } else {
+        "backend_handshake_unavailable"
+    }
+}
+
 pub(crate) struct BridgeLanes {
     control: Mutex<()>,
     status: Mutex<()>,
@@ -32,6 +42,21 @@ impl BridgeLanes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_missing_or_timed_out_hello_is_not_a_rejected_identity() {
+        for kind in [
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            let error = std::io::Error::from(kind);
+            assert_eq!(hello_error(&error, true), "status_response_read_failed");
+            assert_eq!(hello_error(&error, false), "backend_handshake_unavailable");
+        }
+        let malformed = std::io::Error::from(std::io::ErrorKind::InvalidData);
+        assert_eq!(hello_error(&malformed, true), "invalid_handshake");
+        assert_eq!(hello_error(&malformed, false), "invalid_handshake");
+    }
     #[test]
     fn startup_is_debounced_without_taking_a_control_or_status_lane() {
         let lanes = BridgeLanes::new();

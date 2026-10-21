@@ -75,7 +75,8 @@ pub(crate) fn read() -> Result<AppReply, String> {
         }
         Err(_) => return Err("backend_identity_or_pipe_rejected".into()),
     };
-    let hello: AppReply = read_frame(&mut pipe).map_err(|_| "invalid_handshake")?;
+    let hello: AppReply =
+        read_frame(&mut pipe).map_err(|e| super::bridge_lanes::hello_error(&e, true))?;
     let source = option_env!("ADAPTER_SOURCE_SHA").ok_or("runtime_build_identity_missing")?;
     let build = env!("CARGO_PKG_VERSION");
     let boot = hello.verified_boot_id(source, build)?.to_owned();

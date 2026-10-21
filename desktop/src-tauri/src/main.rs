@@ -151,7 +151,8 @@ fn transact(command: AppCommand) -> Result<AppReply, String> {
         }
         Err(_) => return Err("backend_identity_or_pipe_rejected".into()),
     };
-    let hello = read_frame::<AppReply>(&mut pipe).map_err(|_| "invalid_handshake")?;
+    let hello =
+        read_frame::<AppReply>(&mut pipe).map_err(|e| bridge_lanes::hello_error(&e, false))?;
     let boot = hello
         .verified_boot_id(
             option_env!("ADAPTER_SOURCE_SHA").ok_or("runtime_build_identity_missing")?,

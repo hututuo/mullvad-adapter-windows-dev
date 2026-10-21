@@ -180,6 +180,7 @@ const errors: Record<string, string> = {
   route_trial_failed: "本次路线测试未通过；已尝试恢复原路线，可查看当前恢复进度。",
 
   backend_unavailable: "暂时无法读取本机后台；当前隧道情况仍需核实。",
+  backend_handshake_unavailable: "本机后台尚未完成通信握手，未发送操作；请稍候再试。",
   backend_starting: "本机后台正在启动，请稍候；尚未重复提交操作。",
   status_read_busy: "本机状态读取暂忙，稍后自动重读；这不代表断网。",
   status_snapshot_stale: "本机状态更新延迟，正在重新读取；这不代表隧道中断。",
