@@ -20,6 +20,9 @@ final class CityWorkspaceTests: XCTestCase {
             (request.url!.path == "/cities" ? 404 : 200, request.url!.path == "/cities" ? Data("{}".utf8) : CityPreview.data("status"))
         }
         await model.refreshStatusOnly()
+        // City reads have their own schedule; status refresh must not wait for them.
+        XCTAssertNil(model.cityErrorMessage)
+        await model.loadCities()
         XCTAssertEqual(model.status?.serviceReadiness, "ready")
         XCTAssertEqual(model.cityWorkspace?.selectedCity, "us-sjc")
         XCTAssertNotNil(model.cityErrorMessage)

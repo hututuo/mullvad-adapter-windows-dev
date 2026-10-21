@@ -31,7 +31,7 @@ struct MenuBarStatusLabel: View {
             return "wifi.slash"
         case "switching", "reconnecting", "network_recovering", "starting":
             return "arrow.triangle.2.circlepath"
-        case "degraded", "degraded_dns", "degraded_service", "data_fail", "fail", "failed", "error", "status_pending", "status_invalid", "status_error", "status_unavailable":
+        case "degraded", "degraded_dns", "degraded_service", "data_fail", "fail", "failed", "error", "status_pending", "status_stale", "status_invalid", "status_error", "status_unavailable":
             return "exclamationmark.triangle"
         default:
             return "network.badge.shield.half.filled"

@@ -191,6 +191,7 @@ func localizedAdapterStatus(_ rawStatus: String?) -> String {
     case "pending": return "等待中"
     case "unknown": return "未知"
     case "unreachable", "status_unavailable": return "无法读取本机服务状态"
+    case "status_stale": return "状态更新延迟"
     case "status_pending": return "状态待更新"
     case "status_invalid": return "状态格式异常"
     case "status_error": return "状态读取异常"
@@ -208,7 +209,7 @@ func adapterStatusColor(_ rawStatus: String?) -> Color {
         return .orange
     // 部分可用（例如网络通但 DNS 不通）是"能连出去、但有一项不通"，
     // 用橙色警告色，不要和"完全上不了网"的红色混为一谈。
-    case "degraded", "degraded_dns", "degraded_service", "status_pending", "status_invalid", "status_error":
+    case "degraded", "degraded_dns", "degraded_service", "status_pending", "status_stale", "status_invalid", "status_error":
         return .orange
     case "front_fail", "unreachable", "status_unavailable", "data_fail", "backend_fail", "fail", "failed", "error", "tripped", "open":
         return .red

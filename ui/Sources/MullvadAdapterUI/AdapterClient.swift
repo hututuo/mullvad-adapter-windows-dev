@@ -1,11 +1,34 @@
 import Foundation
 
+struct StatusObservation: Sendable {
+    let snapshot: AdapterStatus
+    let ageMilliseconds: Int?
+    let captureMilliseconds: Int?
+}
+
 struct AdapterClient: Sendable {
     let baseURL: URL
     let session: URLSession
+    let statusSession: URLSession
+
+    // A slow account/device request must not consume the status connection pool.
+    // Only the local read uses this session; mutations retain their authorisation.
+    private static let localStatusSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.connectionProxyDictionary = [:]
+        config.urlCache = nil
+        config.httpCookieStorage = nil
+        config.urlCredentialStorage = nil
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.httpMaximumConnectionsPerHost = 2
+        config.timeoutIntervalForRequest = 5
+        config.timeoutIntervalForResource = 5
+        return URLSession(configuration: config)
+    }()
     let accountCapability: @Sendable () throws -> String
 
-    init(baseURL: URL = URL(string: "http://127.0.0.1:17891")!, session: URLSession = .shared,
+    init(baseURL: URL = URL(string: "http://127.0.0.1:17891")!, session: URLSession? = nil,
+         statusSession: URLSession? = nil,
          accountCapability: @escaping @Sendable () throws -> String = {
              let path = FileManager.default.homeDirectoryForCurrentUser
                  .appendingPathComponent("Library/Application Support/MullvadLocalAdapter/account-capability")
@@ -16,7 +39,8 @@ struct AdapterClient: Sendable {
              return value
          }) {
         self.baseURL = baseURL
-        self.session = session
+        self.session = session ?? .shared
+        self.statusSession = statusSession ?? session ?? Self.localStatusSession
         self.accountCapability = accountCapability
     }
 
@@ -90,7 +114,27 @@ struct AdapterClient: Sendable {
     }
 
     func fetchStatus() async throws -> AdapterStatus {
-        try await get("status", as: AdapterStatus.self)
+        try await fetchStatusObservation().snapshot
+    }
+
+    func fetchStatusObservation() async throws -> StatusObservation {
+        var request = URLRequest(url: baseURL.appendingPathComponent("status"))
+        request.timeoutInterval = 5
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (data, response) = try await response(for: request, using: statusSession)
+        func milliseconds(_ name: String) throws -> Int? {
+            guard let value = response.value(forHTTPHeaderField: name) else { return nil }
+            guard value.count <= 12, !value.isEmpty, value.utf8.allSatisfy({ (48...57).contains($0) }),
+                  let number = Int(value), number <= 86_400_000 else {
+                throw AdapterClientError.invalidResponse("本机状态时间标记无效")
+            }
+            return number
+        }
+        let age = try milliseconds("X-Adapter-Status-Age-Ms")
+        let capture = try milliseconds("X-Adapter-Status-Capture-Ms")
+        if let age, age > 3000 { throw AdapterClientError.statusSnapshotStale(age) }
+        return try StatusObservation(snapshot: decode(data, path: "/status"), ageMilliseconds: age, captureMilliseconds: capture)
     }
 
     func fetchMetrics() async throws -> AdapterMetrics {
@@ -246,8 +290,12 @@ struct AdapterClient: Sendable {
     }
 
     private func data(for request: URLRequest) async throws -> Data {
+        try await response(for: request, using: session).0
+    }
+
+    private func response(for request: URLRequest, using transport: URLSession) async throws -> (Data, HTTPURLResponse) {
         do {
-            let (data, response) = try await session.data(for: request)
+            let (data, response) = try await transport.data(for: request)
             guard let http = response as? HTTPURLResponse else {
                 throw AdapterClientError.invalidResponse("适配器返回了非 HTTP 响应")
             }
@@ -260,7 +308,7 @@ struct AdapterClient: Sendable {
                     message: payload.message ?? fallback
                 )
             }
-            return data
+            return (data, http)
         } catch is CancellationError {
             throw CancellationError()
         } catch let error as AdapterClientError {
@@ -289,6 +337,7 @@ enum AdapterClientError: LocalizedError {
     case urlTransport(Int)
     case http(status: Int, code: String?, message: String)
     case invalidResponse(String)
+    case statusSnapshotStale(Int)
 
     var isTransportFailure: Bool {
         switch self {
@@ -312,6 +361,8 @@ enum AdapterClientError: LocalizedError {
             return "适配器 HTTP \(status)：\(message)"
         case .invalidResponse(let message):
             return message
+        case .statusSnapshotStale:
+            return "本机服务已响应，但状态发布暂缓；正在重新读取。"
         }
     }
 }

@@ -14,7 +14,12 @@ struct StatusReadFailure: Equatable {
             switch error {
             case .urlTransport(let code): return urlFailure(code)
             case .transport: return .init(kind: "transport", code: nil, connectivity: true)
-            case .http(let status, _, _): return .init(kind: "http", code: status, connectivity: false)
+            case .statusSnapshotStale: return .init(kind: "snapshot_stale", code: nil, connectivity: false)
+            case .http(let status, let code, _):
+                if status == 503, code == "status_snapshot_stale" || code == "status_snapshot_unavailable" {
+                    return .init(kind: "snapshot_stale", code: status, connectivity: false)
+                }
+                return .init(kind: "http", code: status, connectivity: false)
             case .invalidResponse: return .init(kind: "invalid_response", code: nil, connectivity: false)
             case .cancellationUnconfirmed: break
             }
@@ -42,7 +47,7 @@ struct StatusReadHealth {
 
     // Completion order matters: an old result cannot overwrite a newer observation.
     // Cancellation is not an observation of the service, and does not advance this fence.
-    mutating func finish(_ id: Int, failure: StatusReadFailure?, at now: TimeInterval) -> Bool {
+    mutating func finish(_ id: Int, failure: StatusReadFailure?, at now: TimeInterval, observationAge: TimeInterval = 0) -> Bool {
         guard id >= latestFinished, failure?.kind != "cancelled" else { return false }
         latestFinished = id
         lastFailure = failure
@@ -59,13 +64,14 @@ struct StatusReadHealth {
             failureCount = 0
             transportFailures = 0
             transportFailureSince = nil
-            lastSuccessAt = now
+            lastSuccessAt = now - max(0, observationAge)
         }
         return true
     }
 
     func displayStatus(at now: TimeInterval) -> String? {
         guard let failure = lastFailure else { return nil }
+        if failure.kind == "snapshot_stale" { return "status_stale" }
         if failure.kind == "invalid_response" { return "status_invalid" }
         if !failure.connectivity { return "status_error" }
         if transportFailures >= 3, let since = transportFailureSince, now - since >= 10 {
@@ -79,6 +85,7 @@ struct StatusReadHealth {
         let age = lastSuccessAt.map { "上次状态为 \(max(0, Int(now - $0))) 秒前。" } ?? "尚未成功读取状态。"
         let text: String
         switch state {
+        case "status_stale": text = "本机服务能响应，但连接状态更新延迟；正在重新读取，尚不能据此判断网络中断。"
         case "status_invalid": text = "已收到本机服务响应，但状态格式无法解析；正在重试。"
         case "status_error": text = "本机服务返回异常，正在重试读取状态。"
         case "status_unavailable": text = "持续无法读取本机服务状态，当前连接情况未知；正在重试。"
@@ -98,12 +105,15 @@ struct StatusReadEvent: Encodable, Sendable {
     let consecutiveFailures: Int
     let snapshotAgeSeconds: Int?
     let displayState: String?
+    var publicationAgeMs: Int? = nil
+    var publicationCaptureMs: Int? = nil
 
     enum CodingKeys: String, CodingKey {
         case event, requestID = "request_id", durationMs = "duration_ms"
         case failureKind = "failure_kind", errorCode = "error_code"
         case consecutiveFailures = "consecutive_failures", snapshotAgeSeconds = "snapshot_age_seconds"
         case displayState = "display_state"
+        case publicationAgeMs = "publication_age_ms", publicationCaptureMs = "publication_capture_ms"
     }
 }
 

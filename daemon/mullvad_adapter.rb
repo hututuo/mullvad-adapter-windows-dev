@@ -113,6 +113,8 @@ class MullvadAdapter
   DEFAULT_TRANSPORT_PREFERENCE = 'ss'
   BUILD_ID = '20261005-local-network-recovery-1'
   SOURCE_SHA256 = Digest::SHA256.file(__FILE__).hexdigest
+  STATUS_PUBLICATION_INTERVAL = 1.0
+  STATUS_PUBLICATION_MAX_AGE = 3.0
   # Keep recent history by capacity, not by calendar day: two files together
   # never exceed 20 MB (decimal), retaining multiple days at normal event rates.
   EVENT_LOG_FILE_BYTES = 10_000_000
@@ -319,6 +321,8 @@ class MullvadAdapter
       last_error: nil,
       updated_at: Time.now.iso8601
     }
+    @status_publish_gate = Mutex.new
+    publish_status_snapshot
   end
 
   def run
@@ -1316,6 +1320,7 @@ class MullvadAdapter
 
   def start_api_server
     @server = TCPServer.new(@options[:api_host], @options[:api_port])
+    start_status_publisher
     Thread.new do
       loop do
         break if @stop_requested
@@ -1394,7 +1399,7 @@ class MullvadAdapter
       end
       accepted_async(sock, relay, 'protection-change', nil, profile: profile)
     when ['GET', '/status']
-      respond(sock, 200, snapshot)
+      respond_status(sock)
     when ['GET', '/metrics']
       respond(sock, 200, @mutex.synchronize { @metrics.dup })
     when ['GET', '/relays']
@@ -1702,11 +1707,15 @@ class MullvadAdapter
   end
 
   def respond(sock, code, object)
-    payload = JSON.generate(object)
+    respond_json(sock, code, JSON.generate(object))
+  end
+
+  def respond_json(sock, code, payload, headers: {})
     text = { 200 => 'OK', 202 => 'Accepted', 400 => 'Bad Request', 403 => 'Forbidden', 404 => 'Not Found', 409 => 'Conflict', 500 => 'Internal Server Error', 503 => 'Service Unavailable' }.fetch(code, 'OK')
     sock.write("HTTP/1.1 #{code} #{text}\r\n")
     sock.write("Content-Type: application/json; charset=utf-8\r\n")
     sock.write("Cache-Control: no-store\r\n")
+    headers.each { |name, value| sock.write("#{name}: #{value}\r\n") }
     sock.write("Content-Length: #{payload.bytesize}\r\n")
     sock.write("Connection: close\r\n\r\n")
     sock.write(payload)
@@ -1717,6 +1726,95 @@ class MullvadAdapter
     # socket is already going away, so there is no useful second response to
     # send and no incident should be recorded for the network service.
     false
+  end
+
+  # The public read path only consumes an immutable publication. In particular,
+  # it must not queue behind a profile commit, history work, or operation lock.
+  # Internal control decisions continue using the authoritative snapshot below.
+  def respond_status(sock)
+    publication = @status_publication
+    unless publication
+      return respond(sock, 503, { code: 'status_snapshot_unavailable', error: '本机状态尚未发布' })
+    end
+    age_ms = [(monotonic_now - publication[:captured_at]) * 1000, 0].max.round
+    headers = { 'X-Adapter-Status-Age-Ms' => age_ms,
+                'X-Adapter-Status-Capture-Ms' => publication[:capture_ms] }
+    if age_ms > (STATUS_PUBLICATION_MAX_AGE * 1000).to_i
+      body = { code: 'status_snapshot_stale', error: '本机服务仍能响应，状态发布暂缓', snapshot_age_ms: age_ms }
+      return respond_json(sock, 503, JSON.generate(body), headers: headers)
+    end
+    respond_json(sock, 200, publication[:json], headers: headers)
+  end
+
+  def start_status_publisher
+    return if @status_publisher&.alive?
+    @status_publisher = Thread.new do
+      Thread.current.name = 'adapter-status-publication'
+      until @stop_requested
+        publish_status_snapshot
+        sleep STATUS_PUBLICATION_INTERVAL
+      end
+    end
+  end
+
+  def publish_status_snapshot
+    return false unless @status_publish_gate.try_lock
+    begin
+      started = monotonic_now
+      return false unless @mutex.try_lock
+      begin
+        # Capture time precedes the copy, so serialisation/scheduling delay is
+        # included in the reported age rather than resetting freshness later.
+        captured_at = monotonic_now
+        copy = Marshal.load(Marshal.dump(@state))
+        now = Time.now
+        quarantine = @recovery_quarantine.filter_map do |name, entry|
+          next if entry[:until] <= now
+          { relay: name, reason: entry[:reason], remaining_seconds: [(entry[:until] - now).ceil, 0].max }
+        end
+        copy[:routing_policy][:quarantined_relays] = Marshal.load(Marshal.dump(quarantine))
+      ensure
+        @mutex.unlock
+      end
+      return false unless @action_gate_mutex.try_lock
+      begin
+        pending = @action_pending
+        latest = pending ? @operations[pending[:id]] : @operations.values.last
+        copy[:routing_policy][:pending_action] = pending && Marshal.load(Marshal.dump(pending))
+        copy[:operation] = latest && Marshal.load(Marshal.dump(latest))
+      ensure
+        @action_gate_mutex.unlock
+      end
+      decorate_status_snapshot(copy)
+      json = JSON.generate(copy).freeze
+      @status_publication = { json: json, captured_at: captured_at,
+                              capture_ms: [(monotonic_now - started) * 1000, 0].max.round }.freeze
+      true
+    rescue StandardError
+      # Never publish partial state, renew its age on error, or do disk/network
+      # logging here. Age/error response remains available without these locks.
+      false
+    ensure
+      @status_publish_gate.unlock
+    end
+  end
+
+  def decorate_status_snapshot(copy)
+    if copy.dig(:local_network, :paused)
+      copy[:status] = copy[:service_readiness] = 'waiting_network'
+      copy[:relay_liveness] = 'unknown'
+    elsif copy.dig(:local_network, :recovery_pending)
+      copy[:status] = copy[:service_readiness] = 'network_recovering'
+    end
+    fetched_at = copy.dig(:metadata, :fetched_at)
+    if fetched_at
+      begin
+        copy[:metadata][:age_seconds] = [Time.now - Time.parse(fetched_at), 0].max.round
+      rescue ArgumentError
+        copy[:metadata][:age_seconds] = nil
+      end
+    end
+    copy
   end
 
   def snapshot

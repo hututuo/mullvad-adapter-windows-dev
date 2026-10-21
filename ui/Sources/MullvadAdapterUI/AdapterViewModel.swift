@@ -61,6 +61,8 @@ final class AdapterViewModel: ObservableObject {
     private var batchSpeedTask: Task<Void, Never>?
     private var singleSpeedTask: Task<Void, Never>?
     private var statusPollingTask: Task<Void, Never>?
+    private var cityPollingTask: Task<Void, Never>?
+    private var cityReadInFlight = false
     private var notificationBaselineEstablished = false
     private var lastNotifiedDegradedState: String?
     private var statusReadHealth = StatusReadHealth()
@@ -187,6 +189,22 @@ final class AdapterViewModel: ObservableObject {
                 }
             }
         }
+        cityPollingTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                await self.loadCities()
+                do {
+                    try await Task.sleep(nanoseconds: (self.isBusy || self.isSpeedTesting) ? 1_000_000_000 : 5_000_000_000)
+                } catch { return }
+            }
+        }
+    }
+
+    func stopStatusPolling() {
+        statusPollingTask?.cancel()
+        cityPollingTask?.cancel()
+        statusPollingTask = nil
+        cityPollingTask = nil
     }
 
     func setNotificationsEnabled(_ enabled: Bool) {
@@ -447,7 +465,8 @@ final class AdapterViewModel: ObservableObject {
         // connection snapshot or make a healthy service appear unreachable.
         async let statusRequest: Void = refreshStatusBestEffort()
         async let metricsRequest: Void = refreshMetricsBestEffort()
-        _ = await (statusRequest, metricsRequest)
+        async let cityRequest: Void = loadCities()
+        _ = await (statusRequest, metricsRequest, cityRequest)
     }
 
     func speedState(for hostname: String, transport: TransportPreference? = nil) -> RelaySpeedState {
@@ -898,30 +917,35 @@ final class AdapterViewModel: ObservableObject {
     private func refreshStatusBestEffort() async {
         guard !isPreview else { return }
         _ = await readStatusSnapshot()
-        guard !Task.isCancelled else { return }
-        await loadCities()
     }
 
     private func readStatusSnapshot() async -> AdapterStatus? {
         let id = statusReadHealth.begin()
         let started = statusClock()
         do {
-            let newStatus = try await client.fetchStatus()
+            let observation = try await client.fetchStatusObservation()
+            let newStatus = observation.snapshot
             let now = statusClock()
+            let age = Double(observation.ageMilliseconds ?? 0) / 1000 + max(0, now - started)
             guard !Task.isCancelled else {
                 recordStatusRead("status-read-cancelled", id: id, started: started, failure: .init(kind: "cancelled", code: nil, connectivity: false))
                 return nil
             }
+            // Header age is measured at the server. Include request/scheduling
+            // time conservatively, so a delayed reply cannot revive old ready.
+            if observation.ageMilliseconds != nil, age > 3 {
+                throw AdapterClientError.statusSnapshotStale(Int(age * 1000))
+            }
             let recovering = statusReadHealth.lastFailure != nil
-            guard statusReadHealth.finish(id, failure: nil, at: now) else {
+            guard statusReadHealth.finish(id, failure: nil, at: now, observationAge: age) else {
                 recordStatusRead("status-read-discarded", id: id, started: started)
                 return nil
             }
             let first = lastUpdated == nil
             applyStatusSnapshot(newStatus)
-            lastUpdated = Date()
-            if first || recovering || now - started >= 1 {
-                recordStatusRead(first ? "status-read-ready" : (recovering ? "status-read-recovered" : "status-read-slow"), id: id, started: started)
+            lastUpdated = Date().addingTimeInterval(-age)
+            if first || recovering || now - started >= 1 || (observation.ageMilliseconds ?? 0) >= 1500 || (observation.captureMilliseconds ?? 0) >= 50 {
+                recordStatusRead(first ? "status-read-ready" : (recovering ? "status-read-recovered" : "status-read-slow"), id: id, started: started, observation: observation)
             }
             return newStatus
         } catch {
@@ -940,16 +964,19 @@ final class AdapterViewModel: ObservableObject {
         }
     }
 
-    private func recordStatusRead(_ event: String, id: Int, started: TimeInterval, failure: StatusReadFailure? = nil) {
+    private func recordStatusRead(_ event: String, id: Int, started: TimeInterval, failure: StatusReadFailure? = nil, observation: StatusObservation? = nil) {
         let now = statusClock()
         statusEventSink(StatusReadEvent(event: event, requestID: id, durationMs: max(0, Int((now - started) * 1000)),
             failureKind: failure?.kind, errorCode: failure?.code, consecutiveFailures: statusReadHealth.failureCount,
             snapshotAgeSeconds: statusReadHealth.lastSuccessAt.map { max(0, Int(now - $0)) },
-            displayState: statusReadHealth.displayStatus(at: now)))
+            displayState: statusReadHealth.displayStatus(at: now),
+            publicationAgeMs: observation?.ageMilliseconds, publicationCaptureMs: observation?.captureMilliseconds))
     }
 
     func loadCities() async {
-        guard !isPreview else { return }
+        guard !isPreview, !cityReadInFlight else { return }
+        cityReadInFlight = true
+        defer { cityReadInFlight = false }
         do {
             let workspace = try await client.fetchCities()
             if let generation = workspace.generation, let statusGeneration = status?.generation,

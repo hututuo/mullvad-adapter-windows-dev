@@ -7,6 +7,9 @@ private final class ReadFixtureState: @unchecked Sendable {
     private let lock = NSLock()
     private var mode = "healthy"
     private var held: ReadFixtureProtocol?
+    private var counts: [String: Int] = [:]
+    func count(_ path: String) -> Int { lock.lock(); defer { lock.unlock() }; return counts[path, default: 0] }
+    func saw(_ path: String) { lock.lock(); defer { lock.unlock() }; counts[path, default: 0] += 1 }
     func set(_ value: String) { lock.lock(); defer { lock.unlock() }; mode = value }
     func current() -> String { lock.lock(); defer { lock.unlock() }; return mode }
     func hold(_ value: ReadFixtureProtocol) { lock.lock(); defer { lock.unlock() }; held = value }
@@ -19,7 +22,15 @@ private final class ReadFixtureProtocol: URLProtocol {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         let mode = Self.state.current()
+        Self.state.saw(request.url!.path)
+        if (mode == "hold-cities" && request.url!.path == "/cities") || (mode == "hold-account" && request.url!.path == "/account") {
+            Self.state.hold(self); return
+        }
         if request.url!.path == "/status" {
+            if mode == "stale" { respond(503, Data(#"{"code":"status_snapshot_stale"}"#.utf8)); return }
+            if mode == "aged" { respond(200, CityPreview.data("status"), headers: ["X-Adapter-Status-Age-Ms": "2300", "X-Adapter-Status-Capture-Ms": "51"]); return }
+            if mode == "expired" { respond(200, CityPreview.data("status"), headers: ["X-Adapter-Status-Age-Ms": "3001"]); return }
+            if mode == "bad-age" { respond(200, CityPreview.data("status"), headers: ["X-Adapter-Status-Age-Ms": "-1"]); return }
             if mode == "hold" { Self.state.hold(self); return }
             if mode == "cancel" { fail(URLError(.cancelled)); return }
             if mode == "timeout" { fail(URLError(.timedOut)); return }
@@ -29,8 +40,8 @@ private final class ReadFixtureProtocol: URLProtocol {
         respond(200, CityPreview.data(request.url!.lastPathComponent))
     }
     func fail(_ error: Error) { client?.urlProtocol(self, didFailWithError: error) }
-    func respond(_ code: Int, _ data: Data) {
-        client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: code, httpVersion: nil, headerFields: nil)!, cacheStoragePolicy: .notAllowed)
+    func respond(_ code: Int, _ data: Data, headers: [String: String]? = nil) {
+        client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: code, httpVersion: nil, headerFields: headers)!, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: data)
         client?.urlProtocolDidFinishLoading(self)
     }
@@ -96,14 +107,15 @@ final class StatusReadTests: XCTestCase {
         XCTAssertNil(h.lastFailure)
     }
 
-    @MainActor private func model(_ events: ReadEvents) -> AdapterViewModel {
+    @MainActor private func model(_ events: ReadEvents,
+                                  clock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) -> AdapterViewModel {
         ReadFixtureProtocol.state.set("healthy")
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [ReadFixtureProtocol.self]
         let defaults = UserDefaults(suiteName: "status-read-tests-\(UUID().uuidString)")!
         defaults.set(false, forKey: "MullvadAdapterUI.notificationsEnabled")
         return AdapterViewModel(client: AdapterClient(baseURL: URL(string: "http://status-fixtures.invalid")!, session: URLSession(configuration: config)), defaults: defaults,
-                                statusEventSink: { events.append($0) })
+                                statusEventSink: { events.append($0) }, statusClock: clock)
     }
 
     @MainActor func testCancelledReadPreservesReadyAndProducesCancellationEvidence() async throws {
@@ -159,6 +171,135 @@ final class StatusReadTests: XCTestCase {
         XCTAssertEqual(m.displayedStatus, "ready")
         XCTAssertNil(m.connectionError)
         XCTAssertTrue(events.all.contains { $0.event == "status-read-discarded" && $0.failureKind == "timeout" })
+    }
+
+
+    private func fixtureSession() -> URLSession {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [ReadFixtureProtocol.self]
+        return URLSession(configuration: config)
+    }
+
+    private func heldRequest() async throws -> ReadFixtureProtocol {
+        for _ in 0..<1000 {
+            if let held = ReadFixtureProtocol.state.take() { return held }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        throw XCTUnwrapError.missingHeldRequest
+    }
+
+    private enum XCTUnwrapError: Error { case missingHeldRequest }
+
+    func testProductionStatusSessionHasIndependentUncachedLocalPool() {
+        let subject = AdapterClient()
+        XCTAssertFalse(subject.session === subject.statusSession)
+        let config = subject.statusSession.configuration
+        XCTAssertNotNil(config.connectionProxyDictionary)
+        XCTAssertTrue(config.connectionProxyDictionary!.isEmpty)
+        XCTAssertNil(config.urlCache)
+        XCTAssertNil(config.httpCookieStorage)
+        XCTAssertNil(config.urlCredentialStorage)
+        XCTAssertEqual(config.timeoutIntervalForResource, 5)
+        let injected = fixtureSession()
+        XCTAssertTrue(AdapterClient(session: injected).statusSession === injected)
+        injected.invalidateAndCancel()
+    }
+
+    func testAccountCanRemainPendingWhileStatusUsesIndependentSession() async throws {
+        let ordinary = fixtureSession(), status = fixtureSession()
+        defer { ordinary.invalidateAndCancel(); status.invalidateAndCancel() }
+        let subject = AdapterClient(baseURL: URL(string: "http://status-fixtures.invalid")!, session: ordinary,
+                                    statusSession: status, accountCapability: { "fixture-capability" })
+        ReadFixtureProtocol.state.set("hold-account")
+        let account = Task { try await subject.account() }
+        let pending = try await heldRequest()
+        XCTAssertEqual(pending.request.value(forHTTPHeaderField: "Authorization"), "Bearer fixture-capability")
+        let observed = try await subject.fetchStatus()
+        XCTAssertEqual(observed.serviceReadiness, "ready")
+        pending.fail(URLError(.cancelled))
+        _ = await account.result
+    }
+
+    @MainActor func testPublicationDelayIsNotAnUnreachableServiceAndOldReadyIsNotFresh() async throws {
+        let events = ReadEvents(), m = model(events)
+        await m.refreshStatusOnly()
+        let oldUpdate = m.lastUpdated
+        ReadFixtureProtocol.state.set("stale")
+        await m.refreshStatusOnly()
+        XCTAssertEqual(m.displayedStatus, "status_stale")
+        XCTAssertEqual(m.status?.serviceReadiness, "ready")
+        XCTAssertEqual(m.lastUpdated, oldUpdate)
+        XCTAssertEqual(events.all.last?.failureKind, "snapshot_stale")
+        XCTAssertTrue(m.connectionError?.contains("本机服务能响应") == true)
+        ReadFixtureProtocol.state.set("aged")
+        await m.refreshStatusOnly()
+        XCTAssertEqual(m.displayedStatus, "ready")
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(try XCTUnwrap(m.lastUpdated)), 2.3)
+        XCTAssertEqual(events.all.last?.publicationAgeMs, 2300)
+        XCTAssertEqual(events.all.last?.publicationCaptureMs, 51)
+    }
+
+    func testHeadersRejectExpiredOrMalformedAgeAndLegacyServerStillWorks() async throws {
+        let session = fixtureSession()
+        defer { session.invalidateAndCancel() }
+        let subject = AdapterClient(baseURL: URL(string: "http://status-fixtures.invalid")!, session: session)
+        ReadFixtureProtocol.state.set("healthy")
+        let legacy = try await subject.fetchStatusObservation()
+        XCTAssertNil(legacy.ageMilliseconds)
+        XCTAssertEqual(legacy.snapshot.serviceReadiness, "ready")
+        for mode in ["expired", "bad-age"] {
+            ReadFixtureProtocol.state.set(mode)
+            do { _ = try await subject.fetchStatusObservation(); XCTFail("must reject \(mode)") }
+            catch {
+                let failure = StatusReadFailure.classify(error)
+                XCTAssertFalse(failure.connectivity)
+                XCTAssertEqual(failure.kind, mode == "expired" ? "snapshot_stale" : "invalid_response")
+            }
+        }
+    }
+
+    @MainActor func testPollingContinuesWhileCityReadRemainsBlocked() async throws {
+        let events = ReadEvents(), m = model(events)
+        ReadFixtureProtocol.state.set("hold-cities")
+        let before = ReadFixtureProtocol.state.count("/status")
+        m.startStatusPolling()
+        let city = try await heldRequest()
+        defer { m.stopStatusPolling(); city.fail(URLError(.cancelled)) }
+        // One full normal five-second interval, without live API/window/network work.
+        for _ in 0..<650 {
+            if ReadFixtureProtocol.state.count("/status") >= before + 2 { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertGreaterThanOrEqual(ReadFixtureProtocol.state.count("/status"), before + 2)
+        XCTAssertEqual(m.displayedStatus, "ready")
+    }
+
+    private final class DelayedClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var calls = 0
+        func now() -> TimeInterval {
+            lock.lock(); defer { lock.unlock() }
+            calls += 1
+            return calls == 1 ? 0 : 1
+        }
+    }
+
+    @MainActor func testRequestDelayCannotMakeOldPublicationFresh() async {
+        let clock = DelayedClock(), events = ReadEvents()
+        let m = model(events, clock: { clock.now() })
+        ReadFixtureProtocol.state.set("aged")
+        await m.refreshStatusOnly()
+        XCTAssertEqual(m.displayedStatus, "status_stale")
+        XCTAssertNil(m.status)
+        XCTAssertNil(m.lastUpdated)
+        XCTAssertEqual(events.all.last?.failureKind, "snapshot_stale")
+    }
+
+    func testPublicationAgeIsPreservedInHealthClock() {
+        var health = StatusReadHealth()
+        let id = health.begin()
+        XCTAssertTrue(health.finish(id, failure: nil, at: 10, observationAge: 2.5))
+        XCTAssertEqual(health.lastSuccessAt, 7.5)
     }
 
     func testLogRotationPermissionsAndMachineReadableAllowlist() throws {
