@@ -892,6 +892,7 @@ mod tests {
     fn snapshot() -> Dashboard {
         use adapter_protocol::app::{Account, Settings};
         Dashboard {
+            status_observation: None,
             sequence: 0,
             boot_id: "synthetic".into(),
             build: "test".into(),

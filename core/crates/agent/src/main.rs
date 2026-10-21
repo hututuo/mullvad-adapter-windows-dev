@@ -18,6 +18,8 @@ mod live_status;
 mod recovery_plan;
 #[cfg(any(windows, feature = "windows-api-check", test))]
 mod recovery_retry;
+#[cfg(any(windows, feature = "windows-api-check"))]
+mod status_pipe;
 #[cfg(any(windows, feature = "windows-api-check", test))]
 mod verified_chain;
 #[cfg(any(windows, feature = "windows-api-check"))]

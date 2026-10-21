@@ -401,7 +401,19 @@ impl ConnectionInfo {
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusObservation {
+    pub age_ms: u64,
+    pub capture_ms: u64,
+    /// Time already accounted for inside the native call; do not count it twice.
+    #[serde(default)]
+    pub native_elapsed_ms: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Dashboard {
+    /// Native-observed age; absent on authoritative owner state and old fixtures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_observation: Option<StatusObservation>,
     pub sequence: u64,
     pub boot_id: String,
     pub build: String,

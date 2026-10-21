@@ -18,7 +18,8 @@
     "docs/mac-parity.md",
     "docs/account-devices.md",
     "docs/tunnel-protection.md",
-    "docs/candidate-install.md"
+    "docs/candidate-install.md",
+    "docs/windows-desktop-status.md"
   ],
   "handoff_mode": "direct_source_maintenance_and_verification",
   "platforms": [

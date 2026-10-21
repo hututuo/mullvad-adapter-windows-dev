@@ -112,6 +112,13 @@ impl Identity {
         self.scope = scope.into();
         Ok(self)
     }
+    /// Only for the read-only pipe, never for storage or the control-owner lease.
+    /// Dots cannot occur in user scopes, so this cannot alias a control scope.
+    pub fn status_channel(&self) -> Self {
+        let mut status = self.clone();
+        status.scope.push_str(".Status");
+        status
+    }
     fn same_user_session(&self, other: &Self) -> bool {
         self.sid == other.sid && self.session == other.session
     }
@@ -159,6 +166,24 @@ impl Security {
 /// Hold for the entire host lifetime. Never inherited by UI/engine children.
 pub struct SingleInstance(Handle);
 impl SingleInstance {
+    /// Read presence only; do not wait for or acquire ownership of this mutex.
+    pub fn exists(owner: &Identity) -> io::Result<bool> {
+        let name = wide(&format!(
+            r"Local\MullvadAdapter.{}.{}.{}",
+            owner.scope, owner.sid, owner.session
+        ));
+        let raw = unsafe { OpenMutexW(SYNCHRONIZE, 0, name.as_ptr()) };
+        if raw.is_null() {
+            let error = error();
+            return if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
+                Ok(false)
+            } else {
+                Err(error)
+            };
+        }
+        drop(Handle::checked(raw)?);
+        Ok(true)
+    }
     pub fn acquire(owner: &Identity) -> io::Result<Self> {
         let security = Security::new(owner)?;
         let attributes = security.attributes();
@@ -613,3 +638,7 @@ mod tests {
         server.join().unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "windows_status_tests.rs"]
+mod status_tests;

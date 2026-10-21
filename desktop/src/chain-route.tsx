@@ -5,11 +5,12 @@ import {backupResult,canContinueBackup} from "./backup-result";
 type Choice={name:string;fingerprint:string};
 type AutoResult={selected?:string;accepted?:boolean;kept?:boolean;fingerprint?:string;source_fingerprint?:string;revision?:number};
 const pause=(ms:number)=>new Promise<void>(resolve=>window.setTimeout(resolve,ms));
-export function useChainBackup(data:Dashboard|null) {
+export function useChainBackup(data:Dashboard|null,observationCurrent=true) {
   const [working,setWorking]=useState(false),[notice,setNotice]=useState(""),[choices,setChoices]=useState<Choice[]>([]),[selected,setSelected]=useState("");
   const current=useRef(data),alive=useRef(true),flight=useRef(false),next=useRef(0);
   const generation=useRef(0);
   current.current=data;
+  const observation=useRef(observationCurrent);observation.current=observationCurrent;
   useEffect(()=>{setSelected(data?.settings.chain_selection??"");},[data?.settings.chain_selection]);
   useEffect(()=>{alive.current=true;return()=>{alive.current=false;};},[]);
   async function prepare(manual:boolean,excluded:string[]=[]) {
@@ -17,6 +18,7 @@ export function useChainBackup(data:Dashboard|null) {
     return invoke<AutoResult>("clash_request",{input:{kind:"chain_auto",directory:null,exclude_fingerprints:excluded,...(choice?{chain_name:choice.name,chain_fingerprint:choice.fingerprint}:{})}});
   }
   async function maintain(manual=false) {
+    if(!observation.current){setNotice(errorText("status_snapshot_stale"));return;}
     if(flight.current||!current.current)return;
     flight.current=true;setWorking(true);
     try {
@@ -32,12 +34,14 @@ export function useChainBackup(data:Dashboard|null) {
     }catch(e){if(alive.current)setNotice(errorText(typeof e==="string"?e:"clash_not_found"));}
   }
   async function test() {
+    if(!observation.current){setNotice(errorText("status_snapshot_stale"));return;}
     if(flight.current||!current.current)return;
     flight.current=true;setWorking(true);setNotice("正在自动选择备用并验证实际流量…");
     const token=generation.current,initial=current.current,boot=initial.boot_id;
     const pinned=!!(selected||initial.settings.chain_selection),excluded:string[]=[],roundDeadline=performance.now()+420_000;
     let failedSafely=false,passed=false,finalText="没有找到可用的备用路线，当前连接保持原路径。";
     function checkIntent() {
+      if(!observation.current)throw "status_snapshot_stale";
       if(token!==generation.current||!alive.current)throw "connection_cancelled";
       if(current.current?.boot_id!==boot||current.current?.source_sha!==initial.source_sha)throw "boot_changed_reconcile";
       if((current.current.settings.chain_selection??null)!==(initial.settings.chain_selection??null))throw "clash_config_changed";
@@ -83,7 +87,7 @@ export function useChainBackup(data:Dashboard|null) {
       // Testing candidates must not erase a previously verified standby. Never
       // alter configuration during an in-flight trial, cancellation or live chain.
       const d=current.current;
-      if(!passed&&!pinned&&failedSafely&&alive.current&&token===generation.current&&d?.boot_id===boot&&d.source_sha===initial.source_sha&&!d.settings.chain_selection&&d.physical_attachment==="available"&&d.backup_test_status==="failed"&&d.backup_test_restored===true&&d.status==="connected"&&!d.operation&&!d.connection?.chained) {
+      if(observation.current&&!passed&&!pinned&&failedSafely&&alive.current&&token===generation.current&&d?.boot_id===boot&&d.source_sha===initial.source_sha&&!d.settings.chain_selection&&d.physical_attachment==="available"&&d.backup_test_status==="failed"&&d.backup_test_restored===true&&d.status==="connected"&&!d.operation&&!d.connection?.chained) {
         try {
           const revision=d.chain_revision??0,r=await request({kind:"restore_verified_chain",expected_revision:revision});
           if(r.kind==="accepted") {
@@ -102,15 +106,15 @@ export function useChainBackup(data:Dashboard|null) {
   }
   // Independent SS-only maintenance does not open another WG identity.
   useEffect(()=>{
-    if(!data||!("__TAURI_INTERNALS__" in window)||data.settings.tunnel_route==="direct"||data.physical_attachment!=="available"||data.operation||!["connected","disconnected","retry_wait"].includes(data.status)||data.connection?.chained||flight.current||performance.now()<next.current)return;
+    if(!observationCurrent||!data||!("__TAURI_INTERNALS__" in window)||data.settings.tunnel_route==="direct"||data.physical_attachment!=="available"||data.operation||!["connected","disconnected","retry_wait"].includes(data.status)||data.connection?.chained||flight.current||performance.now()<next.current)return;
     next.current=performance.now()+5*60*1000;void maintain();
-  },[data?.sequence]);
+  },[data?.sequence,observationCurrent]);
   return {working,notice,choices,selected,setSelected,loadChoices,maintain,test,cancel:()=>{generation.current+=1;}};
 }
 export type ChainBackup=ReturnType<typeof useChainBackup>;
-export function ChainRoute({data,disabled,onSettings,backup}:{data:Dashboard;disabled:boolean;onSettings:(settings:Settings)=>Promise<void>;backup:ChainBackup}) {
+export function ChainRoute({data,disabled,onSettings,backup,observationCurrent=true}:{data:Dashboard;observationCurrent?:boolean;disabled:boolean;onSettings:(settings:Settings)=>Promise<void>;backup:ChainBackup}) {
   return <section className="panel backup-route">
-    <div className="panel-heading"><div><p className="eyebrow">LAST RESORT</p><h2>链式备用</h2></div><span className="pill">{data.connection?.chained&&data.status==="connected"?"正在保底":"自动维护"}</span></div>
+    <div className="panel-heading"><div><p className="eyebrow">LAST RESORT</p><h2>链式备用</h2></div><span className="pill">{!observationCurrent?"状态待更新":data.connection?.chained&&data.status==="connected"?"正在保底":"自动维护"}</span></div>
     <div className="backup-route-summary"><div><strong>{data.chain_node??"正在从本机 Clash 准备备用"}</strong><p>优先美国，其次新加坡，再尝试英国。保底后仍会尝试回到直连。</p></div>
       <button disabled={disabled||backup.working||data.physical_attachment!=="available"||!data.identity_configured} onClick={()=>void backup.test()}>{backup.working?"正在自动检查…":"测试备用路线"}</button></div>
     <p className="backup-route-result" role="status">{backup.notice||(data.backup_verified_at?`最近一次完整连通：${timeText(data.backup_verified_at)}`:data.chain_node?"备用已保存；原入口、备用入口和同城节点均失败后才使用。":"不需要逐个选、逐个测试；后台会从实际配置中筛选可承载隧道的节点。")}</p>

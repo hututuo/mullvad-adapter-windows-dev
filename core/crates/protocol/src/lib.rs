@@ -2,6 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 pub mod app;
+pub mod app_status;
 pub const API_MAJOR: u16 = 1;
 pub const API_MINOR: u16 = 0;
 pub const MAX_FRAME: usize = 65_536;

@@ -23,6 +23,7 @@ pub struct DesktopStatus {
     ping_age_seconds: Option<u64>,
     state: String,
     stale: bool,
+    status_age_seconds: Option<u64>,
 }
 impl Default for DesktopStatus {
     fn default() -> Self {
@@ -33,6 +34,7 @@ impl Default for DesktopStatus {
             ping_age_seconds: None,
             state: "unknown".into(),
             stale: true,
+            status_age_seconds: None,
         }
     }
 }
@@ -101,6 +103,7 @@ fn snapshot(d: &Dashboard, now: u64) -> DesktopStatus {
         ping_age_seconds: ping.map(|p| now - p.measured_at),
         state: state.into(),
         stale: false,
+        status_age_seconds: None,
     }
 }
 struct StatusCache {
@@ -111,15 +114,28 @@ pub struct UiState {
     status_item: MenuItem<tauri::Wry>,
     ping_item: MenuItem<tauri::Wry>,
 }
+fn observation_instant(dashboard: &Dashboard, received: Instant) -> Option<Instant> {
+    let timing = dashboard.status_observation.as_ref()?;
+    if timing.age_ms > 3000 || timing.capture_ms > timing.age_ms {
+        return None;
+    }
+    received.checked_sub(Duration::from_millis(timing.age_ms))
+}
 pub fn capture(app: &tauri::AppHandle, dashboard: &Dashboard) {
+    let Some(observed) = observation_instant(dashboard, Instant::now()) else {
+        return;
+    };
     if let Some(state) = app.try_state::<UiState>() {
         if let Ok(mut cache) = state.cache.lock() {
-            cache.dashboard = Some((dashboard.clone(), Instant::now()));
+            cache.dashboard = Some((dashboard.clone(), observed));
         };
     }
 }
 fn needs_poll(main_visible: bool, age: Option<Duration>) -> bool {
-    !main_visible && age.is_none_or(|age| age >= Duration::from_secs(7))
+    match age {
+        None => !main_visible,
+        Some(age) => age >= Duration::from_millis(if main_visible { 2500 } else { 1000 }),
+    }
 }
 fn current(app: &tauri::AppHandle) -> DesktopStatus {
     if crate::STOPPING.load(std::sync::atomic::Ordering::Acquire) {
@@ -138,7 +154,8 @@ fn current(app: &tauri::AppHandle) -> DesktopStatus {
     with_freshness(snapshot(dashboard, unix_seconds()), received.elapsed())
 }
 fn with_freshness(mut s: DesktopStatus, age: Duration) -> DesktopStatus {
-    if age > Duration::from_secs(15) {
+    s.status_age_seconds = Some(age.as_secs());
+    if age > adapter_protocol::app_status::MAX_STATUS_AGE {
         s.stale = true;
         s.ping_ms = None;
         s.ping_age_seconds = None;
@@ -159,10 +176,16 @@ fn tooltip(s: &DesktopStatus) -> String {
         || "暂无近期 ICMP 测量".into(),
         |ms| format!("ICMP {ms} ms（{}秒前）", s.ping_age_seconds.unwrap_or(0)),
     );
-    format!("Mullvad Adapter\n{}\n{}\n{}", s.headline, relay, latency)
-        .chars()
-        .take(120)
-        .collect()
+    let age = s
+        .status_age_seconds
+        .map_or_else(|| "尚无状态记录".to_owned(), |age| format!("状态{age}秒前"));
+    format!(
+        "Mullvad Adapter\n{} · {}\n{}\n{}",
+        s.headline, age, relay, latency
+    )
+    .chars()
+    .take(120)
+    .collect()
 }
 fn icon(state: &str) -> Vec<u8> {
     let dot = match state {
@@ -466,8 +489,9 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     .lock()
                     .ok()
                     .and_then(|cache| cache.dashboard.as_ref().map(|(_, at)| at.elapsed()));
-                // Reuse main-window replies. Only poll when hidden and cache is old;
-                // never compete with foreground actions for the bridge gate.
+                // Reuse recent main-window observations. An old cache also needs
+                // refreshing when the window's renderer is stalled. Reads use
+                // their own pipe/gate, never the foreground control lane.
                 if needs_poll(main_visible, age) {
                     if let Ok(adapter_protocol::app::AppReply::Dashboard { dashboard }) =
                         crate::transact(adapter_protocol::app::AppCommand::Dashboard)
@@ -478,7 +502,7 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             }
             // Explicit stop can remain unconfirmed; do not freeze a healthy icon.
             publish(&handle);
-            std::thread::sleep(Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(1500));
         })?;
     Ok(())
 }
@@ -487,10 +511,33 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     #[test]
+    fn observation_age_is_not_reset_by_tray_capture_and_unknown_timing_is_rejected() {
+        let mut d = dashboard();
+        let now = Instant::now();
+        assert!(observation_instant(&d, now).is_none());
+        d.status_observation = Some(adapter_protocol::app::StatusObservation {
+            age_ms: 2400,
+            capture_ms: 2,
+            native_elapsed_ms: 0,
+        });
+        let observed = observation_instant(&d, now).unwrap();
+        assert_eq!(now.duration_since(observed), Duration::from_millis(2400));
+        let s = with_freshness(
+            snapshot(&d, 1000),
+            now.duration_since(observed) + Duration::from_secs(1),
+        );
+        assert!(s.stale);
+        assert_eq!(s.status_age_seconds, Some(3));
+        assert_eq!(s.ping_ms, None);
+        d.status_observation.as_mut().unwrap().age_ms = 3001;
+        assert!(observation_instant(&d, now).is_none());
+    }
+    #[test]
     fn foreground_replies_are_reused_without_an_extra_bridge_poll() {
         assert!(!needs_poll(true, None));
-        assert!(!needs_poll(true, Some(Duration::from_secs(99))));
-        assert!(!needs_poll(false, Some(Duration::from_secs(3))));
+        assert!(needs_poll(true, Some(Duration::from_secs(99))));
+        assert!(!needs_poll(false, Some(Duration::from_millis(500))));
+        assert!(needs_poll(false, Some(Duration::from_secs(1))));
         assert!(needs_poll(false, None));
         assert!(needs_poll(false, Some(Duration::from_secs(7))));
     }

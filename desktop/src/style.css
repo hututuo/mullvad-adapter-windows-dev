@@ -821,3 +821,9 @@ footer {
 .status-widget.recovering .widget-globe,.status-widget.degraded .widget-globe { color:#b78640; }
 
 .modal.activity-modal { width:min(940px,calc(100vw - 32px));max-height:calc(100vh - 32px); }
+
+/* Always reserve the same space: read warnings must not move the page. */
+.status-read-strip { height:58px; margin:0 0 16px; padding:8px 12px; border:1px solid var(--border); border-radius:10px; display:flex; flex-direction:column; justify-content:center; gap:3px; font-size:12px; color:var(--muted); overflow:hidden; }
+.status-read-strip strong { font-size:12px; color:#172c35; }
+.status-read-strip span { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.status-read-strip.delayed { border-color:#d2ab68; background:#fff9ee; }

@@ -638,6 +638,10 @@ pub fn serve(scope: &str) -> io::Result<()> {
     let pipe_identity = Identity::current()?.with_scope(scope)?;
     let _instance = SingleInstance::acquire(&pipe_identity)?;
     let boot = boot_id()?;
+    // Answer pending-state reads before identity/catalogue/disk initialisation.
+    let publication = adapter_protocol::app_status::StatusPublication::default();
+    let _status_server =
+        crate::status_pipe::StatusServer::start(&pipe_identity, boot.clone(), publication.clone())?;
     let root = AppRoot::open(scope)?;
     let store = PrivateStore::open(&root.path().join("store"))?;
     let mut identity = load_identity(&store).map_err(|e| io::Error::other(e.code()))?;
@@ -651,6 +655,7 @@ pub fn serve(scope: &str) -> io::Result<()> {
     let (api, api_results) = api_worker(store.clone(), root.path().to_owned(), logs.clone())?;
     logs.event("start", "agent_started")?;
     let mut dashboard = Dashboard {
+        status_observation: None,
         sequence: 0,
         boot_id: boot,
         build: env!("CARGO_PKG_VERSION").into(),
@@ -814,6 +819,7 @@ pub fn serve(scope: &str) -> io::Result<()> {
     let mut maintenance = BTreeMap::<String, (u64, usize)>::new();
     let mut shutdown = false;
     let mut receipts = VecDeque::<(String, AppReply)>::new();
+    let mut last_publication = None;
     let mut last_attachment = "unknown".to_string();
     loop {
         let (effect, event) = owner.poll();
@@ -1213,9 +1219,7 @@ pub fn serve(scope: &str) -> io::Result<()> {
                     failure(code)
                 } else {
                     match checked.command {
-                        AppCommand::Dashboard => AppReply::Dashboard {
-                            dashboard: Box::new(dashboard.clone()),
-                        },
+                        AppCommand::Dashboard => failure("status_channel_required"),
                         AppCommand::RefreshCatalogue => {
                             if !catalogue_refresh.try_start_manual() {
                                 failure(if catalogue_refresh.in_flight() {
@@ -1836,6 +1840,13 @@ pub fn serve(scope: &str) -> io::Result<()> {
             }
             logs.event("stop", "agent_stopped")?;
             return Ok(());
+        }
+        let now = Instant::now();
+        if last_publication.is_none_or(|at| {
+            now.duration_since(at) >= adapter_protocol::app_status::STATUS_INTERVAL
+        }) {
+            last_publication = Some(now);
+            let _ = publication.publish(&dashboard, now);
         }
         thread::sleep(Duration::from_millis(20));
     }

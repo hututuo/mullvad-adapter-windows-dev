@@ -27,6 +27,8 @@ import { canCreateDevice } from "./device-creation";
 import { ActivityPanel } from "./activity-panel";
 import { DesktopSettings } from "./desktop-settings";
 import { StatusWidget } from "./status-widget";
+import { StatusReadHealth } from "./status-read";
+import { StatusReadStrip } from "./status-read-strip";
 type Page = "setup" | "cities" | "account" | "clash" | "relays" | "diagnostics";
 const pages: { id: Page; name: string; mark: string }[] = [
   { id: "setup", name: "使用引导", mark: "◇" },
@@ -72,7 +74,7 @@ function Modal({
 function App() {
   const [page, setPage] = useState<Page>("cities"),
     [data, setData] = useState<Dashboard | null>(null),
-    [message, setMessage] = useState("正在连接本机后台…"),
+    [message, setMessage] = useState("后台操作与连接进度显示在这里。"),
     [error, setError] = useState(false),
     [pending, setPending] = useState(false);
   const reportRequested = useRef<{ operation: string | null; boot: string } | null>(null);
@@ -105,8 +107,11 @@ function App() {
     });
     return () => { closed = true; void registration.then(unlisten => unlisten()).catch(() => {}); };
   }, []);
+  const statusHealth = useRef(new StatusReadHealth());
+  const [statusNow,setStatusNow] = useState(()=>performance.now());
+  const statusView = statusHealth.current.view(statusNow);
+  useEffect(()=>{const timer=setInterval(()=>setStatusNow(performance.now()),1000);return ()=>clearInterval(timer);},[]);
   const flight = useRef(false),
-    refreshFailed = useRef(false),
     mounted = useRef(false),
     current = useRef<Dashboard | null>(null);
   const [chooser, setChooser] = useState(false),
@@ -133,19 +138,20 @@ function App() {
       setRelayPage(reply.page);
     }
   }, []);
-  const refresh = useCallback(async (manual = false) => {
+  const refresh = useCallback(async () => {
     if (flight.current || stopping.current) return;
     flight.current = true;
+    const readID=statusHealth.current.begin(),started=performance.now();
     try {
       const reply = await request({ kind: "dashboard" });
       if (mounted.current && !stopping.current) {
-        const firstSnapshot = current.current === null;
+        if(reply.kind!=="dashboard") {
+          statusHealth.current.failure(readID,reply.kind==="error"?reply.code:"status_response_invalid",performance.now());
+          return;
+        }
+        if(!statusHealth.current.success(readID,reply.dashboard,started,performance.now()))return;
         accept(reply);
-        if (reply.kind === "error") {
-          refreshFailed.current = true;
-          setMessage(errorText(reply.code));
-          setError(true);
-        } else if (reply.kind === "dashboard" && actionRequested.current
+        if (actionRequested.current
           && reply.dashboard.boot_id !== actionRequested.current.boot) {
           actionRequested.current = null;
           setMessage("后台已重启，请核对刚才操作的结果。");
@@ -157,24 +163,18 @@ function App() {
           && !["connecting", "disconnecting"].includes(reply.dashboard.status)) {
           const catalogueResult = actionRequested.current.catalogue;
           actionRequested.current = null;
-          refreshFailed.current = false;
           const code = catalogueResult ? reply.dashboard.metadata_error : reply.dashboard.last_error;
           setMessage(code ? errorText(code) : catalogueResult ? "官方目录已更新，现有连接保持运行。" : "操作已完成");
           setError(!!code);
-        } else if (manual || firstSnapshot || refreshFailed.current) {
-          setMessage(refreshFailed.current ? "后台连接已恢复" : "当前状态已同步");
-          setError(false);
-          refreshFailed.current = false;
         }
       }
     } catch (failure) {
       if (mounted.current && !stopping.current) {
-        refreshFailed.current = true;
-        setMessage(bridgeError(failure));
-        setError(true);
+        statusHealth.current.failure(readID,failure,performance.now());
       }
     } finally {
       flight.current = false;
+      if(mounted.current)setStatusNow(performance.now());
     }
   }, [accept]);
   useEffect(() => {
@@ -224,7 +224,6 @@ function App() {
       };
     }
     flight.current = true;
-    refreshFailed.current = false;
     actionRequested.current = null;
     setPending(true);
     setError(false);
@@ -338,7 +337,7 @@ function App() {
       setError(true);
     }
   }, [data?.last_report_path, data?.boot_id, data?.operation, data?.last_error]);
-  const backup = useChainBackup(data);
+  const backup = useChainBackup(data,statusView.fresh);
   const chosen = data?.cities.find((c) => c.id === data.settings.selected_city),
     busy = pending || backup.working || !!data?.operation || ["testing_backup","restoring_previous","returning_direct"].includes(data?.recovery?.stage??""),
     quickState = data?.quick_test;
@@ -383,9 +382,9 @@ function App() {
         </nav>
         <div className="sidebar-bottom">
           <span
-            className={`status-dot ${data?.status === "connected" ? "green" : ""}`}
+            className={`status-dot ${statusView.fresh && data?.status === "connected" ? "green" : ""}`}
           />
-          {data ? (statusText[data.status] ?? data.status) : "后台连接中"}
+          {statusView.fresh && data ? (statusText[data.status] ?? data.status) : statusView.label}
           <small>
             本机入口 {data ? `127.0.0.1:${data.settings.front_port}` : "—"}
           </small>
@@ -399,7 +398,7 @@ function App() {
           </div>
           <button
             className="quiet"
-            onClick={() => void refresh(true)}
+            onClick={() => void refresh()}
             disabled={pending}
           >
             刷新状态
@@ -416,13 +415,14 @@ function App() {
           />
           <span>
             {data?.operation
-              ? `正在进行：${operationText[data.operation] ?? data.operation}`
+              ? `${statusView.fresh ? "正在进行" : "上次记录的操作"}：${operationText[data.operation] ?? data.operation}`
               : message}
           </span>
           <button className="activity-open" onClick={()=>setShowActivity(true)}>查看详情与日志</button>
         </div>
-        {page === "setup" && <SetupPage data={data} navigate={setPage}/>}
-        {page === "clash" && <ClashPage frontPort={data?.settings.front_port??17890} connected={data?.status==="connected"} disabled={!data||busy} bootstrapPort={data?.settings.bootstrap_port??null} onUseProxy={async(port)=>{
+        <StatusReadStrip view={statusView}/>
+        {page === "setup" && <SetupPage data={data} observationCurrent={statusView.fresh} navigate={setPage}/>}
+        {page === "clash" && <ClashPage frontPort={data?.settings.front_port??17890} connected={statusView.fresh && data?.status==="connected"} disabled={!data||busy} bootstrapPort={data?.settings.bootstrap_port??null} onUseProxy={async(port)=>{
           const latest=current.current;if(!latest)throw new Error("backend_unavailable");
           const reply=await request({kind:"save_settings",settings:{...latest.settings,bootstrap_port:port}});
           if(reply.kind==="error")throw new Error(reply.code);
@@ -478,8 +478,8 @@ function App() {
                 );
               })}
             </div>
-            {data && <RecoveryPanel data={data} busy={busy} onAction={act} />}
-            {data && <ChainRoute data={data} disabled={busy} backup={backup} onSettings={async next=>{await act({kind:"save_settings",settings:next});setSettings({...next});}} />}
+            {data && <RecoveryPanel data={data} busy={busy} observationCurrent={statusView.fresh} onAction={act} />}
+            {data && <ChainRoute data={data} observationCurrent={statusView.fresh} disabled={busy || !statusView.fresh} backup={backup} onSettings={async next=>{await act({kind:"save_settings",settings:next});setSettings({...next});}} />}
             <section className="panel">
               <div className="panel-heading"><h2>同城备选</h2><button className="quiet" disabled={!data || busy} onClick={()=>setChooser(true)}>管理城市</button></div>
               <p className="hint">
@@ -1013,7 +1013,7 @@ function App() {
                 </form>
               </section>
             )}
-            {data && <ChainRoute data={data} disabled={busy} backup={backup} onSettings={async next => {
+            {data && <ChainRoute data={data} observationCurrent={statusView.fresh} disabled={busy || !statusView.fresh} backup={backup} onSettings={async next => {
               const latest = current.current;
               if (!latest) return;
               setSettings(draft => draft ? {...draft, tunnel_route:next.tunnel_route,chain_selection:next.chain_selection} : draft);
@@ -1025,7 +1025,7 @@ function App() {
           关闭窗口可从托盘重新打开。这里只保护经过适配器的流量，系统分流由外部代理管理。
         </footer>
       </main>
-      {showActivity && <Modal wide labelledBy="event-log-title" onClose={()=>setShowActivity(false)}><ActivityPanel current={data} stale={refreshFailed.current} onClose={()=>setShowActivity(false)} onExport={()=>void act({kind:"export_report"})}/></Modal>}
+      {showActivity && <Modal wide labelledBy="event-log-title" onClose={()=>setShowActivity(false)}><ActivityPanel current={data} stale={!statusView.fresh} onClose={()=>setShowActivity(false)} onExport={()=>void act({kind:"export_report"})}/></Modal>}
       {chooser && data && (
         <Modal labelledBy="city-title" onClose={() => setChooser(false)}>
           <div className="panel-heading">

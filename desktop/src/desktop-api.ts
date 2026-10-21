@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { EventItem } from "./event-text";
 export type EventPage = { events: EventItem[]; skipped:number; truncated:boolean };
 export type DesktopPreferences = { autostart:boolean; widget:boolean; startup_error:string|null };
-export type DesktopStatus = { headline:string; relay:string|null; ping_ms:number|null; ping_age_seconds:number|null; state:string; stale:boolean };
+export type DesktopStatus = { headline:string; relay:string|null; ping_ms:number|null; ping_age_seconds:number|null; state:string; stale:boolean; status_age_seconds?:number|null };
 export const readEvents = () => invoke<EventPage>("read_recent_events");
 export const getDesktopPreferences = () => invoke<DesktopPreferences>("desktop_preferences");
 export const setAutostart = (enabled:boolean) => invoke<boolean>("set_autostart",{enabled});

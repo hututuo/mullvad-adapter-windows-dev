@@ -1,12 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use adapter_protocol::app::{AppCommand, AppReply, AppRequest, APP_API_MAJOR};
+mod bridge_lanes;
 mod clash;
 mod desktop_ui;
+#[cfg(windows)]
+mod status_bridge;
 use tauri::Emitter;
 #[cfg(windows)]
 #[path = "../../../core/crates/agent/src/live_runtime.rs"]
 mod live_runtime;
-static BRIDGE_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static BRIDGE_LANES: bridge_lanes::BridgeLanes = bridge_lanes::BridgeLanes::new();
 static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static STOP_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -104,17 +107,28 @@ fn transact(command: AppCommand) -> Result<AppReply, String> {
     if STOPPING.load(std::sync::atomic::Ordering::Acquire) && !shutdown {
         return Err("backend_stopping".into());
     }
-    let _gate = BRIDGE_GATE.try_lock().map_err(|_| "operation_busy")?;
+    let _gate = BRIDGE_LANES.enter(&command)?;
+    if matches!(command, AppCommand::Dashboard) {
+        return status_bridge::read();
+    }
+    // Shutdown waits for any verified launch already in flight before it can
+    // confirm exit. A launch after STOPPING was set is rejected at its source.
+    let _startup = if shutdown {
+        Some(
+            BRIDGE_LANES
+                .startup
+                .try_lock()
+                .map_err(|_| "operation_busy")?,
+        )
+    } else {
+        None
+    };
     if shutdown {
         STOPPING.store(true, std::sync::atomic::Ordering::Release);
     }
     use adapter_platform::windows::{boot_id, Identity, Pipe};
     use adapter_protocol::{read_frame, write_frame, ResponseAck};
-    use std::{
-        os::windows::process::CommandExt,
-        process::{Command, Stdio},
-        time::Duration,
-    };
+    use std::time::Duration;
     let identity = Identity::current()
         .and_then(|i| i.with_scope("Windows"))
         .map_err(|_| "user_identity_unavailable")?;
@@ -132,32 +146,7 @@ fn transact(command: AppCommand) -> Result<AppReply, String> {
             if shutdown {
                 return Err("backend_stop_unconfirmed".into());
             }
-            let sha = option_env!("ADAPTER_SOURCE_SHA").ok_or("runtime_invalid")?;
-            let exe = std::env::current_exe().map_err(|_| "runtime_invalid")?;
-            let runtime = live_runtime::verify_runtime_dir(
-                &exe.parent().ok_or("runtime_invalid")?.join("runtime"),
-                sha,
-                env!("CARGO_PKG_VERSION"),
-            )
-            .map_err(|_| "runtime_invalid")?;
-            use sha2::{Digest, Sha256};
-            let expected = option_env!("ADAPTER_RUNTIME_MANIFEST_SHA256")
-                .ok_or("runtime_manifest_unpinned")?;
-            let manifest = std::fs::read(runtime.runtime_dir.join("manifest.json"))
-                .map_err(|_| "runtime_invalid")?;
-            if manifest.len() > 1024 * 1024
-                || format!("{:x}", Sha256::digest(&manifest)) != expected
-            {
-                return Err("runtime_manifest_pin_mismatch".into());
-            }
-            Command::new(&runtime.adapter_agent)
-                .arg("--serve")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .creation_flags(0x08000000 | 0x00000200)
-                .spawn()
-                .map_err(|_| "backend_start_failed")?;
+            status_bridge::launch_if_absent(&identity)?;
             Pipe::connect(&identity, Duration::from_secs(3)).map_err(|_| "backend_unavailable")?
         }
         Err(_) => return Err("backend_identity_or_pipe_rejected".into()),

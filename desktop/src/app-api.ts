@@ -46,6 +46,7 @@ export function probeText(value: boolean | null, outcome?: ProbeOutcome) {
 export type RecoveryAction = "retry_current" | "retry_city" | "test_backup" | "chain_fallback" | "return_direct";
 export type RecoveryProgress = { stage:string; relay:string|null; inlet:string|null; attempt:number; elapsed_seconds:number; budget_seconds:number; wait_seconds:number; next:string; direct_return_in_seconds:number|null };
 export type Dashboard = {
+  status_observation?: { age_ms:number; capture_ms:number; native_elapsed_ms:number } | null;
   sequence: number;
   boot_id: string;
   build: string;
@@ -178,12 +179,29 @@ const errors: Record<string, string> = {
   clash_chain_no_working_route: "本次没有找到能承载隧道的备用节点，已保留原配置；后台会稍后再试。",
   route_trial_failed: "本次路线测试未通过；已尝试恢复原路线，可查看当前恢复进度。",
 
-  backend_unavailable: "后台暂不可达，正在重新连接。",
+  backend_unavailable: "暂时无法读取本机后台；当前隧道情况仍需核实。",
+  backend_starting: "本机后台正在启动，请稍候；尚未重复提交操作。",
+  status_read_busy: "本机状态读取暂忙，稍后自动重读；这不代表断网。",
+  status_snapshot_stale: "本机状态更新延迟，正在重新读取；这不代表隧道中断。",
+  status_snapshot_unavailable: "本机后台正在准备状态，稍后自动重读。",
+  status_channel_unavailable: "本机状态通道暂不可读，正在重试；不会因此另启后台。",
+  status_response_invalid: "本机状态格式未通过校验，已保留上次记录。",
+  status_identity_mismatch: "状态所属的后台实例或版本不符，未采用旧结果。",
+  status_request_write_failed: "本机状态请求发送失败，正在重读；不据此判断断网。",
+  status_response_read_failed: "本机状态回包未完整读到，正在重读；不据此判断断网。",
+  status_response_ack_failed: "本机状态接收确认未完成，正在重新核对。",
+  owner_unavailable: "本机控制线程未及时答复；当前隧道情况仍需核实。",
+  request_write_failed: "本机操作请求未能完整发送；请核对结果后重试。",
+  response_read_failed: "本机操作结果未完整读到；请先核对状态，勿重复提交。",
+  response_ack_failed: "本机操作接收确认未完成；请先核对结果，勿重复提交。",
+  backend_identity_or_pipe_rejected: "本机通信身份校验未通过，没有发送控制凭据。",
+  runtime_manifest_unpinned: "程序缺少配套运行清单标识，请核对安装版本。",
+  runtime_manifest_pin_mismatch: "运行组件清单与本程序不一致，未启动未验证组件。",
+  runtime_build_identity_missing: "程序缺少构建身份标识，请核对配套版本。",
   backend_start_failed: "后台启动失败，请导出诊断记录。",
   backend_version_mismatch: "界面与后台版本不一致，请先退出旧后台再启动这版应用。",
   incompatible_backend: "后台接口版本不兼容，请核对安装版本。",
   invalid_handshake: "后台握手未通过，请核对安装版本。",
-  runtime_build_identity_missing: "此构建缺少版本标识，请使用完整候选。",
   clipboard_busy: "剪贴板正在被占用；文件已保留，可点击重新复制。",
   clipboard_write_failed: "剪贴板写入失败；文件已保留，可点击重新复制。",
   clipboard_window_unavailable: "窗口暂不可用；文件已保留，可点击重新复制。",
@@ -257,7 +275,8 @@ export function errorText(code: string) {
   return errors[code] ?? `操作未完成（${code}）`;
 }
 export function bridgeError(error: unknown) {
-  return errorText(typeof error === "string" && Object.hasOwn(errors, error) ? error : "backend_unavailable");
+  return typeof error === "string" && Object.hasOwn(errors,error) ? errorText(error)
+    : "本机操作结果暂未确认；请先核对状态或查看诊断，勿重复提交。";
 }
 export function timeText(seconds: number | null) {
   return seconds === null
