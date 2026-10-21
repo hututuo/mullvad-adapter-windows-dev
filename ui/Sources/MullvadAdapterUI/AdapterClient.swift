@@ -179,7 +179,8 @@ struct AdapterClient: Sendable {
                     } catch {
                         try Task.checkCancellation()
                         readFailures += 1
-                        guard readFailures <= 3, case AdapterClientError.transport = error else { throw error }
+                        guard readFailures <= 3, let failure = error as? AdapterClientError,
+                              failure.isTransportFailure else { throw error }
                         try await Task.sleep(nanoseconds: 500_000_000)
                         continue // Retry only the read, never repeat the POST.
                     }
@@ -264,6 +265,9 @@ struct AdapterClient: Sendable {
             throw CancellationError()
         } catch let error as AdapterClientError {
             throw error
+        } catch let error as URLError {
+            if error.code == .cancelled { throw CancellationError() }
+            throw AdapterClientError.urlTransport(error.code.rawValue)
         } catch {
             throw AdapterClientError.transport(error.localizedDescription)
         }
@@ -282,8 +286,16 @@ struct AdapterClient: Sendable {
 enum AdapterClientError: LocalizedError {
     case cancellationUnconfirmed
     case transport(String)
+    case urlTransport(Int)
     case http(status: Int, code: String?, message: String)
     case invalidResponse(String)
+
+    var isTransportFailure: Bool {
+        switch self {
+        case .transport, .urlTransport: return true
+        default: return false
+        }
+    }
 
     var errorDescription: String? {
         switch self {
@@ -291,6 +303,8 @@ enum AdapterClientError: LocalizedError {
             return "已请求停止测速，但未确认后台已结束；请查看后台状态，暂勿重复测速。"
         case .transport(let message):
             return "无法连接本地适配器：\(message)"
+        case .urlTransport(let code):
+            return "本机服务请求失败（URL 错误 \(code)）：\(URLError(URLError.Code(rawValue: code)).localizedDescription)"
         case .http(let status, let code, let message):
             if let code, !code.isEmpty {
                 return "适配器 HTTP \(status)（\(code)）：\(message)"

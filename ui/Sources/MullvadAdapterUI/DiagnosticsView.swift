@@ -8,6 +8,14 @@ struct DiagnosticsView: View {
             VStack(alignment: .leading, spacing: 16) {
                 header
 
+                if let error = model.connectionError {
+                    AppCard("本机状态通信") {
+                        Text(error).foregroundStyle(.orange).textSelection(.enabled)
+                        Text("下方是上次读取的资料，请按各项时间判断；它不代表当前网络状态。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+
                 if let status = model.status {
                     if let diagnosis = status.diagnosis {
                         NetworkDiagnosisCard(diagnosis: diagnosis)
@@ -139,7 +147,7 @@ struct DiagnosticsView: View {
                     HStack(spacing: 8) {
                         Text("状态")
                             .foregroundStyle(.secondary)
-                        AdapterStatusBadge(rawStatus: status.status)
+                        AdapterStatusBadge(rawStatus: model.displayedStatus)
                     }
                     KeyValueRow(label: "代次", value: status.generation.map(String.init) ?? "—")
                     KeyValueRow(label: "活动槽位", value: status.activeSlot?.uppercased() ?? "—")

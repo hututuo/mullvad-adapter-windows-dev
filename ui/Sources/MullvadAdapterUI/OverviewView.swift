@@ -80,7 +80,7 @@ struct OverviewView: View {
     /// 一眼看懂"现在什么情况"：先一句结论，再把网络和 DNS 分开列。
     private func nowCard(_ status: AdapterStatus) -> some View {
         let headline = readinessHeadline(model.displayedStatus)
-        let facts = readinessFacts(for: status)
+        let facts = model.connectionError == nil ? readinessFacts(for: status) : []
 
         return AppCard("现在什么情况") {
             VStack(alignment: .leading, spacing: 12) {
@@ -88,15 +88,15 @@ struct OverviewView: View {
                     .font(.title3.weight(.semibold))
                     .fixedSize(horizontal: false, vertical: true)
 
-                Text(model.isBusy ? "正在处理，进度会自动更新。" : "后台会检查连接并尝试恢复。遇到问题时点“检查并恢复”，不用先判断该换哪个节点。")
+                Text(model.connectionError ?? (model.isBusy ? "正在处理，进度会自动更新。" : "后台会检查连接并尝试恢复。遇到问题时点“检查并恢复”，不用先判断该换哪个节点。"))
                     .font(.callout).foregroundStyle(.secondary)
 
-                if status.front?.controllerDegraded == true {
+                if model.connectionError == nil, status.front?.controllerDegraded == true {
                     InlineNotice(text: "网页仍能访问，但本地控制接口暂时异常，正在自动复查。", kind: .info)
                 }
 
                 if facts.isEmpty {
-                    Text("还没有探针结果，稍等一下。")
+                    Text(model.connectionError == nil ? "还没有探针结果，稍等一下。" : "下方保留上次读取的资料，当前连通情况待确认。")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 } else {

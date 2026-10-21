@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 enum DiagnosticReportExporter {
     /// Snapshots and a bounded log tail only; configuration / key files are
@@ -15,12 +16,8 @@ enum DiagnosticReportExporter {
             formatter.dateFormat = "yyyyMMdd-HHmmss"
             let name = "Mullvad-诊断-\(formatter.string(from: Date()))-\(UUID().uuidString.prefix(6)).md"
             let destination = directory.appendingPathComponent(name)
-            let logFiles = [
-                logs.appendingPathComponent("events.jsonl.1"),
-                logs.appendingPathComponent("events.jsonl"),
-                logs.appendingPathComponent("daemon.err.log"),
-                home.appendingPathComponent("Library/Logs/MullvadFailOpen/watchdog.log")
-            ]
+            StatusReadLogger.shared.flush()
+            let logFiles = diagnosticLogURLs(home: home)
             let tails = logFiles.map { ($0.path, readTail($0)) }
             let document = render(status: status, metrics: metrics, cities: cities, cachedSummary: cachedSummary,
                                   errors: errors, logs: tails)
@@ -30,14 +27,27 @@ enum DiagnosticReportExporter {
         }.value
     }
 
+    static func diagnosticLogURLs(home: URL) -> [URL] {
+        let logs = home.appendingPathComponent("Library/Logs/MullvadLocalAdapter")
+        return ["events.jsonl.1", "events.jsonl", "ui-status.jsonl.1", "ui-status.jsonl", "daemon.err.log"]
+            .map { logs.appendingPathComponent($0) }
+            + [home.appendingPathComponent("Library/Logs/MullvadFailOpen/watchdog.log")]
+    }
+
     static func readTail(_ url: URL, byteLimit: UInt64 = 64 * 1024) -> String {
         do {
-            let handle = try FileHandle(forReadingFrom: url)
-            defer { try? handle.close() }
+            let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+            guard fd >= 0 else { return "（日志不可读取或不是普通文件）" }
+            defer { close(fd) }
+            var info = stat()
+            guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
+                  info.st_uid == getuid(), info.st_nlink == 1 else { return "（已跳过非普通或不安全的日志文件）" }
+            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
             let length = try handle.seekToEnd()
-            let offset = length > byteLimit ? length - byteLimit : 0
+            let limit = min(byteLimit, 1024 * 1024)
+            let offset = length > limit ? length - limit : 0
             try handle.seek(toOffset: offset)
-            let data = try handle.read(upToCount: Int(byteLimit)) ?? Data()
+            let data = try handle.read(upToCount: Int(limit)) ?? Data()
             var text = String(decoding: data, as: UTF8.self)
             if offset > 0, let newline = text.firstIndex(of: "\n") { text = String(text[text.index(after: newline)...]) }
             return text.isEmpty ? "（日志为空）" : redact(text)
@@ -75,7 +85,7 @@ enum DiagnosticReportExporter {
         - 导出时间：\(ISO8601DateFormatter().string(from: Date()))
         - 系统：\(ProcessInfo.processInfo.operatingSystemVersionString)
         - 界面版本：\(version)
-        - 本次服务状态获取：\(status == nil ? "FAIL（服务未响应；不能把缓存当作当前状态）" : "PASS")
+        - 本次服务状态获取：\(status == nil ? "FAIL（未取得状态；具体原因见错误与 ui-status 日志，不能把缓存当作当前状态）" : "PASS")
         - 采集方式：只读取本地 API 和日志，没有切换节点、重启服务或更改网络。
         - 网页 / DNS 探测以每项的 checked_at、at 或 last_check_at 为准；导出没有额外发起外网测试。
         - 未包含账号、私钥模板、完整 Clash 配置或订阅内容。日志经过常见凭据模式过滤；资料中仍有本机路径、节点地址和访问错误。

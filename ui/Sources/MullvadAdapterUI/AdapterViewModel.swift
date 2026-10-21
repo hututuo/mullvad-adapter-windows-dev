@@ -63,11 +63,18 @@ final class AdapterViewModel: ObservableObject {
     private var statusPollingTask: Task<Void, Never>?
     private var notificationBaselineEstablished = false
     private var lastNotifiedDegradedState: String?
+    private var statusReadHealth = StatusReadHealth()
+    private let statusEventSink: @Sendable (StatusReadEvent) -> Void
+    private let statusClock: () -> TimeInterval
 
-    init(client: AdapterClient = AdapterClient(), defaults: UserDefaults = .standard, preview: Bool = false) {
+    init(client: AdapterClient = AdapterClient(), defaults: UserDefaults = .standard, preview: Bool = false,
+         statusEventSink: @escaping @Sendable (StatusReadEvent) -> Void = { StatusReadLogger.shared.record($0) },
+         statusClock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.client = preview ? CityPreview.client() : client
         self.isPreview = preview
         self.defaults = defaults
+        self.statusEventSink = statusEventSink
+        self.statusClock = statusClock
         if let data = defaults.data(forKey: "MullvadAdapterUI.quickPingResults"),
            let saved = try? JSONDecoder().decode([String: QuickPingResult].self, from: data) {
             quickPingResults = saved
@@ -89,7 +96,7 @@ final class AdapterViewModel: ObservableObject {
     var isBusy: Bool { isActionRunning || status?.operation?.isRunning == true }
 
     var displayedStatus: String? {
-        if connectionError != nil { return "unreachable" }
+        if connectionError != nil { return statusReadHealth.displayStatus(at: statusClock()) ?? "status_pending" }
         if status?.front?.dataPath?.status == "fail", status?.status == "ready" { return "front_fail" }
         return status?.status ?? status?.serviceReadiness
     }
@@ -124,6 +131,9 @@ final class AdapterViewModel: ObservableObject {
 
     var feedbackDetails: [String] {
         var messages = [connectionError, errorMessage, relayErrorMessage, operationMessage, speedMessage, reportMessage].compactMap { $0 }
+        if connectionError != nil {
+            messages.insert("状态读取失败 \(statusReadHealth.failureCount) 次；最后成功：\(lastUpdated?.formatted(date: .numeric, time: .standard) ?? "尚无")。\n此处是本机状态通信，不是隧道通断结论。诊断日志：~/Library/Logs/MullvadLocalAdapter/ui-status.jsonl", at: 0)
+        }
         if let network = status?.localNetwork {
             messages.insert("本机链路：\(network.message ?? network.detail ?? network.status ?? "未知")\n最近检查：\(network.checkedAt ?? "未记录")\n断开：\(network.offlineAt ?? "未记录") · 恢复：\(network.linkRestoredAt ?? "未记录")\n恢复阶段：\(network.recoveryStage ?? "无") · 结果：\(network.outcome ?? "待验证")", at: 0)
         }
@@ -887,14 +897,55 @@ final class AdapterViewModel: ObservableObject {
 
     private func refreshStatusBestEffort() async {
         guard !isPreview else { return }
+        _ = await readStatusSnapshot()
+        guard !Task.isCancelled else { return }
+        await loadCities()
+    }
+
+    private func readStatusSnapshot() async -> AdapterStatus? {
+        let id = statusReadHealth.begin()
+        let started = statusClock()
         do {
             let newStatus = try await client.fetchStatus()
+            let now = statusClock()
+            guard !Task.isCancelled else {
+                recordStatusRead("status-read-cancelled", id: id, started: started, failure: .init(kind: "cancelled", code: nil, connectivity: false))
+                return nil
+            }
+            let recovering = statusReadHealth.lastFailure != nil
+            guard statusReadHealth.finish(id, failure: nil, at: now) else {
+                recordStatusRead("status-read-discarded", id: id, started: started)
+                return nil
+            }
+            let first = lastUpdated == nil
             applyStatusSnapshot(newStatus)
             lastUpdated = Date()
+            if first || recovering || now - started >= 1 {
+                recordStatusRead(first ? "status-read-ready" : (recovering ? "status-read-recovered" : "status-read-slow"), id: id, started: started)
+            }
+            return newStatus
         } catch {
-            connectionError = "本地适配器没有响应。正在自动重试；下方是上次读取的状态。"
+            let failure = Task.isCancelled ? StatusReadFailure(kind: "cancelled", code: nil, connectivity: false) : StatusReadFailure.classify(error)
+            if failure.kind == "cancelled" {
+                recordStatusRead("status-read-cancelled", id: id, started: started, failure: failure)
+                return nil
+            }
+            guard statusReadHealth.finish(id, failure: failure, at: statusClock()) else {
+                recordStatusRead("status-read-discarded", id: id, started: started, failure: failure)
+                return nil
+            }
+            connectionError = statusReadHealth.message(at: statusClock())
+            recordStatusRead("status-read-failed", id: id, started: started, failure: failure)
+            return nil
         }
-        await loadCities()
+    }
+
+    private func recordStatusRead(_ event: String, id: Int, started: TimeInterval, failure: StatusReadFailure? = nil) {
+        let now = statusClock()
+        statusEventSink(StatusReadEvent(event: event, requestID: id, durationMs: max(0, Int((now - started) * 1000)),
+            failureKind: failure?.kind, errorCode: failure?.code, consecutiveFailures: statusReadHealth.failureCount,
+            snapshotAgeSeconds: statusReadHealth.lastSuccessAt.map { max(0, Int(now - $0)) },
+            displayState: statusReadHealth.displayStatus(at: now)))
     }
 
     func loadCities() async {
@@ -903,8 +954,10 @@ final class AdapterViewModel: ObservableObject {
             let workspace = try await client.fetchCities()
             if let generation = workspace.generation, let statusGeneration = status?.generation,
                generation != statusGeneration {
-                let latest = try await client.fetchStatus()
-                applyStatusSnapshot(latest)
+                guard let latest = await readStatusSnapshot() else {
+                    cityErrorMessage = "正在同步最新城市状态…"
+                    return
+                }
                 if let latestGeneration = latest.generation, generation < latestGeneration {
                     cityErrorMessage = "正在同步最新城市状态…"
                     return

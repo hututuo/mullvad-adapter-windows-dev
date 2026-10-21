@@ -31,7 +31,7 @@ struct MenuBarStatusLabel: View {
             return "wifi.slash"
         case "switching", "reconnecting", "network_recovering", "starting":
             return "arrow.triangle.2.circlepath"
-        case "degraded", "degraded_dns", "degraded_service", "data_fail", "fail", "failed", "error":
+        case "degraded", "degraded_dns", "degraded_service", "data_fail", "fail", "failed", "error", "status_pending", "status_invalid", "status_error", "status_unavailable":
             return "exclamationmark.triangle"
         default:
             return "network.badge.shield.half.filled"
@@ -49,7 +49,7 @@ struct MenuBarStatusLabel: View {
     }
 
     private var menuPing: Int? {
-        guard model.status?.localNetwork?.message == nil else { return nil }
+        guard model.connectionError == nil, model.status?.localNetwork?.message == nil else { return nil }
         return model.status?.lastCanary?.pingData?.delayMs
     }
 }
@@ -67,18 +67,20 @@ struct MenuBarControlView: View {
             if let relay = model.status?.activeRelay {
                 Text(relay)
                 Text("\(TransportPreference.shortDisplayName(for: model.status?.activeTransportMode ?? model.status?.activeTransport)) · \(localizedAdapterStatus(model.displayedStatus))")
-                if let status = model.status {
+                if model.connectionError == nil, let status = model.status {
                     let facts = readinessFacts(for: status)
                     if !facts.isEmpty {
                         Text(facts.map { "\($0.label) \($0.detail)" }.joined(separator: " · "))
                     }
                 }
-                if model.status?.localNetwork?.message == nil, let ping = model.status?.lastCanary?.pingData?.delayMs {
+                if model.connectionError == nil, model.status?.localNetwork?.message == nil, let ping = model.status?.lastCanary?.pingData?.delayMs {
                     Text("Ping：\(ping) ms")
                 }
                 if let message = model.status?.localNetwork?.message { Text(message) }
+                if let error = model.connectionError { Text(error) }
             } else {
-                Text("尚未连接")
+                Text(model.connectionError == nil ? "尚未连接" : "连接情况未知")
+                if let error = model.connectionError { Text(error) }
             }
 
             if let status = model.status, status.drainingConnections > 0 {

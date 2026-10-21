@@ -175,8 +175,8 @@ func localizedAdapterStatus(_ rawStatus: String?) -> String {
     case "external": return "外部"
     case "half_open": return "半开"
     case "degraded": return "部分可用"
-    case "degraded_dns": return "网络通，DNS 不通"
-    case "degraded_service": return "网络通，网页打不开"
+    case "degraded_dns": return "隧道可用，DNS 探测未通过"
+    case "degraded_service": return "隧道可用，网页探测未通过"
     case "data_fail": return "网络不通"
     case "backend_fail": return "网络不通（后端路径不通）"
     case "fail", "failed": return "失败"
@@ -190,7 +190,10 @@ func localizedAdapterStatus(_ rawStatus: String?) -> String {
     case "idle": return "空闲"
     case "pending": return "等待中"
     case "unknown": return "未知"
-    case "unreachable": return "适配器未响应"
+    case "unreachable", "status_unavailable": return "无法读取本机服务状态"
+    case "status_pending": return "状态待更新"
+    case "status_invalid": return "状态格式异常"
+    case "status_error": return "状态读取异常"
     case "front_fail": return "本地转发探测未通过"
     default: return rawStatus
     }
@@ -205,9 +208,9 @@ func adapterStatusColor(_ rawStatus: String?) -> Color {
         return .orange
     // 部分可用（例如网络通但 DNS 不通）是"能连出去、但有一项不通"，
     // 用橙色警告色，不要和"完全上不了网"的红色混为一谈。
-    case "degraded", "degraded_dns", "degraded_service":
+    case "degraded", "degraded_dns", "degraded_service", "status_pending", "status_invalid", "status_error":
         return .orange
-    case "front_fail", "unreachable", "data_fail", "backend_fail", "fail", "failed", "error", "tripped", "open":
+    case "front_fail", "unreachable", "status_unavailable", "data_fail", "backend_fail", "fail", "failed", "error", "tripped", "open":
         return .red
     default:
         return .secondary
@@ -273,8 +276,8 @@ func readinessHeadline(_ rawStatus: String?) -> String {
     case "waiting_network": return "本机网络断开，等待恢复"
     case "network_recovering": return "本机网络恢复，正在验证原连接"
     case "starting": return "正在启动…"
-    case "degraded_dns": return "能连出去，但 DNS 不通 —— 网页打不开"
-    case "degraded_service": return "网络通、DNS 通，但网页打不开"
+    case "degraded_dns": return "隧道仍可用，DNS 探测未通过"
+    case "degraded_service": return "隧道与 DNS 可用，网页探测未通过"
     case "degraded": return "能连出去，但有一项不通"
     case "data_fail": return "上不了网"
     case "backend_fail": return "上不了网（后端路径不通）"

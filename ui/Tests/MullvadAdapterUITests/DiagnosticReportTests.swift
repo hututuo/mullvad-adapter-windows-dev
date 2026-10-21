@@ -7,7 +7,7 @@ final class DiagnosticReportTests: XCTestCase {
             status: nil, metrics: Data(#"{"password":"metrics-secret"}"#.utf8),
             cachedSummary: "private_key=cache-secret", errors: ["Bearer error-secret"],
             logs: [("/tmp/events.jsonl", "account: 1234567890123456\nhttps://user:pass@example.test\nhttps://example.test/?token=abc")])
-        XCTAssertTrue(report.contains("FAIL（服务未响应"))
+        XCTAssertTrue(report.contains("FAIL（未取得状态"))
         XCTAssertTrue(report.contains("/tmp/events.jsonl"))
         for secret in ["metrics-secret", "cache-secret", "error-secret", "1234567890123456", "user:pass", "token=abc"] {
             XCTAssertFalse(report.contains(secret), secret)
