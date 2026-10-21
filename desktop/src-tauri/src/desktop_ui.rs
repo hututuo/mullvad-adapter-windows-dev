@@ -122,6 +122,12 @@ fn needs_poll(main_visible: bool, age: Option<Duration>) -> bool {
     !main_visible && age.is_none_or(|age| age >= Duration::from_secs(7))
 }
 fn current(app: &tauri::AppHandle) -> DesktopStatus {
+    if crate::STOPPING.load(std::sync::atomic::Ordering::Acquire) {
+        return DesktopStatus {
+            headline: "正在停止后台，等待确认".into(),
+            ..DesktopStatus::default()
+        };
+    }
     let state = app.state::<UiState>();
     let Ok(cache) = state.cache.lock() else {
         return DesktopStatus::default();
@@ -452,7 +458,7 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             if !crate::STOPPING.load(std::sync::atomic::Ordering::Acquire) {
                 let main_visible = handle
                     .get_webview_window("main")
-                    .and_then(|w| w.is_visible().ok())
+                    .and_then(|w| Some(w.is_visible().ok()? && !w.is_minimized().ok()?))
                     .unwrap_or(true);
                 let age = handle
                     .state::<UiState>()
@@ -469,8 +475,9 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         capture(&handle, &dashboard);
                     }
                 }
-                publish(&handle);
             }
+            // Explicit stop can remain unconfirmed; do not freeze a healthy icon.
+            publish(&handle);
             std::thread::sleep(Duration::from_secs(5));
         })?;
     Ok(())
