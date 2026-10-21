@@ -81,7 +81,7 @@ summary:focus-visible {
 .widget-globe svg { width:30px;height:30px;fill:none;stroke:currentColor;stroke-width:1.5; }
 .status-widget .widget-body { flex:1;min-width:0;display:flex;flex-direction:column;align-items:start;border:0;background:transparent;min-height:55px;padding:0;gap:3px;text-align:left; }
 .widget-body strong { font-size:12px;white-space:nowrap;text-overflow:ellipsis;overflow:hidden;max-width:176px; }
-.widget-body span { font:11px Consolas,monospace; }
+.widget-body span { font:11px Consolas,monospace;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis; }
 .widget-body small { font-size:10px;color:#61796d; }
 .status-widget .widget-close { border:0;background:transparent;align-self:start;min-height:22px;min-width:22px;padding:0;font-size:17px; }
 @media(max-width:800px){.activity-event{grid-template-columns:1fr;gap:3px}.activity-tools{gap:6px}.activity-open{padding:8px;font-size:12px}}

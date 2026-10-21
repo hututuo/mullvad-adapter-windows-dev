@@ -61,6 +61,8 @@ fn snapshot(d: &Dashboard, now: u64) -> DesktopStatus {
         .filter(|p| p.rtt_ms <= 60_000 && p.measured_at <= now && now - p.measured_at <= 180);
     let (headline, state) = if d.physical_attachment == "unavailable" {
         ("本机离线，暂停恢复", "offline")
+    } else if connected && !d.front_ready {
+        ("本机转发入口待恢复", "degraded")
     } else if connected {
         match d.readiness.as_deref() {
             Some("ready") => (
@@ -521,6 +523,14 @@ mod tests {
         let s = snapshot(&d, 1000);
         assert_eq!(s.ping_ms, None);
         assert_eq!(s.state, "offline");
+    }
+    #[test]
+    fn backend_connected_with_broken_front_cannot_look_fully_ready() {
+        let mut d = dashboard();
+        d.front_ready = false;
+        let s = snapshot(&d, 1000);
+        assert_eq!(s.state, "degraded");
+        assert!(s.headline.contains("入口待恢复"));
     }
     #[test]
     fn stale_snapshot_cannot_report_current_latency_or_disconnect() {
