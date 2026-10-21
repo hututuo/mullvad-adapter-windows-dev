@@ -2,6 +2,10 @@ name: windows-shared-core
 on:
   workflow_dispatch:
     inputs:
+      tests_only:
+        description: Run tests only; skip standalone release builds, executable uploads and installer
+        type: boolean
+        default: false
       build_candidate:
         description: Build unsigned Windows x64 NSIS candidate after checks
         type: boolean
@@ -27,9 +31,10 @@ jobs:
           components: rustfmt
       - run: cargo fmt --manifest-path core/Cargo.toml --all -- --check
       - run: cargo test --manifest-path core/Cargo.toml --locked
-      - run: cargo build --manifest-path core/Cargo.toml --locked --release
+      - if: ${{ !inputs.tests_only }}
+        run: cargo build --manifest-path core/Cargo.toml --locked --release
       - uses: actions/upload-artifact@v4
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && !inputs.tests_only
         with:
           name: windows-development-agent-${{ github.sha }}
           path: core/target/release/adapter-agent.exe
@@ -93,8 +98,10 @@ jobs:
       - run: npm run build
         working-directory: desktop
       - run: cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked
-      - run: cargo build --manifest-path desktop/src-tauri/Cargo.toml --locked --release
+      - if: ${{ !inputs.tests_only }}
+        run: cargo build --manifest-path desktop/src-tauri/Cargo.toml --locked --release
       - uses: actions/upload-artifact@v4
+        if: ${{ !inputs.tests_only }}
         with:
           name: windows-development-ui-${{ github.sha }}
           path: desktop/src-tauri/target/release/mullvad-adapter-desktop.exe
@@ -102,7 +109,7 @@ jobs:
           retention-days: 14
   candidate-build:
     name: unsigned Windows installer candidate
-    if: github.event_name == 'workflow_dispatch' && inputs.build_candidate
+    if: github.event_name == 'workflow_dispatch' && inputs.build_candidate && !inputs.tests_only
     needs: [core-checks, mihomo-config-parser, macos-compatibility, desktop-checks]
     runs-on: windows-2022
     timeout-minutes: 60
