@@ -212,6 +212,8 @@ fn main_window(app: &tauri::AppHandle) {
     }
 }
 
+static WIDGET_GATE: Mutex<()> = Mutex::new(());
+
 fn show_widget(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
     if !enabled {
         if let Some(w) = app.get_webview_window("status-widget") {
@@ -287,6 +289,7 @@ pub async fn set_status_widget(
     if window.label() != "main" {
         return Err("window_not_authorized".into());
     }
+    let _guard = WIDGET_GATE.try_lock().map_err(|_| "operation_busy")?;
     let previous = adapter_platform::windows_startup::widget_enabled()?;
     let actual = adapter_platform::windows_startup::set_widget_enabled(enabled)?;
     if let Err(error) = show_widget(&app, actual) {
@@ -304,6 +307,7 @@ pub fn hide_status_widget(app: tauri::AppHandle, window: tauri::Window) -> Resul
     if window.label() != "status-widget" {
         return Err("window_not_authorized".into());
     }
+    let _guard = WIDGET_GATE.try_lock().map_err(|_| "operation_busy")?;
     adapter_platform::windows_startup::set_widget_enabled(false)?;
     show_widget(&app, false)
 }
@@ -403,14 +407,22 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = crate::begin_shutdown(app.clone());
             }
             "widget" => {
-                if let Ok(previous) = adapter_platform::windows_startup::widget_enabled() {
-                    let enabled = !previous;
-                    if adapter_platform::windows_startup::set_widget_enabled(enabled).is_ok() {
-                        if show_widget(app, enabled).is_err() {
+                // WebView2 creation in a synchronous event handler can deadlock.
+                // A separate worker also keeps tray handling responsive.
+                let handle = app.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let Ok(_guard) = WIDGET_GATE.try_lock() else {
+                        return;
+                    };
+                    if let Ok(previous) = adapter_platform::windows_startup::widget_enabled() {
+                        let enabled = !previous;
+                        if adapter_platform::windows_startup::set_widget_enabled(enabled).is_ok()
+                            && show_widget(&handle, enabled).is_err()
+                        {
                             let _ = adapter_platform::windows_startup::set_widget_enabled(previous);
                         }
                     }
-                }
+                });
             }
             _ => {}
         })
