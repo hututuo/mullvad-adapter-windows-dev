@@ -344,9 +344,18 @@ pub enum ProbeOutcome {
     Unavailable,
     NotRunDnsFailed,
 }
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PingMeasurement {
+    pub rtt_ms: u32,
+    pub measured_at: u64,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectionInfo {
+    /// Existing outer ICMP maintenance evidence, never tunnel readiness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ping: Option<PingMeasurement>,
     #[serde(default)]
     pub chained: bool,
     pub relay: String,
@@ -363,7 +372,10 @@ pub struct ConnectionInfo {
 }
 impl ConnectionInfo {
     pub fn valid(&self) -> bool {
-        self.relay.len() <= 128
+        self.ping
+            .as_ref()
+            .is_none_or(|p| p.rtt_ms <= 60_000 && p.measured_at <= 9_007_199_254_740_991)
+            && self.relay.len() <= 128
             && !self.relay.is_empty()
             && self
                 .relay

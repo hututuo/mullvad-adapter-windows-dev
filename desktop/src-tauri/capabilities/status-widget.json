@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "status-widget",
+  "description": "Small status display: read-only native status, drag, close itself, or open the main window. No backend commands, account operations or arbitrary files.",
+  "windows": [
+    "status-widget"
+  ],
+  "permissions": [
+    "allow-desktop-status",
+    "allow-widget-controls",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

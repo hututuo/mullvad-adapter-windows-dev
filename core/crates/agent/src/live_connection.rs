@@ -1006,6 +1006,7 @@ impl Connections {
             self.seed_manual_candidates(attempt.path.city.clone(), alternatives, relay.is_some());
         }
         dashboard.connection = Some(ConnectionInfo {
+            ping: None,
             relay: attempt.path.relay.clone(),
             city: attempt.path.city.clone(),
             inlet: attempt.path.inlet.clone(),

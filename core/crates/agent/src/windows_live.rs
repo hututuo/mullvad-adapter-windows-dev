@@ -56,6 +56,29 @@ struct QueuedConnect {
 }
 const PING_DISPLAY_TTL: Duration = Duration::from_secs(180);
 fn update_candidates(dashboard: &mut Dashboard, pings: &BTreeMap<String, PingObservation>) {
+    // Reuse the existing bounded ICMP maintenance. No new probe or WG peer.
+    // Bind the number to the current relay and a fresh observation only.
+    if let Some(info) = &mut dashboard.connection {
+        info.ping = if dashboard.status == "connected"
+            && dashboard.physical_attachment == "available"
+            && dashboard.active_relay.as_ref() == Some(&info.relay)
+        {
+            pings
+                .get(&info.relay)
+                .filter(|o| o.city == info.city && o.measured.elapsed() <= PING_DISPLAY_TTL)
+                .and_then(|o| match o.result {
+                    Ok(PingResult::Reply { rtt_ms }) => {
+                        Some(adapter_protocol::app::PingMeasurement {
+                            rtt_ms,
+                            measured_at: o.at,
+                        })
+                    }
+                    _ => None,
+                })
+        } else {
+            None
+        };
+    }
     dashboard.city_candidates.clear();
     for city in &dashboard.settings.favorite_cities {
         let mut candidates: Vec<_> = pings

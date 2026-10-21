@@ -12,6 +12,9 @@
     "allow-clash-request",
     "allow-copy-clash-config",
     "core:event:allow-listen",
-    "core:event:allow-unlisten"
+    "core:event:allow-unlisten",
+    "allow-recent-events",
+    "allow-desktop-preferences",
+    "allow-desktop-status"
   ]
 }

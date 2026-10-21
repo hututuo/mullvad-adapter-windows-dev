@@ -22,3 +22,23 @@ commands.allow = ["clash_request"]
 identifier = "allow-copy-clash-config"
 description = "Copy only the verified backend's public local SOCKS5 node configuration."
 commands.allow = ["copy_clash_config"]
+
+[[permission]]
+identifier = "allow-recent-events"
+description = "Read only bounded, allowlisted current-user event records. No renderer path argument."
+commands.allow = ["read_recent_events"]
+
+[[permission]]
+identifier = "allow-desktop-preferences"
+description = "Read and explicitly change this app's per-user login startup and status-widget preferences."
+commands.allow = ["desktop_preferences", "set_autostart", "set_status_widget"]
+
+[[permission]]
+identifier = "allow-desktop-status"
+description = "Read the latest verified native status snapshot, with freshness and ICMP provenance."
+commands.allow = ["desktop_status"]
+
+[[permission]]
+identifier = "allow-widget-controls"
+description = "Only close/drag the small status window or reveal the main workspace."
+commands.allow = ["hide_status_widget", "drag_status_widget", "open_workspace"]

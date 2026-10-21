@@ -150,6 +150,7 @@ fn fresh_negative_after_success_remains_loggable_without_old_probe_outcomes() {
     use adapter_protocol::app::{ProbeMeasurements, ProbeOutcome};
     let mut f = fixture(TrialKind::TestBackup);
     f.dashboard.connection = Some(ConnectionInfo {
+        ping: None,
         chained: false,
         relay: f.path.relay.clone(),
         city: f.path.city.clone(),

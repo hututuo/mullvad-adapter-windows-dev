@@ -1,0 +1,17 @@
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import {eventMessages,eventView,eventTimestamp} from '../desktop/src/event-text.ts';
+const source=readFileSync(new URL('../core/crates/agent/src/live_diagnostics.rs',import.meta.url),'utf8');
+const closed=source.slice(source.indexOf('fn safe_event'),source.indexOf('/// Renderer-safe event'));
+const codes=[...closed.matchAll(/"([a-z_]+)"/g)].map(m=>m[1]).filter(c=>!['agent','start','front','physical','api','api_access','stop','quick','connection'].includes(c));
+for(const code of new Set(codes))assert.ok(eventMessages[code],`missing readable event: ${code}`);
+const failed=eventView({time:1,stage:'connection',code:'active_probe_failed',relay:'test-city-wg-001',ip:'passed',dns:'timeout',https:'not_run_dns_failed'});
+assert.match(failed.title,/test-city-wg-001/);assert.match(failed.probes,/DNS：超时/);assert.match(failed.probes,/HTTPS：未测/);
+assert.equal(eventView({time:1,stage:'connection',code:'active_probe_cancelled'}).tone,'info');
+assert.equal(eventView({time:1,stage:'connection',code:'connected',relay:'test-city-wg-001'}).tone,'success');
+assert.match(eventView({time:1,stage:'connection',code:'worker_start_failed'}).title,/未记录节点/);
+assert.doesNotMatch(eventView({time:1,stage:'connection',code:'worker_start_failed'}).title,/us-sjc/);
+assert.match(eventView({time:1,stage:'other',code:'unknown_future'}).title,/新/);
+assert.equal(eventTimestamp(Number.MAX_SAFE_INTEGER).iso,undefined);
+assert.ok(eventTimestamp(1792590000).iso);
+console.log(`readable event vocabulary: ${new Set(codes).size} mapped; node attribution, cancelled!=dead, DNS/HTTPS dependency and time bounds PASS`);

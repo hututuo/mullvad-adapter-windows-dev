@@ -3,8 +3,8 @@ use adapter_protocol::app::Dashboard;
 use std::{
     collections::VecDeque,
     fs::{File, OpenOptions},
-    io::{self, Read, Write},
-    path::PathBuf,
+    io::{self, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc,
@@ -169,6 +169,183 @@ fn safe_event(value: &LogEvent) -> bool {
                 | "maintenance_cancelled"
         )
 }
+
+/// Renderer-safe event projection. It deliberately excludes the raw connection
+/// object, which contains the public inlet address and local interface details.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventView {
+    pub time: u64,
+    pub stage: String,
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip: Option<adapter_protocol::app::ProbeOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<adapter_protocol::app::ProbeOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https: Option<adapter_protocol::app::ProbeOutcome>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventPage {
+    pub events: Vec<EventView>,
+    /// Number of malformed, rejected, or incomplete event rows in the read tail.
+    pub skipped: usize,
+    /// True when the byte tail or requested event limit omitted older rows.
+    pub truncated: bool,
+}
+
+const EVENT_TAIL_BYTES: u64 = 512 * 1024;
+const EVENT_PAGE_MAX: usize = 500;
+
+fn event_log_error(kind: io::ErrorKind) -> io::Error {
+    io::Error::new(kind, "event_log_unavailable")
+}
+
+fn accept_event_line(
+    line: &[u8],
+    events: &mut VecDeque<EventView>,
+    limit: usize,
+    skipped: &mut usize,
+    truncated: &mut bool,
+) {
+    let value = match serde_json::from_slice::<LogEvent>(line) {
+        Ok(value) if safe_event(&value) => value,
+        _ => {
+            *skipped = skipped.saturating_add(1);
+            return;
+        }
+    };
+    let connection = value.connection;
+    let outcome = |explicit: Option<adapter_protocol::app::ProbeOutcome>,
+                   fallback: Option<bool>| {
+        explicit.or_else(|| {
+            fallback.map(|passed| {
+                if passed {
+                    adapter_protocol::app::ProbeOutcome::Passed
+                } else {
+                    adapter_protocol::app::ProbeOutcome::Rejected
+                }
+            })
+        })
+    };
+    let projected = EventView {
+        time: value.time,
+        stage: value.stage,
+        code: value.code,
+        relay: connection.as_ref().map(|c| c.relay.clone()),
+        city: connection.as_ref().map(|c| c.city.clone()),
+        phase: connection.as_ref().map(|c| c.phase.clone()),
+        ip: connection
+            .as_ref()
+            .and_then(|c| outcome(c.probes.as_ref().map(|p| p.ip), c.ip)),
+        dns: connection
+            .as_ref()
+            .and_then(|c| outcome(c.probes.as_ref().map(|p| p.dns), c.dns)),
+        https: connection
+            .as_ref()
+            .and_then(|c| outcome(c.probes.as_ref().map(|p| p.https), c.https)),
+    };
+    if events.len() == limit {
+        events.pop_front();
+        *truncated = true;
+    }
+    events.push_back(projected);
+}
+
+fn collect_event_tail(
+    bytes: &[u8],
+    starts_mid_line: bool,
+    events: &mut VecDeque<EventView>,
+    limit: usize,
+    skipped: &mut usize,
+    truncated: &mut bool,
+) {
+    let mut cursor = 0;
+    if starts_mid_line {
+        // The byte cap cut through an older row. Count it and discard through
+        // the first newline so only complete rows reach the parser.
+        *skipped = skipped.saturating_add(1);
+        let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') else {
+            return;
+        };
+        cursor = newline + 1;
+    }
+
+    while cursor < bytes.len() {
+        let Some(relative_newline) = bytes[cursor..].iter().position(|byte| *byte == b'\n') else {
+            // The writer terminates every row. An unterminated tail may be a
+            // partial write, so never display it even if its JSON happens to parse.
+            *skipped = skipped.saturating_add(1);
+            break;
+        };
+        let end = cursor + relative_newline;
+        accept_event_line(&bytes[cursor..end], events, limit, skipped, truncated);
+        cursor = end + 1;
+    }
+}
+
+/// Read a bounded tail of the two fixed event files without creating or
+/// changing anything in `root`.
+pub fn recent_events(root: &Path, limit: usize) -> io::Result<EventPage> {
+    if !(1..=EVENT_PAGE_MAX).contains(&limit) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid_event_limit",
+        ));
+    }
+
+    let mut events = VecDeque::with_capacity(limit);
+    let mut skipped = 0usize;
+    let mut truncated = false;
+    for name in ["events.previous.jsonl", "events.jsonl"] {
+        let path = root.join(name);
+        let mut options = OpenOptions::new();
+        options.read(true);
+        let mut file = match open_log_file(&path, options) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(event_log_error(error.kind())),
+        };
+        let length = file
+            .metadata()
+            .map_err(|error| event_log_error(error.kind()))?
+            .len();
+        let offset = length.saturating_sub(EVENT_TAIL_BYTES);
+        let read_length = length - offset;
+        if offset > 0 {
+            truncated = true;
+        }
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| event_log_error(error.kind()))?;
+        let mut bytes = Vec::with_capacity(read_length as usize);
+        file.take(read_length)
+            .read_to_end(&mut bytes)
+            .map_err(|error| event_log_error(error.kind()))?;
+        collect_event_tail(
+            &bytes,
+            offset > 0,
+            &mut events,
+            limit,
+            &mut skipped,
+            &mut truncated,
+        );
+    }
+
+    Ok(EventPage {
+        events: events.into_iter().collect(),
+        skipped,
+        truncated,
+    })
+}
+
 pub(crate) fn open_log_file(path: &std::path::Path, options: OpenOptions) -> io::Result<File> {
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         if meta.file_type().is_symlink() || !meta.is_file() {
@@ -410,6 +587,276 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         path
     }
+
+    fn event_line(time: u64, code: &str, connection: Option<serde_json::Value>) -> Vec<u8> {
+        let mut event = serde_json::json!({
+            "time": time,
+            "layer": "agent",
+            "stage": "connection",
+            "code": code,
+        });
+        if let Some(connection) = connection {
+            event["connection"] = connection;
+        }
+        let mut line = serde_json::to_vec(&event).unwrap();
+        line.push(b'\n');
+        line
+    }
+
+    fn connection_facts(probes: bool) -> serde_json::Value {
+        let mut connection = serde_json::json!({
+            "chained": false,
+            "relay": "xx-aaa-wg-001",
+            "city": "xx-aaa",
+            "inlet": "192.0.2.1:20484",
+            "interface_index": 5,
+            "instance": 17,
+            "phase": "failed",
+            "ip": true,
+            "dns": false,
+            "https": false,
+        });
+        if probes {
+            connection["probes"] = serde_json::json!({
+                "ip": "passed",
+                "dns": "timeout",
+                "https": "not_run_dns_failed",
+            });
+        }
+        connection
+    }
+
+    fn append_bytes(path: &std::path::Path, bytes: &[u8]) {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    #[test]
+    fn recent_events_projects_safe_fields_in_rotation_order_and_keeps_only_latest_limit() {
+        let root = temporary();
+        let previous = root.join("events.previous.jsonl");
+        let active = root.join("events.jsonl");
+        append_bytes(
+            &previous,
+            &[
+                event_line(1, "connected", None),
+                event_line(2, "candidate_not_ready", Some(connection_facts(true))),
+            ]
+            .concat(),
+        );
+        append_bytes(
+            &active,
+            &[
+                event_line(3, "active_data_failed", None),
+                event_line(4, "connected", None),
+            ]
+            .concat(),
+        );
+        let before = (
+            std::fs::read(&previous).unwrap(),
+            std::fs::read(&active).unwrap(),
+            {
+                let mut names: Vec<_> = std::fs::read_dir(&root)
+                    .unwrap()
+                    .map(|item| item.unwrap().file_name())
+                    .collect();
+                names.sort();
+                names
+            },
+        );
+
+        let page = recent_events(&root, 3).unwrap();
+
+        assert_eq!(page.events.len(), 3);
+        let serialized: Vec<serde_json::Value> = page
+            .events
+            .iter()
+            .map(|event| serde_json::to_value(event).unwrap())
+            .collect();
+        assert_eq!(serialized[0]["time"], 2);
+        assert_eq!(serialized[0]["code"], "candidate_not_ready");
+        assert_eq!(serialized[0]["relay"], "xx-aaa-wg-001");
+        assert_eq!(serialized[0]["city"], "xx-aaa");
+        assert_eq!(serialized[0]["phase"], "failed");
+        assert_eq!(serialized[0]["ip"], "passed");
+        assert_eq!(serialized[0]["dns"], "timeout");
+        assert_eq!(serialized[0]["https"], "not_run_dns_failed");
+        for forbidden in [
+            "connection",
+            "inlet",
+            "interface_index",
+            "instance",
+            "ping",
+            "probes",
+        ] {
+            assert!(
+                serialized[0].get(forbidden).is_none(),
+                "projection leaked {forbidden}"
+            );
+        }
+        assert!(!serialized[0].to_string().contains("192.0.2.1"));
+        assert_eq!(serialized[1]["time"], 3);
+        assert_eq!(serialized[2]["time"], 4);
+        assert!(page.truncated);
+        assert_eq!(page.skipped, 0);
+
+        let after = (
+            std::fs::read(&previous).unwrap(),
+            std::fs::read(&active).unwrap(),
+            {
+                let mut names: Vec<_> = std::fs::read_dir(&root)
+                    .unwrap()
+                    .map(|item| item.unwrap().file_name())
+                    .collect();
+                names.sort();
+                names
+            },
+        );
+        assert_eq!(
+            before, after,
+            "event reader must leave the directory untouched"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recent_events_maps_legacy_booleans_to_closed_probe_outcomes() {
+        let root = temporary();
+        append_bytes(
+            &root.join("events.jsonl"),
+            &event_line(5, "candidate_not_ready", Some(connection_facts(false))),
+        );
+        let page = recent_events(&root, 10).unwrap();
+        let view = serde_json::to_value(&page.events[0]).unwrap();
+        assert_eq!(view["ip"], "passed");
+        assert_eq!(view["dns"], "rejected");
+        assert_eq!(view["https"], "rejected");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recent_events_reads_only_bounded_tail_and_discards_cut_row() {
+        let root = temporary();
+        let path = root.join("events.jsonl");
+        let mut oversized_row = b"{\"time\":1,\"layer\":\"agent\",\"stage\":\"api\",\"code\":\"complete\",\"unknown\":\"".to_vec();
+        oversized_row.resize(EVENT_TAIL_BYTES as usize + 1024, b'x');
+        oversized_row.extend_from_slice(b"\"}\n");
+        oversized_row.extend_from_slice(&event_line(9, "connected", None));
+        append_bytes(&path, &oversized_row);
+
+        let page = recent_events(&root, 10).unwrap();
+
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].time, 9);
+        assert_eq!(page.skipped, 1, "the leading partial row is counted");
+        assert!(page.truncated);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recent_events_counts_invalid_rows_and_never_returns_raw_json_fields() {
+        let root = temporary();
+        let path = root.join("events.jsonl");
+        let mut bytes = event_line(1, "connected", None);
+        bytes.extend_from_slice(b"not-json\n");
+        bytes.extend_from_slice(&event_line(2, "unrecognized-code", None));
+        let mut unknown = serde_json::json!({
+            "time": 3,
+            "layer": "agent",
+            "stage": "connection",
+            "code": "connected",
+            "private_key": "synthetic-sensitive-sentinel",
+        });
+        bytes.extend_from_slice(&serde_json::to_vec(&unknown).unwrap());
+        bytes.push(b'\n');
+        unknown["code"] = serde_json::json!("active_data_failed");
+        bytes.extend_from_slice(&serde_json::to_vec(&unknown).unwrap());
+        bytes.push(b'\n');
+        // Even a complete JSON object is not a committed event until newline.
+        bytes.extend_from_slice(
+            b"{\"time\":4,\"layer\":\"agent\",\"stage\":\"connection\",\"code\":\"connected\"}",
+        );
+        append_bytes(&path, &bytes);
+
+        let page = recent_events(&root, 10).unwrap();
+
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].time, 1);
+        assert_eq!(page.skipped, 5);
+        let output = serde_json::to_string(&page).unwrap();
+        assert!(!output.contains("synthetic-sensitive-sentinel"));
+        assert!(!output.contains("private_key"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recent_events_missing_logs_and_invalid_limits_are_bounded_and_read_only() {
+        let root = temporary();
+        assert!(recent_events(&root, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid_event_limit"));
+        assert!(recent_events(&root, EVENT_PAGE_MAX + 1)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid_event_limit"));
+        let page = recent_events(&root, EVENT_PAGE_MAX).unwrap();
+        assert!(page.events.is_empty());
+        assert_eq!(page.skipped, 0);
+        assert!(!page.truncated);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recent_events_rejects_hard_link_without_disclosing_path_or_mutating_it() {
+        let root = temporary();
+        let source = root.join("source");
+        let log = root.join("events.jsonl");
+        let contents = event_line(1, "connected", None);
+        std::fs::write(&source, &contents).unwrap();
+        std::fs::hard_link(&source, &log).unwrap();
+
+        let error = recent_events(&root, 10).unwrap_err();
+
+        assert_eq!(error.to_string(), "event_log_unavailable");
+        assert!(!error.to_string().contains(root.to_string_lossy().as_ref()));
+        assert_eq!(std::fs::read(&source).unwrap(), contents);
+        assert!(std::fs::metadata(&log).unwrap().is_file());
+        std::fs::remove_file(&log).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recent_events_rejects_symlink_without_disclosing_path_or_mutating_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = temporary();
+        let source = root.join("source");
+        let log = root.join("events.jsonl");
+        let contents = event_line(1, "connected", None);
+        std::fs::write(&source, &contents).unwrap();
+        symlink(&source, &log).unwrap();
+
+        let error = recent_events(&root, 10).unwrap_err();
+
+        assert_eq!(error.to_string(), "event_log_unavailable");
+        assert!(!error.to_string().contains(root.to_string_lossy().as_ref()));
+        assert_eq!(std::fs::read(&source).unwrap(), contents);
+        assert!(std::fs::symlink_metadata(&log)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        std::fs::remove_file(&log).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn api_routes_and_network_recovery_events_remain_loggable_without_raw_data() {
         for (stage, code) in [
@@ -599,6 +1046,7 @@ mod tests {
         let root = temporary();
         let logs = Logs { root: root.clone() };
         let mut info = adapter_protocol::app::ConnectionInfo {
+            ping: None,
             chained: false,
             relay: "xx-aaa-wg-001".into(),
             city: "xx-aaa".into(),

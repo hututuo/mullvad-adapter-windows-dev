@@ -24,6 +24,9 @@ import { SetupPage } from "./setup-page";
 import { ChainRoute, useChainBackup } from "./chain-route";
 import { RecoveryPanel } from "./recovery-panel";
 import { canCreateDevice } from "./device-creation";
+import { ActivityPanel } from "./activity-panel";
+import { DesktopSettings } from "./desktop-settings";
+import { StatusWidget } from "./status-widget";
 type Page = "setup" | "cities" | "account" | "clash" | "relays" | "diagnostics";
 const pages: { id: Page; name: string; mark: string }[] = [
   { id: "setup", name: "使用引导", mark: "◇" },
@@ -38,11 +41,13 @@ function Modal({
   labelledBy,
   onClose,
   small = false,
+  wide = false,
 }: {
   children: React.ReactNode;
   labelledBy: string;
   onClose: () => void;
   small?: boolean;
+  wide?: boolean;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   useEffect(() => {
@@ -53,7 +58,7 @@ function Modal({
   return (
     <dialog
       ref={ref}
-      className={small ? "modal small-modal" : "modal"}
+      className={small ? "modal small-modal" : wide ? "modal activity-modal" : "modal"}
       aria-labelledby={labelledBy}
       onCancel={(event) => {
         event.preventDefault();
@@ -111,6 +116,7 @@ function App() {
     [relayPage, setRelayPage] = useState(0);
   const [privateKey, setPrivateKey] = useState<string|null>(null);
   const [stopConfirm, setStopConfirm] = useState(false);
+  const [showActivity, setShowActivity] = useState(false);
   const [account, setAccount] = useState(""),
     [voucher, setVoucher] = useState(""),
     [confirm, setConfirm] = useState<{ text: string; command: Command } | null>(
@@ -413,6 +419,7 @@ function App() {
               ? `正在进行：${operationText[data.operation] ?? data.operation}`
               : message}
           </span>
+          <button className="activity-open" onClick={()=>setShowActivity(true)}>查看详情与日志</button>
         </div>
         {page === "setup" && <SetupPage data={data} navigate={setPage}/>}
         {page === "clash" && <ClashPage frontPort={data?.settings.front_port??17890} connected={data?.status==="connected"} disabled={!data||busy} bootstrapPort={data?.settings.bootstrap_port??null} onUseProxy={async(port)=>{
@@ -857,6 +864,7 @@ function App() {
         )}
         {page === "diagnostics" && (
           <>
+            <DesktopSettings/>
             <section className="panel">
               <div className="panel-heading">
                 <div><h2>后台与退出</h2><p>停止连接和本机入口，确认后台退出后关闭应用。</p></div>
@@ -867,6 +875,7 @@ function App() {
               <div className="panel-heading">
                 <h2>当前状态与日志</h2>
                 <div className="button-row">
+                  <button onClick={()=>setShowActivity(true)}>查看事件日志</button>
                   <button
                     className="primary"
                     disabled={!data || pending}
@@ -1016,6 +1025,7 @@ function App() {
           关闭窗口可从托盘重新打开。这里只保护经过适配器的流量，系统分流由外部代理管理。
         </footer>
       </main>
+      {showActivity && <Modal wide labelledBy="event-log-title" onClose={()=>setShowActivity(false)}><ActivityPanel current={data} stale={refreshFailed.current} onClose={()=>setShowActivity(false)} onExport={()=>void act({kind:"export_report"})}/></Modal>}
       {chooser && data && (
         <Modal labelledBy="city-title" onClose={() => setChooser(false)}>
           <div className="panel-heading">
@@ -1120,6 +1130,7 @@ function App() {
 }
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <App />
+    {window.location.hash==="#status-widget" ? <StatusWidget/> : <App />}
   </React.StrictMode>,
 );
+if(window.location.hash==="#status-widget")document.body.classList.add("widget-page");

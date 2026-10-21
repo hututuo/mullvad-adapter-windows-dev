@@ -60,7 +60,7 @@ export type Dashboard = {
   device_name: string | null;
   public_key: string | null;
   active_relay: string | null;
-  connection?: { relay:string; city:string; inlet:string; interface_index:number; instance:number; phase:string; chained?:boolean; ip:boolean|null; dns:boolean|null; https:boolean|null; probes?: {ip:ProbeOutcome;dns:ProbeOutcome;https:ProbeOutcome} } | null;
+  connection?: { relay:string; city:string; inlet:string; interface_index:number; instance:number; phase:string; chained?:boolean; ping?:{rtt_ms:number;measured_at:number}|null; ip:boolean|null; dns:boolean|null; https:boolean|null; probes?: {ip:ProbeOutcome;dns:ProbeOutcome;https:ProbeOutcome} } | null;
   readiness: string | null;
   cities: City[];
   metadata_source: string;

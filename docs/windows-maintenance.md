@@ -186,3 +186,5 @@ SS/WG连接、Clash独立配置及普通/AI/国内出口验收；这是基线证
 本公开源码按所有者的开源发布委托采用GPL-3.0-only，保留Mihomo等第三方的许可和源码来源。
 Mac PQ helper有其独立上游来源和许可，不代表此Windows包包含它。不得删除第三方通知。
 已有私有Git历史不在本源码ZIP审查范围，不能直接把旧仓库改公开当成已脱敏。
+
+事件详情、登录自启和托盘／小状态窗说明见 [Windows 桌面状态](windows-desktop-status.md)。

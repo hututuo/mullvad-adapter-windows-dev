@@ -47,3 +47,5 @@ mod launch_gate;
 pub mod chain_endpoint;
 #[cfg(any(windows, feature = "windows-api-check"))]
 pub mod windows_control_pipe;
+
+pub mod windows_startup;

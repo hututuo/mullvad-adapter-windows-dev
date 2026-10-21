@@ -1,11 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use adapter_protocol::app::{AppCommand, AppReply, AppRequest, APP_API_MAJOR};
 mod clash;
-use tauri::{
-    menu::{Menu, MenuItem},
-    tray::TrayIconBuilder,
-    Emitter, Manager,
-};
+mod desktop_ui;
+use tauri::Emitter;
 #[cfg(windows)]
 #[path = "../../../core/crates/agent/src/live_runtime.rs"]
 mod live_runtime;
@@ -210,44 +207,31 @@ fn main() {
             copy_last_report,
             stop_backend_and_exit,
             clash::clash_request,
-            clash::copy_clash_config
+            clash::copy_clash_config,
+            desktop_ui::read_recent_events,
+            desktop_ui::desktop_preferences,
+            desktop_ui::set_autostart,
+            desktop_ui::set_status_widget,
+            desktop_ui::desktop_status,
+            desktop_ui::hide_status_widget,
+            desktop_ui::drag_status_widget,
+            desktop_ui::open_workspace
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+                if window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                } else if window.label() == "status-widget" {
+                    // A closed status window must not remain hidden above other apps.
+                    let _ = adapter_platform::windows_startup::set_widget_enabled(false);
+                }
             }
         })
         .setup(|app| {
             #[cfg(windows)]
             clash::restore_profile_service();
-            let show = MenuItem::with_id(app, "show", "打开连接工作台", true, None::<&str>)?;
-            let quit =
-                MenuItem::with_id(app, "quit", "退出界面（后台继续运行）", true, None::<&str>)?;
-            let stop = MenuItem::with_id(app, "stop", "停止后台并退出", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &stop, &quit])?;
-            TrayIconBuilder::new()
-                .icon(tauri::image::Image::new_owned(
-                    vec![180; 16 * 16 * 4],
-                    16,
-                    16,
-                ))
-                .menu(&menu)
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                    }
-                    "quit" => app.exit(0),
-                    "stop" => {
-                        let _ = begin_shutdown(app.clone());
-                    }
-                    _ => {}
-                })
-                .build(app)?;
-            Ok(())
+            desktop_ui::setup(app)
         })
         .run(tauri::generate_context!())
         .expect("desktop initialization failed");
