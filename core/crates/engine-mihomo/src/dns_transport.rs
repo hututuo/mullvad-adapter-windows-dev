@@ -513,7 +513,7 @@ mod tests {
                 || false,
                 || owner.is_alive()
             ),
-            DnsResult::Rejected
+            DnsResult::Unavailable
         );
         other.join().unwrap();
         let original = std::sync::Mutex::new(None);
