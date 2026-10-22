@@ -54,7 +54,7 @@ pub(crate) fn run(
     let work = || -> Result<usize, DnsResult> {
         checkpoint()?;
         if port < 1024 {
-            return Err(DnsResult::Rejected);
+            return Err(DnsResult::Unavailable);
         }
         let budget = deadline
             .saturating_duration_since(Instant::now())
@@ -67,18 +67,22 @@ pub(crate) fn run(
             budget,
         )
         .map_err(|_| DnsResult::Unavailable)?;
-        verify(&stream).map_err(|_| DnsResult::Rejected)?;
-        checkpoint()?;
+        let local_failure = |error| match error {
+            DnsResult::Cancelled => DnsResult::Cancelled,
+            _ => DnsResult::Unavailable,
+        };
+        verify(&stream).map_err(|_| DnsResult::Unavailable)?;
+        checkpoint().map_err(local_failure)?;
         let mut socket = BoundedSocket {
             stream,
             deadline,
             cancelled: &cancelled,
         };
-        socket.write(&[5, 1, 0])?;
+        socket.write(&[5, 1, 0]).map_err(local_failure)?;
         let mut hello = [0; 2];
-        socket.read(&mut hello)?;
+        socket.read(&mut hello).map_err(local_failure)?;
         if hello != [5, 0] {
-            return Err(DnsResult::Rejected);
+            return Err(DnsResult::Unavailable);
         }
         // Fixed IPv4 inner resolver, no hostname lookup and no proxy environment.
         socket.write(&[5, 1, 0, 1, 10, 64, 0, 1, 0, 53])?;
@@ -125,7 +129,7 @@ pub(crate) fn run(
         // Requiring that transient row again rejects a legitimate response. Keep
         // the retained process object live, plus nonce/parser/epoch/deadline gates.
         if !retained_process_alive() {
-            return Err(DnsResult::Rejected);
+            return Err(DnsResult::Unavailable);
         }
         checkpoint()?;
         if count == 0 {
@@ -306,7 +310,7 @@ mod tests {
                 || false,
                 || true
             ),
-            DnsResult::Rejected
+            DnsResult::Unavailable
         );
         worker.join().unwrap();
     }
@@ -395,7 +399,7 @@ mod tests {
         });
         assert_eq!(
             run(port, |_| Ok(()), || false, || false),
-            DnsResult::Rejected
+            DnsResult::Unavailable
         );
         worker.join().unwrap();
     }
@@ -564,7 +568,7 @@ mod tests {
         );
         assert_eq!(
             run(53, |_| panic!("must not verify"), || false, || true),
-            DnsResult::Rejected
+            DnsResult::Unavailable
         );
     }
 
@@ -657,7 +661,7 @@ mod tests {
             });
             assert_eq!(
                 run(port, |_| Ok(()), || false, || true),
-                DnsResult::Rejected
+                DnsResult::Unavailable
             );
             worker.join().unwrap();
         }

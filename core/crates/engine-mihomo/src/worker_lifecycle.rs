@@ -128,7 +128,7 @@ impl Worker {
         };
         checkpoint()?;
         let chain_endpoint = chain
-            .map(|proxy| crate::chain::resolve_ipv4(proxy, &network))
+            .map(|proxy| crate::chain::resolve_ipv4(proxy, &network, deadline))
             .transpose()
             .map_err(|_| WorkerStartError::ChainResolution)?;
         let destination = if let Some(ip) = chain_endpoint {
@@ -287,7 +287,7 @@ impl Worker {
                 {
                     return Err(WorkerStartError::Start);
                 }
-                match controller.check_version() {
+                match controller.check_version_until(deadline) {
                     Ok(()) => {}
                     Err(ControllerError::Unavailable) => {
                         std::thread::sleep(Duration::from_millis(50));
@@ -296,7 +296,7 @@ impl Worker {
                     Err(_) => return Err(WorkerStartError::Controller),
                 }
                 checkpoint()?;
-                match controller.check_worker_graph() {
+                match controller.check_worker_graph_until(deadline) {
                     Ok(()) => {}
                     Err(ControllerError::Unavailable | ControllerError::UnexpectedResponse) => {
                         std::thread::sleep(Duration::from_millis(50));
@@ -305,9 +305,13 @@ impl Worker {
                     Err(_) => return Err(WorkerStartError::Controller),
                 }
                 checkpoint()?;
+                let connect_budget = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|d| !d.is_zero())
+                    .ok_or(WorkerStartError::Deadline)?;
                 let stream = TcpStream::connect_timeout(
                     &SocketAddrV4::new(Ipv4Addr::LOCALHOST, request.listener.mixed_port).into(),
-                    Duration::from_millis(500),
+                    connect_budget.min(Duration::from_millis(500)),
                 );
                 match stream.and_then(|stream| owner.verify_connected(&stream)) {
                     Ok(()) => {}

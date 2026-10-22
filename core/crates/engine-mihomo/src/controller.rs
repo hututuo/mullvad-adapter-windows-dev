@@ -239,13 +239,25 @@ impl Controller {
         header.set_sensitive(true);
         Ok(header)
     }
-    fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, ControllerError> {
+    fn get<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        deadline: Instant,
+    ) -> Result<T, ControllerError> {
         let started = Instant::now();
+        let deadline = deadline.min(started + REQUEST_LIMIT);
+        let budget = deadline
+            .checked_duration_since(started)
+            .filter(|v| !v.is_zero())
+            .ok_or(ControllerError::Unavailable)?;
         let mut response = self
             .agent
             .get(format!("{}{path}", self.base))
             .header("Authorization", self.authorization()?)
             .header("Connection", "close")
+            .config()
+            .timeout_global(Some(budget))
+            .build()
             .call()
             .map_err(|_| ControllerError::Unavailable)?;
         match response.status().as_u16() {
@@ -259,17 +271,20 @@ impl Controller {
             .limit(16384)
             .read_json()
             .map_err(|_| ControllerError::UnexpectedResponse)?;
-        if started.elapsed() >= REQUEST_LIMIT {
+        if Instant::now() >= deadline {
             return Err(ControllerError::Unavailable);
         }
         Ok(value)
     }
     pub fn check_version(&self) -> Result<(), ControllerError> {
+        self.check_version_until(Instant::now() + REQUEST_LIMIT)
+    }
+    pub(crate) fn check_version_until(&self, deadline: Instant) -> Result<(), ControllerError> {
         #[derive(Deserialize)]
         struct Version {
             version: String,
         }
-        let result: Version = self.get("/version")?;
+        let result: Version = self.get("/version", deadline)?;
         if Some(result.version.as_str())
             != crate::ENGINE_COMPATIBILITY_TARGET.strip_prefix("mihomo-")
         {
@@ -278,6 +293,9 @@ impl Controller {
         Ok(())
     }
     pub fn selected(&self) -> Result<Selected, ControllerError> {
+        self.selected_until(Instant::now() + REQUEST_LIMIT)
+    }
+    pub(crate) fn selected_until(&self, deadline: Instant) -> Result<Selected, ControllerError> {
         #[derive(Deserialize)]
         struct Group {
             #[serde(rename = "type")]
@@ -285,7 +303,7 @@ impl Controller {
             now: String,
             all: Vec<String>,
         }
-        let result: Group = self.get("/proxies/OUT")?;
+        let result: Group = self.get("/proxies/OUT", deadline)?;
         let mut choices = result.all;
         choices.sort();
         if result.kind != "Selector" || choices != ["REJECT", "SLOT-A", "SLOT-B"] {
@@ -300,6 +318,12 @@ impl Controller {
     }
     /// Worker-only graph check. A ready controller is not tunnel readiness.
     pub fn check_worker_graph(&self) -> Result<(), ControllerError> {
+        self.check_worker_graph_until(Instant::now() + REQUEST_LIMIT)
+    }
+    pub(crate) fn check_worker_graph_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), ControllerError> {
         #[derive(Deserialize)]
         struct Group {
             #[serde(rename = "type")]
@@ -307,7 +331,7 @@ impl Controller {
             now: String,
             all: Vec<String>,
         }
-        let result: Group = self.get("/proxies/OUT")?;
+        let result: Group = self.get("/proxies/OUT", deadline)?;
         if result.kind != "Selector" || result.now != "MULLVAD" || result.all != ["MULLVAD"] {
             return Err(ControllerError::UnexpectedResponse);
         }
@@ -348,6 +372,72 @@ mod tests {
         thread,
     };
     const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    #[test]
+    fn expired_startup_deadline_never_connects_or_sends_capability() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let checks = Arc::new(AtomicUsize::new(0));
+        let controller = Controller::new_verified(
+            listener.local_addr().unwrap().port(),
+            SECRET,
+            Arc::new(Permit(checks.clone())),
+        )
+        .unwrap();
+        let deadline = Instant::now();
+        assert!(controller.check_version_until(deadline).is_err());
+        assert!(controller.selected_until(deadline).is_err());
+        assert!(controller.check_worker_graph_until(deadline).is_err());
+        assert_eq!(checks.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+    #[test]
+    fn startup_deadline_bounds_slow_controller_body_without_changing_later_requests() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let mut stream = accept_bounded(&listener);
+            assert!(!request(&mut stream).is_empty());
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 200\r\n\r\n");
+            for _ in 0..100 {
+                if stream.write_all(b" ").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            drop(stream);
+            let mut stream = accept_bounded(&listener);
+            assert!(!request(&mut stream).is_empty());
+            let body = format!(
+                "{{\"version\":\"{}\"}}",
+                crate::ENGINE_COMPATIBILITY_TARGET
+                    .strip_prefix("mihomo-")
+                    .unwrap()
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let controller = Controller::new_verified(
+            port,
+            SECRET,
+            Arc::new(Permit(Arc::new(AtomicUsize::new(0)))),
+        )
+        .unwrap();
+        let started = Instant::now();
+        assert!(controller
+            .check_version_until(started + Duration::from_millis(120))
+            .is_err());
+        assert!(started.elapsed() < Duration::from_millis(800));
+        assert_eq!(controller.check_version(), Ok(()));
+        server.join().unwrap();
+    }
     struct Permit(Arc<AtomicUsize>);
     impl PeerVerifier for Permit {
         fn verify(&self, _: &TcpStream) -> io::Result<()> {

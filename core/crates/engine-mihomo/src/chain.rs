@@ -100,13 +100,23 @@ impl SystemLookup {
         Ok(Self(send))
     }
     fn resolve(&self, host: String, port: u16, deadline: std::time::Instant) -> Option<Ipv4Addr> {
+        let deadline = lookup_deadline(deadline, std::time::Instant::now())?;
         let (send, receive) = std::sync::mpsc::sync_channel(1);
         self.0.try_send((host, port, deadline, send)).ok()?;
         receive
             .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
             .ok()
             .flatten()
+            .filter(|_| std::time::Instant::now() < deadline)
     }
+}
+
+#[cfg(any(windows, feature = "windows-api-check", test))]
+fn lookup_deadline(
+    parent: std::time::Instant,
+    now: std::time::Instant,
+) -> Option<std::time::Instant> {
+    (parent > now).then(|| parent.min(now + std::time::Duration::from_secs(4)))
 }
 
 /// One bounded primary lane per process; the state owner never waits on DNS.
@@ -114,6 +124,7 @@ impl SystemLookup {
 pub(crate) fn resolve_ipv4(
     proxy: &UpstreamSs,
     network: &adapter_control::owned_lifecycle::BoundNetwork,
+    parent_deadline: std::time::Instant,
 ) -> io::Result<Ipv4Addr> {
     use std::{
         net::{IpAddr, ToSocketAddrs},
@@ -123,6 +134,10 @@ pub(crate) fn resolve_ipv4(
     type Job = (String, u16, Instant, mpsc::SyncSender<Option<Ipv4Addr>>);
     static RESOLVER: OnceLock<Option<mpsc::SyncSender<Job>>> = OnceLock::new();
     static SYSTEM: OnceLock<Option<SystemLookup>> = OnceLock::new();
+    let deadline = lookup_deadline(parent_deadline, Instant::now()).ok_or_else(super::invalid)?;
+    if network.is_cancelled() {
+        return Err(super::invalid());
+    }
     if let Ok(ip) = proxy.server().parse::<Ipv4Addr>() {
         return if public_ipv4(ip) {
             Ok(ip)
@@ -180,13 +195,15 @@ pub(crate) fn resolve_ipv4(
         .as_ref()
         .ok_or_else(super::invalid)?;
     let (reply, result) = mpsc::sync_channel(1);
-    let deadline = Instant::now() + Duration::from_secs(4);
     sender
         .try_send((proxy.server().into(), proxy.port(), deadline, reply))
         .map_err(|_| super::invalid())?;
     while !network.is_cancelled() && Instant::now() < deadline {
-        match result.recv_timeout(Duration::from_millis(20)) {
-            Ok(Some(ip)) => return Ok(ip),
+        match result.recv_timeout(
+            Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
+        ) {
+            Ok(Some(ip)) if Instant::now() < deadline && !network.is_cancelled() => return Ok(ip),
+            Ok(Some(_)) => return Err(super::invalid()),
             Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => return Err(super::invalid()),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
@@ -197,6 +214,31 @@ pub(crate) fn resolve_ipv4(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn resolver_budget_keeps_parent_deadline_and_refuses_expired_work() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        assert_eq!(lookup_deadline(now, now), None);
+        assert_eq!(lookup_deadline(now - Duration::from_millis(1), now), None);
+        assert_eq!(
+            lookup_deadline(now + Duration::from_millis(40), now),
+            Some(now + Duration::from_millis(40))
+        );
+        assert_eq!(
+            lookup_deadline(now + Duration::from_secs(15), now),
+            Some(now + Duration::from_secs(4))
+        );
+    }
+    #[test]
+    fn expired_lookup_never_enters_system_lane() {
+        use std::time::Instant;
+        let lane =
+            SystemLookup::start(|_, _| panic!("expired work must never reach native resolver"))
+                .unwrap();
+        assert!(lane
+            .resolve("node.example".into(), 443, Instant::now())
+            .is_none());
+    }
     #[test]
     fn stalled_system_dns_has_a_deadline_and_bounded_queue() {
         use std::{

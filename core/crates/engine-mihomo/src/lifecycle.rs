@@ -98,7 +98,7 @@ impl Front {
                 {
                     return Err(StartError::Unavailable);
                 }
-                match controller.check_version() {
+                match controller.check_version_until(deadline) {
                     Ok(()) => {}
                     Err(ControllerError::Unavailable) => {
                         std::thread::sleep(Duration::from_millis(50));
@@ -107,7 +107,7 @@ impl Front {
                     Err(_) => return Err(StartError::ControllerContract),
                 }
                 checkpoint(StartPhase::Starting)?;
-                match controller.selected() {
+                match controller.selected_until(deadline) {
                     Ok(Selected::Reject) => {}
                     Err(ControllerError::Unavailable | ControllerError::UnexpectedResponse) => {
                         std::thread::sleep(Duration::from_millis(50));
@@ -116,9 +116,13 @@ impl Front {
                     _ => return Err(StartError::ControllerContract),
                 }
                 checkpoint(StartPhase::Starting)?;
+                let connect_budget = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|d| !d.is_zero())
+                    .ok_or(StartError::Deadline)?;
                 let stream = TcpStream::connect_timeout(
                     &SocketAddrV4::new(Ipv4Addr::LOCALHOST, listener.mixed_port).into(),
-                    Duration::from_millis(500),
+                    connect_budget.min(Duration::from_millis(500)),
                 );
                 match stream.and_then(|stream| owner.verify_connected(&stream)) {
                     Ok(()) => {}

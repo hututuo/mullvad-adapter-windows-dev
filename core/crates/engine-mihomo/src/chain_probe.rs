@@ -97,9 +97,8 @@ pub fn qualify_udp(
     };
     gate.check()?;
     // Reuse the two bounded fresh DNS lanes; no saved-IP shortcut for hostnames.
-    // An already in-flight bootstrap lookup can take up to its own 4s ceiling.
-    let endpoint =
-        crate::chain::resolve_ipv4(upstream, network).map_err(|_| ProbeError::Resolution)?;
+    let endpoint = crate::chain::resolve_ipv4(upstream, network, gate.deadline)
+        .map_err(|_| ProbeError::Resolution)?;
     gate.check()?;
     let route = snapshot(network.binding(), IpAddr::V4(endpoint)).map_err(|_| ProbeError::Route)?;
     gate.check()?;

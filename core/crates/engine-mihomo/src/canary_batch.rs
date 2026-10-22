@@ -62,6 +62,7 @@ fn https_outcome(result: HttpsResult) -> ProbeOutcome {
         HttpsResult::Rejected => ProbeOutcome::Rejected,
         HttpsResult::Cancelled => ProbeOutcome::Cancelled,
         HttpsResult::Deadline => ProbeOutcome::Deadline,
+        HttpsResult::Unavailable => ProbeOutcome::Unavailable,
     }
 }
 #[derive(Debug)]
@@ -273,6 +274,23 @@ fn collect_observed(
             .is_some_and(|m| m.value == HttpsResult::Cancelled)
     {
         return Err(BatchError::Cancelled);
+    }
+    // A local proxy/handshake failure is indeterminate about the remote
+    // relay. Preserve independent positive traffic, but never publish an
+    // all-negative canary that would consume a relay/SS recovery attempt.
+    if !matches!(report.ip.value, HttpsResult::Passed(_))
+        && !report
+            .hostname
+            .as_ref()
+            .is_some_and(|m| matches!(m.value, HttpsResult::Passed(_)))
+        && (report.ip.value == HttpsResult::Unavailable
+            || report.dns.value == DnsResult::Unavailable
+            || report
+                .hostname
+                .as_ref()
+                .is_some_and(|m| m.value == HttpsResult::Unavailable))
+    {
+        return Err(BatchError::LocalFailure);
     }
     Ok(report)
 }
@@ -896,13 +914,20 @@ mod tests {
                 move || dns,
                 || panic!("DNS dependency did not pass"),
             );
-            let report = collect(&fake).unwrap();
-            let public = serde_json::to_value(report.outcomes()).unwrap();
+            let mut historical = None;
+            let result = collect_observed(&fake, |diagnostics| historical = Some(diagnostics));
+            let historical = historical.unwrap();
+            let public = serde_json::json!({"ip":historical.ip.outcome,"dns":historical.dns.outcome,"hostname":historical.hostname.outcome});
             assert_eq!(
                 public,
                 serde_json::json!({"ip":"rejected","dns":expected,"hostname":"not_run_dns_failed"})
             );
             assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+            if dns == DnsResult::Unavailable {
+                assert!(matches!(result, Err(BatchError::LocalFailure)));
+                continue;
+            }
+            let report = result.unwrap();
             assert_eq!(
                 report.fresh_canary(Instant::now()).unwrap().readiness(),
                 adapter_domain::Readiness::DataFail
@@ -922,6 +947,68 @@ mod tests {
             .unwrap();
         assert!(!canary.ip);
         assert_eq!(canary.readiness(), adapter_domain::Readiness::Ready);
+    }
+    #[test]
+    fn local_proxy_unavailable_never_becomes_negative_relay_evidence() {
+        for (ip, dns, hostname) in [
+            (
+                HttpsResult::Unavailable,
+                DnsResult::Timeout,
+                HttpsResult::Rejected,
+            ),
+            (
+                HttpsResult::Rejected,
+                DnsResult::Unavailable,
+                HttpsResult::Rejected,
+            ),
+            (
+                HttpsResult::Rejected,
+                DnsResult::ValidatedA(1),
+                HttpsResult::Unavailable,
+            ),
+        ] {
+            let fake = Fake::new(move || ip, move || dns, move || hostname);
+            let mut diagnostic = None;
+            let result = collect_observed(&fake, |d| diagnostic = Some(d));
+            assert!(matches!(result, Err(BatchError::LocalFailure)));
+            let d = diagnostic.expect("local diagnostics must survive rejection of relay evidence");
+            assert!(
+                d.ip.outcome == ProbeOutcome::Unavailable
+                    || d.dns.outcome == ProbeOutcome::Unavailable
+                    || d.hostname.outcome == ProbeOutcome::Unavailable
+            );
+            assert_eq!(fake.active.load(Ordering::SeqCst), 0);
+        }
+    }
+    #[test]
+    fn independent_success_preserves_live_path_when_another_local_probe_is_unavailable() {
+        for (ip, dns, hostname, readiness) in [
+            (
+                HttpsResult::Unavailable,
+                DnsResult::ValidatedA(1),
+                HttpsResult::Passed(204),
+                adapter_domain::Readiness::Ready,
+            ),
+            (
+                HttpsResult::Passed(200),
+                DnsResult::Unavailable,
+                HttpsResult::Rejected,
+                adapter_domain::Readiness::DegradedDns,
+            ),
+            (
+                HttpsResult::Passed(200),
+                DnsResult::ValidatedA(1),
+                HttpsResult::Unavailable,
+                adapter_domain::Readiness::DegradedService,
+            ),
+        ] {
+            let fake = Fake::new(move || ip, move || dns, move || hostname);
+            let report = collect(&fake).unwrap();
+            assert_eq!(
+                report.fresh_canary(Instant::now()).unwrap().readiness(),
+                readiness
+            );
+        }
     }
     #[test]
     fn cancellation_waits_for_started_threads_and_rejects_late_success() {

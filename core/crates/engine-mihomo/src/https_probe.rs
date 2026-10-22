@@ -3,7 +3,10 @@ use std::{
     fmt,
     io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddrV4, TcpStream},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use ureq::{
@@ -52,6 +55,9 @@ pub enum HttpsResult {
     Rejected,
     Cancelled,
     Deadline,
+    /// The owned local proxy/process was unavailable before an upstream
+    /// connection was requested. This is not negative relay evidence.
+    Unavailable,
 }
 type Verify = Arc<dyn Fn(&TcpStream) -> io::Result<()> + Send + Sync>;
 type Cancel = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -64,7 +70,7 @@ pub fn for_worker(
     target: Target,
 ) -> HttpsResult {
     let Ok(owner) = process.controller_owner() else {
-        return HttpsResult::Rejected;
+        return HttpsResult::Unavailable;
     };
     let monitor = network.cancellation_monitor();
     run(
@@ -120,6 +126,7 @@ struct SocksConnector {
     deadline: Instant,
     verify: Verify,
     cancel: Cancel,
+    local_unavailable: Arc<AtomicBool>,
 }
 impl fmt::Debug for SocksConnector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -154,22 +161,28 @@ impl<In: Transport> Connector<In> for SocksConnector {
         {
             return Err(denied().into());
         }
+        let local_failure = |error: io::Error| {
+            self.local_unavailable.store(true, Ordering::Release);
+            error
+        };
         let stream = TcpStream::connect_timeout(
             &SocketAddrV4::new(Ipv4Addr::LOCALHOST, self.port).into(),
             remaining(self.deadline, &self.cancel)?.min(Duration::from_millis(500)),
-        )?;
-        (self.verify)(&stream)?;
-        remaining(self.deadline, &self.cancel)?;
+        )
+        .map_err(local_failure)?;
+        (self.verify)(&stream).map_err(local_failure)?;
+        remaining(self.deadline, &self.cancel).map_err(local_failure)?;
         let mut transport = SocksTransport {
             stream,
             deadline: self.deadline,
             cancel: self.cancel.clone(),
             buffers: LazyBuffers::new(4096, 4096),
         };
-        transport.write_bytes(&[5, 1, 0])?;
+        transport.write_bytes(&[5, 1, 0]).map_err(local_failure)?;
         let mut hello = [0; 2];
-        transport.read_bytes(&mut hello)?;
+        transport.read_bytes(&mut hello).map_err(local_failure)?;
         if hello != [5, 0] {
+            self.local_unavailable.store(true, Ordering::Release);
             return Err(denied().into());
         }
         let mut request = vec![5, 1, 0];
@@ -310,7 +323,7 @@ pub(crate) fn run(
         return HttpsResult::Cancelled;
     }
     if port < 1024 || !live() {
-        return HttpsResult::Rejected;
+        return HttpsResult::Unavailable;
     }
     let config = Agent::config_builder()
         .proxy(None)
@@ -323,12 +336,14 @@ pub(crate) fn run(
         .http_status_as_error(false)
         .tls_config(tls)
         .build();
+    let local_unavailable = Arc::new(AtomicBool::new(false));
     let connector = SocksConnector {
         port,
         target,
         deadline,
         verify,
         cancel: cancel.clone(),
+        local_unavailable: local_unavailable.clone(),
     }
     .chain(RustlsConnector::default());
     let agent = Agent::with_parts(config, connector, FixedResolver { target, port });
@@ -350,10 +365,12 @@ pub(crate) fn run(
     })();
     if cancel() {
         HttpsResult::Cancelled
+    } else if local_unavailable.load(Ordering::Acquire) {
+        HttpsResult::Unavailable
     } else if Instant::now() >= deadline {
         HttpsResult::Deadline
     } else if !live() {
-        HttpsResult::Rejected
+        HttpsResult::Unavailable
     } else if cancel() {
         HttpsResult::Cancelled
     } else if Instant::now() >= deadline {
@@ -847,7 +864,7 @@ mod tests {
                 Duration::from_secs(2),
                 || true
             ),
-            HttpsResult::Rejected
+            HttpsResult::Unavailable
         );
         join.join().unwrap();
     }
@@ -924,8 +941,50 @@ mod tests {
                 Duration::from_secs(2),
                 || live_calls.fetch_add(1, Ordering::SeqCst) == 0
             ),
-            HttpsResult::Rejected
+            HttpsResult::Unavailable
         );
         join.join().unwrap();
+    }
+    #[test]
+    fn refused_local_listener_is_unavailable_without_remote_evidence() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let started = Instant::now();
+        assert_eq!(
+            probe(
+                port,
+                Target::Ip,
+                TlsConfig::default(),
+                Duration::from_secs(1)
+            ),
+            HttpsResult::Unavailable
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+    #[test]
+    fn stalled_local_greeting_is_unavailable_and_sends_no_upstream_request() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+        });
+        assert_eq!(
+            probe(
+                port,
+                Target::Ip,
+                TlsConfig::default(),
+                Duration::from_millis(80)
+            ),
+            HttpsResult::Unavailable
+        );
+        peer.join().unwrap();
     }
 }

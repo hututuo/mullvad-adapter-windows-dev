@@ -34,6 +34,17 @@ returns LocalFailure, even if another probe reports success. A retained process
 liveness check and final network-hint cancellation check follow collection.
 The duplicate handle and sockets remain owned until the joined operation ends.
 
+Local listener refusal, a missing retained process and a failure of the local
+SOCKS greeting are `Unavailable`, before any upstream CONNECT is requested.
+Upstream CONNECT, inner DNS and TLS/HTTP rejection retain their remote-path
+classification. If there is no successful IP/hostname canary and any phase is
+locally unavailable, collection returns `LocalFailure` after emitting phase
+diagnostics; it never publishes an all-negative relay sample. Independent
+positive traffic still uses the existing degraded/Ready matrix. Ownership
+rejection, cancellation and process-death fences remain stronger than any
+positive result. The active owner already retries a local observation and, on
+repeated local failure, rebuilds the same path without recording relay failure.
+
 Individual DNS/IP/hostname acceptance budgets remain two/eight/twelve seconds,
 with their existing bounded body/frame limits and cancellation slices. Kernel
 calls still cannot be forcibly interrupted, so joining is a cleanup guarantee,
@@ -41,10 +52,10 @@ not a hard OS-thread completion deadline. No detached sibling may outlive a
 returned batch. No process is terminated here; the ResourceOwner still owns its
 normal cancellation and stop lifecycle.
 
-Twelve portable tests use real threads and bounded synchronization to check
+Portable tests use real threads and bounded synchronization to check
 IP/DNS overlap, DNS-before-hostname ordering, DNS skip and degraded classification,
 IP-failed Ready matrix, cancellation with both probes blocked until release,
-local panic classification (including hostname with IP still active), all DNS
+local panic classification (including hostname with IP still active), local-unavailability classification and independent success, all DNS
 dependency refusals, cancellation-before-start/status, every phase at five seconds/
 plus one nanosecond/future timestamps, and all feasible matrix/time-order cases.
 They use injected probe functions; transport byte-level tests remain in the DNS
@@ -58,3 +69,13 @@ selection preflight. It rechecks all phase timestamps with the real monotonic
 clock. A fresh mailbox stamp never refreshes an old phase. The owner independently
 fences operation/candidate/resource/network continuity on each check. This seam
 does not enable a production agent, switch the front, or certify actual egress.
+
+Front and worker startup use their existing 15-second monotonic acceptance
+budget across controller reads, mixed-listener connection and chain endpoint
+resolution. Each controller read is capped at the lesser of two seconds and
+the remaining startup budget; normal later controller requests get their own
+budget. Chain resolution is capped at four seconds or the remaining parent
+budget, rejects expired queued work and does not accept late native resolver
+results. A blocked native resolver stays in its existing fixed lane; this does
+not add unbounded threads or promise interruption of a kernel call. Failure
+cleanup retains its independent owned-process/carrier stop budget.
