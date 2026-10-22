@@ -70,6 +70,8 @@ class ReliabilityAdapter < MullvadAdapter
   end
 
   def front_connections_for(_slot) = 0
+
+  def curl_proxy_test(*) = { status: 'fail', detail: 'isolated fake service probe' }
   def start_drain(_slot); end
 end
 

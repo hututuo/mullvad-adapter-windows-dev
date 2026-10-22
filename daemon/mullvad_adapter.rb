@@ -23,6 +23,14 @@ Encoding.default_internal = Encoding::UTF_8
 
 class MullvadAdapter
   class LocalNetworkInterrupted < StandardError; end
+  class LocalProbeTimeout < StandardError
+    attr_reader :phase
+
+    def initialize(phase)
+      @phase = phase
+      super("local probe deadline exceeded: #{phase}")
+    end
+  end
   # Local decoder only: never monkey-patch Resolv or allocate globally cached
   # resource classes from response-controlled type/class numbers.
   class DnsCanaryDecoder < Resolv::DNS::Message::MessageDecoder
@@ -1528,6 +1536,7 @@ class MullvadAdapter
       Thread.current[:adapter_operation_id] = id
       begin
         update_operation(state: 'running')
+        action_evidence = {}
         ok = case reason
              when 'speedtest'
                deadline = monotonic_now + 20
@@ -1547,14 +1556,15 @@ class MullvadAdapter
              when 'repair'
                repair_connection
              when 'protection-change'
-               activate(relay, reason: reason, transport_preference: preference, protection_profile: profile)
+               activate(relay, reason: reason, transport_preference: preference, protection_profile: profile,
+                        attempt_evidence: action_evidence)
              when 'city-select'
                activate_city(find_relay(relay)['location'], preference)
              else
-               activate(relay, reason: reason, transport_preference: preference)
+               activate(relay, reason: reason, transport_preference: preference, attempt_evidence: action_evidence)
              end
         recovered = false
-        if !ok && reason == 'reconnect' && snapshot[:active_slot].nil?
+        if !ok && reason == 'reconnect' && !action_evidence[:local_failure] && snapshot[:active_slot].nil?
           update_operation(stage: 'fallback', message: '原节点和回退都未通过，正在尝试可用备用节点')
           quarantine_relay(relay, 'manual-reconnect-failed', 60)
           recovered = activate_startup_with_fallback(relay, current_transport_preference, reason: 'health-recovery')
@@ -1680,10 +1690,10 @@ class MullvadAdapter
   def log_event(event, fields = {})
     trace = { operation_id: Thread.current[:adapter_operation_id],
               recovery_id: Thread.current[:adapter_recovery_id], attempt_id: Thread.current[:adapter_attempt_id] }.compact
-    entry = { at: Time.now.iso8601, event: event, build: BUILD_ID }.merge(trace).merge(redact_log(fields))
+    entry = { at: Time.now.iso8601, event: event, build: BUILD_ID, source_sha256: SOURCE_SHA256 }.merge(trace).merge(redact_log(fields))
     line = JSON.generate(entry) + "\n"
     if line.bytesize > EVENT_LOG_FILE_BYTES
-      line = JSON.generate(at: entry[:at], event: 'oversized-event', build: BUILD_ID,
+      line = JSON.generate(at: entry[:at], event: 'oversized-event', build: BUILD_ID, source_sha256: SOURCE_SHA256,
                            original_bytes: line.bytesize, detail: 'event exceeded log capacity; payload omitted') + "\n"
     end
     @log_mutex.synchronize do
@@ -2029,7 +2039,7 @@ class MullvadAdapter
           previous_front_pid = @front_pid
           previous_generation = @mutex.synchronize { @state[:generation] }
           @switch_mutex.unlock
-          data_probe = curl_proxy_ip_test(@options[:front_mixed], IP_CANARY, 3)
+          data_probe = front_service_probe(@options[:front_mixed])
           return unless @switch_mutex.try_lock
           return unless @front_pid == previous_front_pid && @mutex.synchronize { @state[:generation] == previous_generation }
           return if control_context && !active_context_current?(control_context, front: true)
@@ -2080,6 +2090,9 @@ class MullvadAdapter
 
       @switch_mutex.unlock
       supervise_front_data_path(active_slot, active_worker)
+    rescue LocalProbeTimeout => e
+      log_event('front-observation-deferred', phase: e.phase, reason: 'local-probe-timeout-not-front-failure')
+      nil
     rescue StandardError => e
       @mutex.synchronize do
         @state[:front][:ready] = false
@@ -2102,8 +2115,8 @@ class MullvadAdapter
                 front_pid: captured[:front_pid], worker_pid: captured[:pid],
                 endpoint: active_worker[:endpoint], interface: active_worker[:interface], timeout_seconds: 3 }
     # Both observations are outside the switch mutex. Neither creates a tunnel.
-    front_result = curl_proxy_ip_test(@options[:front_mixed], IP_CANARY, 3)
-    direct_result = curl_proxy_ip_test(active_worker[:mixed_port], IP_CANARY, 3) unless front_result[:status] == 'pass'
+    front_result = front_service_probe(@options[:front_mixed])
+    direct_result = front_service_probe(active_worker[:mixed_port]) unless front_result[:status] == 'pass'
     return unless @switch_mutex.try_lock
     begin
       unless active_context_current?(captured, front: true)
@@ -2111,6 +2124,11 @@ class MullvadAdapter
         return
       end
       if front_result[:status] == 'pass'
+        if front_result[:observation] == 'alternate-https' && !@front_target_degraded
+          log_event('front-target-degraded', **context, primary_status: front_result[:primary_status],
+                    alternate_status: 'pass', decision: 'keep-live-front')
+        end
+        @front_target_degraded = front_result[:observation] == 'alternate-https'
         if @front_incident_id
           original = @front_incident_context || {}
           recovery = if original[:relay] != context[:relay]
@@ -2166,7 +2184,7 @@ class MullvadAdapter
     ensure
       @switch_mutex.unlock if @switch_mutex.owned?
     end
-    verification = curl_proxy_ip_test(@options[:front_mixed], IP_CANARY, 3)
+    verification = front_service_probe(@options[:front_mixed])
     return unless @switch_mutex.try_lock
     begin
       return unless repaired && active_context_current?(repaired, front: true)
@@ -2179,9 +2197,26 @@ class MullvadAdapter
     ensure
       @switch_mutex.unlock if @switch_mutex.owned?
     end
+  rescue LocalProbeTimeout => e
+    log_event('front-observation-deferred', **(context || {}), phase: e.phase,
+              reason: 'local-probe-timeout-not-front-failure')
+    nil
   rescue StandardError => e
     log_event('front-repair-error', **(context || {}), incident_id: @front_incident_id, error: "#{e.class}: #{e.message}")
     raise
+  end
+
+  def front_service_probe(port)
+    primary = curl_proxy_ip_test(port, IP_CANARY, 3)
+    return primary if primary[:status] == 'pass'
+
+    alternate = curl_proxy_test(port, HOST_CANARY, 3)
+    if alternate[:status] == 'pass'
+      alternate.merge(observation: 'alternate-https', primary_status: primary[:status],
+                      primary_exit_code: primary[:exit_code])
+    else
+      primary.merge(alternate: alternate)
+    end
   end
 
   def supervise_worker_runtime
@@ -2225,7 +2260,7 @@ class MullvadAdapter
         @state[:active_slot] = nil
         @state[:active_transport] = nil
         @state[:active_transport_mode] = nil
-        @state[:relay_liveness] = 'fail'
+        @state[:relay_liveness] = 'unknown'
         @state[:service_readiness] = 'data_fail'
         @state[:status] = 'data_fail'
         @state[:last_error] = "active worker-#{slot} exited unexpectedly"
@@ -2247,13 +2282,19 @@ class MullvadAdapter
 
     return unless recovery
     with_recovery_budget('worker-crash-recovery', recovery[:relay]) do
+      evidence = {}
       ok = activate(
         recovery[:relay],
         reason: 'worker-crash-recovery',
         transport_preference: recovery[:preference],
-        expected_state: recovery[:expected_state]
+        expected_state: recovery[:expected_state],
+        attempt_evidence: evidence
       )
       unless ok
+        if evidence[:local_failure]
+          log_event('recovery-local-deferred', relay: recovery[:relay], phase: evidence[:local_failure], reason: 'local-bootstrap')
+          return false
+        end
         return unless automatic_recovery_context_valid?(recovery[:expected_state][:generation], recovery[:relay])
         quarantine_relay(recovery[:relay], 'worker-crash-rebuild-failed')
         recovery_relay_candidates(recovery[:relay]).each do |fallback|
@@ -2266,14 +2307,19 @@ class MullvadAdapter
               active_relay: @state[:active_relay]
             }
           end
-          recovery_handled = false
+          evidence = {}
           ok = activate(
             fallback,
             reason: 'health-recovery',
             transport_preference: recovery[:preference],
-            expected_state: current
+            expected_state: current,
+            attempt_evidence: evidence
           )
           break if ok
+          if evidence[:local_failure]
+            log_event('recovery-local-deferred', relay: fallback, phase: evidence[:local_failure], reason: 'local-bootstrap')
+            return false
+          end
           quarantine_relay(fallback, 'recovery-candidate-failed', 300)
         end
       end
@@ -2759,6 +2805,10 @@ class MullvadAdapter
           recovery = recovery_candidates.shift
         end
       end
+    rescue LocalProbeTimeout => e
+      log_event('health-local-deferred', relay: expected_relay || context&.dig(:relay), phase: e.phase,
+                reason: 'local-probe-timeout-not-relay-failure')
+      return :retry
     rescue StandardError => e
       record_error("active health check failed: #{e.class}: #{e.message}")
     ensure
@@ -2788,10 +2838,12 @@ class MullvadAdapter
         @metrics[:auto_recovery_attempts] += 1
         @state[:health][:last_attempt_at] = @last_auto_recovery_at.iso8601
       end
+      attempt_evidence = {}
       ok = activate(
         recovery,
         reason: recovery_reason,
         transport_preference: current_transport_preference,
+        attempt_evidence: attempt_evidence,
         expected_state: {
           generation: expected_generation,
           active_slot: expected_slot,
@@ -2799,6 +2851,11 @@ class MullvadAdapter
         }
       )
       unless ok
+        if attempt_evidence[:local_failure]
+          log_event('recovery-local-deferred', relay: expected_relay, phase: attempt_evidence[:local_failure],
+                    reason: 'local-component-timeout-not-relay-failure')
+          return
+        end
         context_valid = automatic_recovery_context_valid?(expected_generation, expected_relay)
         unless context_valid
           @mutex.synchronize { @metrics[:auto_recovery_failures] += 1 }
@@ -2833,13 +2890,20 @@ class MullvadAdapter
               active_relay: @state[:active_relay]
             }
           end
+          attempt_evidence = {}
           ok = activate(
             fallback_relay,
             reason: 'health-recovery',
             transport_preference: current_transport_preference,
-            expected_state: current
+            expected_state: current,
+            attempt_evidence: attempt_evidence
           )
           break if ok
+          if attempt_evidence[:local_failure]
+            log_event('recovery-local-deferred', relay: expected_relay, phase: attempt_evidence[:local_failure],
+                      reason: 'local-component-timeout-not-relay-failure')
+            return
+          end
           if recovery_reason == 'dns-recovery-probe' && inner_dns_breaker_open?
             recovery_handled = true
             record_routing_event(
@@ -3040,7 +3104,9 @@ class MullvadAdapter
     with_recovery_budget('city-select', city, city: city) do
       city_selection_candidates(city, preference).each do |name|
         break unless recovery_budget_remaining?
-        return true if activate(name, reason: 'city-select', transport_preference: preference)
+        evidence = {}
+        return true if activate(name, reason: 'city-select', transport_preference: preference, attempt_evidence: evidence)
+        return false if evidence[:local_failure]
         quarantine_relay(name, 'city-selection-failed', 60)
       end
       false
@@ -3184,13 +3250,19 @@ class MullvadAdapter
         end
         return false unless current[:active_slot].nil?
 
+        evidence = {}
         ok = activate(
           candidate,
           reason: reason,
           transport_preference: normalized,
-          expected_state: current
+          expected_state: current,
+          attempt_evidence: evidence
         )
         return true if ok
+        if evidence[:local_failure]
+          log_event('recovery-local-deferred', relay: candidate, phase: evidence[:local_failure], reason: 'local-bootstrap')
+          return false
+        end
         return false unless automatic_recovery_context_valid?(current[:generation], current[:active_relay])
 
         quarantine_relay(candidate, 'startup-candidate-failed', 300)
@@ -3731,8 +3803,14 @@ class MullvadAdapter
     else
       ok = false
       recovery_relay_candidates(current[:active_relay]).each do |candidate|
-        ok = activate(candidate, reason: 'health-recovery', transport_preference: current_transport_preference)
+        evidence = {}
+        ok = activate(candidate, reason: 'health-recovery', transport_preference: current_transport_preference,
+                      attempt_evidence: evidence)
         break if ok
+        if evidence[:local_failure]
+          log_event('recovery-local-deferred', relay: candidate, phase: evidence[:local_failure], reason: 'manual-repair')
+          return false
+        end
         quarantine_relay(candidate, 'repair-candidate-failed', 60)
         break if inner_dns_breaker_open?
       end
@@ -4191,7 +4269,7 @@ class MullvadAdapter
   end
 
   def record_ss_endpoint_failure(relay_name, mode, ss_candidate, error)
-    return if error.is_a?(LocalNetworkInterrupted) || !network_attempt_current?
+    return if error.is_a?(LocalNetworkInterrupted) || error.is_a?(LocalProbeTimeout) || !network_attempt_current?
     return unless mode.to_s == 'ss' && ss_candidate
     return if protection_profile[:multihop] || ss_candidate.is_a?(Hash)
 
@@ -4244,6 +4322,9 @@ class MullvadAdapter
               duration_ms: canary[:duration_ms], **classification,
               ip: canary.dig(:ip_data, :status), dns: canary.dig(:inner_dns, :status),
               https: canary.dig(:https_data, :status),
+              phase_duration_ms: { ip: canary.dig(:ip_data, :wall_duration_ms),
+                                   dns: canary.dig(:inner_dns, :delay_ms),
+                                   https: canary.dig(:https_data, :wall_duration_ms) }.compact,
               evidence: classification[:service_readiness] == 'ready' ? nil :
                 canary.slice(:ip_data, :inner_dns, :https_data, :controller_probe))
     result
@@ -4657,6 +4738,10 @@ class MullvadAdapter
             last_candidate_error = "#{mode}: #{e.class}: #{e.message}"
             record_ss_endpoint_failure(relay_name, mode, ss_candidate, e)
             stop_worker(new_slot) if @workers[new_slot]
+            if e.is_a?(LocalProbeTimeout)
+              attempt_evidence[:local_failure] = e.phase if attempt_evidence
+              raise
+            end
             raise if e.is_a?(LocalNetworkInterrupted)
             raise unless mode == 'ss' || preference == 'auto'
           end
@@ -4767,6 +4852,7 @@ class MullvadAdapter
 
     stop_worker(old_slot)
     attempt_started = monotonic_now
+    local_probe_error = nil
     modes.each do |mode|
       inlets = endpoint_candidates_for_transport(relay, mode)
       inlets = inlets.first(1) if %w[ss-endpoint-recovery network-resume].include?(reason)
@@ -4809,16 +4895,28 @@ class MullvadAdapter
         rescue StandardError => e
           record_ss_endpoint_failure(relay_name, mode, ss_candidate, e)
           stop_worker(new_slot) if @workers[new_slot]
+          if e.is_a?(LocalProbeTimeout)
+            attempt_evidence[:local_failure] = e.phase if attempt_evidence
+            local_probe_error = e
+            break
+          end
           raise if e.is_a?(LocalNetworkInterrupted)
           # Failure of an explicitly requested direct transport must reach
           # rollback too. It must not escape with the old worker already gone.
         end
       end
+      break if local_probe_error
     end
 
     raise LocalNetworkInterrupted unless network_attempt_current?
     @mutex.synchronize { @metrics[:failed_switches] += 1 }
     if %w[ss-endpoint-recovery network-resume].include?(reason)
+      if local_probe_error
+        update_state(status: 'degraded', active_slot: nil, active_transport: nil, active_transport_mode: nil,
+                     transport_preference: old_preference, relay_liveness: 'unknown', service_readiness: 'degraded',
+                     last_error: '本机隧道组件未就绪；保留原节点意图，等待本地组件重建')
+        return false
+      end
       update_state(
         status: 'data_fail', active_slot: nil, active_transport: nil, active_transport_mode: nil,
         transport_preference: old_preference, relay_liveness: 'fail', service_readiness: 'data_fail',
@@ -4844,6 +4942,8 @@ class MullvadAdapter
         record_ss_endpoint_canary(relay_name, old_mode, rollback_info, rollback_canary)
         observe_inner_dns_result(relay_name, rollback_canary)
         rollback_classification = classify_canary(rollback_canary)
+        local_probe_error = nil
+        attempt_evidence.delete(:local_failure) if attempt_evidence
         rollback_last = [rollback_canary, rollback_classification]
         if candidate_acceptable?(rollback_classification, profile: protection_profile)
           select_front(old_slot)
@@ -4858,11 +4958,20 @@ class MullvadAdapter
       rescue StandardError => e
         record_ss_endpoint_failure(relay_name, old_mode, ss_candidate, e)
         stop_worker(old_slot) if @workers[old_slot]
+        if e.is_a?(LocalProbeTimeout)
+          local_probe_error = e
+          attempt_evidence[:local_failure] = e.phase if attempt_evidence
+          break
+        end
         raise if e.is_a?(LocalNetworkInterrupted)
       end
     end
 
-    if rollback_last
+    if local_probe_error
+      update_state(status: 'degraded', active_slot: nil, active_transport: nil, active_transport_mode: nil,
+                   transport_preference: old_preference, relay_liveness: 'unknown', service_readiness: 'degraded',
+                   last_error: '本机隧道组件未就绪，原连接暂未重建；后台继续重试原路径')
+    elsif rollback_last
       rollback_canary, rollback_classification = rollback_last
       update_state(
         status: rollback_classification[:service_readiness],
@@ -5054,6 +5163,7 @@ class MullvadAdapter
       @mutex.synchronize { @metrics[:worker_start_failures] += 1 }
       log_event('worker-start-failed', relay: relay['hostname'], slot: slot,
                 post_quantum: !!protection_profile[:post_quantum], phase: phase, error_class: error.class.name)
+      raise error if error.is_a?(LocalProbeTimeout)
       raise 'protected worker could not start; no unprotected fallback was selected'
     end
 
@@ -5093,7 +5203,7 @@ class MullvadAdapter
     end
     return pid if wait_controller(spec[:controller], 8, pid: pid)
     stop_pid(pid)
-    raise 'worker controller did not become ready'
+    raise LocalProbeTimeout, 'worker-controller'
   end
 
   def negotiate_pq(port, ephemeral_private_key: nil)
@@ -5282,6 +5392,8 @@ class MullvadAdapter
     thread = Thread.new do
       begin
         yield
+      rescue LocalProbeTimeout => e
+        { status: 'unknown', local_timeout: e.phase }
       rescue StandardError => e
         { status: 'fail', detail: "#{e.class}: #{e.message}" }
       end
@@ -5300,8 +5412,15 @@ class MullvadAdapter
 
   def run_canary(slot)
     started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    deadline = started + canary_budget_seconds
+    probes = []
     spec = @slot_config.fetch(slot)
-    endpoint = @mutex.synchronize { @workers[slot] && @workers[slot][:endpoint] }
+    raise LocalProbeTimeout, 'canary-state-busy' unless @mutex.try_lock
+    begin
+      endpoint = @workers[slot] && @workers[slot][:endpoint]
+    ensure
+      @mutex.unlock
+    end
 
     # 探针顺序按"能不能改变结论"来排，并且一旦结论已定就早退。
     #
@@ -5313,16 +5432,18 @@ class MullvadAdapter
     #   · controller_probe 只要求"数据面活着"，而 ip_data 一通过就已知数据面活着，
     #     所以它不必等 https_data。健康隧道上这两个各约 1.2s / 0.5s，重叠掉就是净省。
     # 依赖关系没动：https 仍然只在 DNS 通过后跑，controller 仍然只在数据面通过后跑。
+    # Keep the UI's optional RTT sample, but do not let it hold traffic
+    # readiness hostage. A result still pending at readiness is omitted.
     ping_thread = spawn_probe do
       endpoint ? outer_ping_test(endpoint, 1_000) : { status: 'fail', detail: 'worker endpoint unavailable' }
     end
     ip_thread = spawn_probe { curl_proxy_ip_test(spec[:mixed], IP_CANARY, 8) }
     dns_thread = spawn_probe { inner_dns_tcp_test(spec[:mixed], 'www.gstatic.com', 8) }
+    probes.concat([ping_thread, ip_thread, dns_thread])
 
-    ping_result = ping_thread.value
-    ip_result = ip_thread.value
+    ip_result = await_probe(ip_thread, deadline, 'ip-data')
     # inner_dns 必须跑：dns_ok 由它决定，而 degraded_dns 和 data_fail 的区别靠它。
-    dns_result = dns_thread.value
+    dns_result = await_probe(dns_thread, deadline, 'inner-dns')
 
     # https_data 走 socks5h，域名解析依赖内层 DNS。内层 DNS 已经挂了的话
     # domain_ok 必然为 false，再花 12 秒等它是纯浪费。
@@ -5332,6 +5453,7 @@ class MullvadAdapter
     https_thread = if dns_result[:status] == 'pass'
                      spawn_probe { curl_proxy_test(spec[:mixed], HOST_CANARY, 12) }
                    end
+    probes << https_thread if https_thread
 
     # controller_probe 不参与就绪度判定（只进缓存快照供界面显示）。
     # 数据面已经确定不通时它只会再白等 8 秒，直接跳过。
@@ -5339,9 +5461,10 @@ class MullvadAdapter
     controller_thread = if !Thread.current[:adapter_skip_controller_probe] && ip_result[:status] == 'pass'
                           spawn_probe { delay_test(spec[:controller], 'MULLVAD', IP_CANARY, 8_000) }
                         end
+    probes << controller_thread if controller_thread
 
     https_result = if https_thread
-                     https_thread.value
+                     await_probe(https_thread, deadline, 'https-data')
                    else
                      {
                        status: 'skip', http_code: 0, target: HOST_CANARY,
@@ -5353,9 +5476,11 @@ class MullvadAdapter
     controller_result = if Thread.current[:adapter_skip_controller_probe]
                           { status: 'skip', target: IP_CANARY, detail: 'optional controller diagnostic omitted during readiness validation' }
                         elsif controller_thread
-                          controller_thread.value
+                          await_probe(controller_thread, deadline, 'controller-delay')
                         elsif https_result[:status] == 'pass'
-                          delay_test(spec[:controller], 'MULLVAD', IP_CANARY, 8_000)
+                          controller_thread = spawn_probe { delay_test(spec[:controller], 'MULLVAD', IP_CANARY, 8_000) }
+                          probes << controller_thread
+                          await_probe(controller_thread, deadline, 'controller-delay')
                         else
                           {
                             status: 'skip', target: IP_CANARY,
@@ -5363,6 +5488,11 @@ class MullvadAdapter
                           }
                         end
 
+    ping_result = if Thread.current[:adapter_skip_controller_probe]
+                    ping_thread.join(0) ? ping_thread.value : { status: 'skip', detail: 'optional ICMP result not ready' }
+                  else
+                    await_probe(ping_thread, deadline, 'outer-ping')
+                  end
     elapsed = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round
 
     {
@@ -5374,13 +5504,32 @@ class MullvadAdapter
       inner_dns: dns_result,
       https_data: https_result
     }
+  ensure
+    Array(probes).each { |probe| probe.kill if probe.alive? }
+    Array(probes).each { |probe| probe.join(0.4) }
+  end
+
+  def canary_budget_seconds
+    Thread.current[:adapter_skip_controller_probe] ? 24 : 34
+  end
+
+  def await_probe(thread, deadline, phase)
+    remaining = deadline - monotonic_now
+    unless remaining.positive? && thread.join(remaining)
+      log_event('local-probe-timeout', phase: phase, reason: 'aggregate-deadline')
+      raise LocalProbeTimeout, phase
+    end
+    result = thread.value
+    raise LocalProbeTimeout, result[:local_timeout] if result[:local_timeout]
+    result
   end
 
   def outer_ping_test(endpoint, timeout_ms)
     address = IPAddr.new(endpoint.to_s)
     command = address.ipv6? ? '/sbin/ping6' : '/sbin/ping'
-    stdout, stderr, status = Open3.capture3(
-      command, '-n', '-c', '1', '-W', timeout_ms.to_i.to_s, endpoint.to_s
+    stdout, stderr, status = capture_probe_command(
+      command, '-n', '-c', '1', '-W', timeout_ms.to_i.to_s, endpoint.to_s,
+      timeout_seconds: timeout_ms.to_f / 1000 + 1, phase: 'outer-ping'
     )
     match = stdout.match(/time[=<]([0-9.]+)\s*ms/)
     if status.success? && match
@@ -5390,6 +5539,8 @@ class MullvadAdapter
       detail = stdout.lines.last.to_s.strip if detail.empty?
       { status: 'fail', target: endpoint.to_s, detail: detail[0, 160] }
     end
+  rescue LocalProbeTimeout
+    raise
   rescue StandardError => e
     { status: 'fail', target: endpoint.to_s, detail: "#{e.class}: #{e.message}" }
   end
@@ -5534,13 +5685,14 @@ class MullvadAdapter
 
   def curl_proxy_test(port, url, timeout)
     format = 'code=%{http_code} total=%{time_total}'
-    stdout, stderr, status = Open3.capture3(
+    stdout, stderr, status, command_ms = capture_probe_command(
       'curl', '-q', '-sS', '--noproxy', '', '--max-time', timeout.to_s,
       '--proxy', "socks5h://127.0.0.1:#{port}",
-      '-o', '/dev/null', '-w', format, url
+      '-o', '/dev/null', '-w', format, url,
+      timeout_seconds: timeout + 1, phase: 'https-data'
     )
     code = stdout[/code=(\d+)/, 1].to_i
-    evidence = { exit_code: status.exitstatus, elapsed_seconds: stdout[/total=([\d.]+)/, 1]&.to_f,
+    evidence = { exit_code: status.exitstatus, wall_duration_ms: command_ms, elapsed_seconds: stdout[/total=([\d.]+)/, 1]&.to_f,
                  proxy_port: port, target: url, timeout_seconds: timeout }
     if status.success? && code >= 200 && code < 400
       { **evidence, status: 'pass', http_code: code, detail: stdout.strip, dependency: 'inner_dns+data' }
@@ -5551,13 +5703,14 @@ class MullvadAdapter
 
   def curl_proxy_ip_test(port, url, timeout)
     format = 'code=%{http_code} total=%{time_total}'
-    stdout, stderr, status = Open3.capture3(
+    stdout, stderr, status, command_ms = capture_probe_command(
       'curl', '-q', '-sS', '--noproxy', '', '--max-time', timeout.to_s,
       '--proxy', "socks5://127.0.0.1:#{port}",
-      '-o', '/dev/null', '-w', format, url
+      '-o', '/dev/null', '-w', format, url,
+      timeout_seconds: timeout + 1, phase: 'ip-data'
     )
     code = stdout[/code=(\d+)/, 1].to_i
-    evidence = { exit_code: status.exitstatus, elapsed_seconds: stdout[/total=([\d.]+)/, 1]&.to_f,
+    evidence = { exit_code: status.exitstatus, wall_duration_ms: command_ms, elapsed_seconds: stdout[/total=([\d.]+)/, 1]&.to_f,
                  proxy_port: port, target: url, timeout_seconds: timeout }
     if status.success? && code >= 200 && code < 400
       { **evidence, status: 'pass', http_code: code, detail: stdout.strip, dependency: 'data' }
@@ -5823,25 +5976,35 @@ class MullvadAdapter
   end
 
   def validate_runtime_config(path, dir)
-    _stdout, _stderr, status = Open3.capture3(@options[:core], '-t', '-d', dir, '-f', path)
+    _stdout, _stderr, status = capture_probe_command(@options[:core], '-t', '-d', dir, '-f', path,
+                                                   timeout_seconds: 8, phase: 'config-validation')
     raise 'Mihomo rejected generated configuration' unless status.success?
     true
   end
 
   def wait_controller(port, timeout_seconds, pid: nil)
-    deadline = Time.now + timeout_seconds
+    deadline = monotonic_now + timeout_seconds
     consecutive_successes = 0
     loop do
       return false if pid && !process_alive?(pid)
-      if pid && !controller_listener_owned_by?(port, pid)
+      remaining = deadline - monotonic_now
+      return false unless remaining.positive?
+      if pid && !controller_listener_owned_by?(port, pid, timeout_seconds: [remaining, 0.5].min)
         consecutive_successes = 0
-        return false if Time.now >= deadline
-        sleep 0.1
+        return false if monotonic_now >= deadline
+        sleep [0.1, deadline - monotonic_now].min.clamp(0, 0.1)
         next
       end
       begin
-        payload = http_json(port, '/version', open_timeout: 0.3, read_timeout: 0.3)
-        if payload.is_a?(Hash) && (!pid || (process_alive?(pid) && controller_listener_owned_by?(port, pid)))
+        remaining = deadline - monotonic_now
+        return false unless remaining.positive?
+        request_timeout = [remaining / 2, 0.3].min
+        payload = Timeout.timeout(remaining, LocalProbeTimeout, 'controller-http') do
+          http_json(port, '/version', open_timeout: request_timeout, read_timeout: request_timeout)
+        end
+        remaining = deadline - monotonic_now
+        if remaining.positive? && payload.is_a?(Hash) && (!pid || (process_alive?(pid) &&
+           controller_listener_owned_by?(port, pid, timeout_seconds: [remaining, 0.5].min)))
           consecutive_successes += 1
           return true if consecutive_successes >= 2
         else
@@ -5850,19 +6013,90 @@ class MullvadAdapter
       rescue StandardError
         consecutive_successes = 0
       end
-      return false if Time.now >= deadline
-      sleep 0.1
+      return false if monotonic_now >= deadline
+      sleep [0.1, deadline - monotonic_now].min.clamp(0, 0.1)
     end
   end
 
-  def controller_listener_owned_by?(port, pid)
-    stdout, status = Open3.capture2(
+  def controller_listener_owned_by?(port, pid, timeout_seconds: 0.5)
+    stdout, _stderr, status = capture_probe_command(
       '/usr/sbin/lsof', '-nP', '-a', '-p', pid.to_i.to_s,
-      "-iTCP:#{port.to_i}", '-sTCP:LISTEN', '-t'
+      "-iTCP:#{port.to_i}", '-sTCP:LISTEN', '-t',
+      timeout_seconds: timeout_seconds, phase: 'controller-listener'
     )
     status.success? && stdout.lines.any? { |line| line.strip == pid.to_i.to_s }
   rescue StandardError
     false
+  end
+
+  # Only short-lived probes use this runner. Each owns a new process group;
+  # cancellation/timeout cannot signal an existing front, worker or shell.
+  # Drain both pipes concurrently, cap retained output, and never join an
+  # Open3 waiter indefinitely after a child ignores its own timeout.
+  def capture_probe_command(*argv, timeout_seconds:, phase:)
+    started = monotonic_now
+    deadline = started + timeout_seconds
+    outputs = [String.new(encoding: Encoding::BINARY), String.new(encoding: Encoding::BINARY)]
+    readers, writers = [], []
+    pid = status = nil
+    complete = false
+    2.times do
+      reader, writer = IO.pipe
+      readers << reader
+      writers << writer
+    end
+    pid = Process.spawn(*argv, in: File::NULL, out: writers[0], err: writers[1], pgroup: true)
+    writers.each(&:close)
+    streams = readers.each_with_index.to_h
+    until status && streams.empty?
+      status ||= Process.waitpid2(pid, Process::WNOHANG)&.last
+      remaining = deadline - monotonic_now
+      if remaining <= 0
+        log_event('local-command-timeout', phase: phase, budget_ms: (timeout_seconds * 1000).round,
+                  duration_ms: ((monotonic_now - started) * 1000).round)
+        raise LocalProbeTimeout, phase
+      end
+      ready = IO.select(streams.keys, nil, nil, [remaining, 0.025].min)
+      Array(ready&.first).each do |io|
+        chunk = io.read_nonblock(16_384, exception: false)
+        if chunk.nil?
+          streams.delete(io)
+          io.close
+        elsif chunk != :wait_readable
+          buffer = outputs[streams.fetch(io)]
+          buffer << chunk.byteslice(0, [65_536 - buffer.bytesize, chunk.bytesize].min)
+        end
+      end
+    end
+    complete = true
+    [*outputs.map { |output| output.force_encoding(Encoding::UTF_8).scrub }, status,
+     ((monotonic_now - started) * 1000).round]
+  ensure
+    # These are probe children only. KILL also closes inherited output pipes
+    # held by descendants. Bounded reap preserves caller responsiveness.
+    if pid && !complete
+      begin
+        Process.kill('KILL', -pid)
+      rescue Errno::ESRCH
+        nil
+      end
+      unless status
+        reap_deadline = monotonic_now + 0.25
+        begin
+          loop do
+            break if Process.waitpid(pid, Process::WNOHANG)
+            if monotonic_now >= reap_deadline
+              Process.detach(pid)
+              break
+            end
+            sleep 0.005
+          end
+        rescue Errno::ECHILD
+          nil
+        end
+      end
+    end
+    (readers.to_a + writers.to_a).each { |io| io.close unless io.closed? }
   end
 
   def http_json(port, path, method: :get, body: nil, open_timeout: 1, read_timeout: 5)
@@ -5873,7 +6107,7 @@ class MullvadAdapter
       request['Content-Type'] = 'application/json'
       request.body = JSON.generate(body)
     end
-    response = Net::HTTP.start(uri.host, uri.port, nil, open_timeout: open_timeout, read_timeout: read_timeout) do |http|
+    response = Net::HTTP.start(uri.host, uri.port, nil, open_timeout: open_timeout, read_timeout: read_timeout, max_retries: 0) do |http|
       http.request(request)
     end
     raise "HTTP #{response.code} for #{path}" unless response.code.to_i.between?(200, 299)

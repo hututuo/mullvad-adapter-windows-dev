@@ -40,6 +40,12 @@ Actions手动运行`checks-and-candidate`：先Ruby/Swift/PQ组件检查，再as
 
 ## 本机状态读取与界面日志
 
+就绪验证保留隧道IP、DNS、HTTPS检查；外层ICMP并行采样供界面参考，未及时完成时不阻塞就绪结论。完整测速仍保留ICMP检查。事件携带实际后台源码的SHA256，避免仅凭历史固定 `build` 标签混淆已安装版本。
+
+短命探测命令（lsof监听归属、配置验证、ping、curl）由父进程按单调时钟限制等待，双流并行读取、各保留最多64KiB，超时/取消只结束本次探测拥有的进程组。控制器等待把监听归属检查计入总预算，本机HTTP禁止隐式重试。readiness/full canary分别有24/34秒汇总预算及有界清理；本地执行超时独立记为不确定，不能作为节点/SS失效样本。日志记录 `local-command-timeout`、`health-local-deferred`、`recovery-local-deferred` 和数值阶段耗时，区分父进程等待与curl自报耗时。这些边界不能保证操作系统严重卡顿时准点执行。
+
+本地转发监测先测IP地址，失败后再测独立域名HTTPS；同一入口仍有HTTPS流量通过时保留原进程，并记录 `front-target-degraded`。两个目标均失败才进入原有后端对照与连续两次修复阈值，仍保留代次/网络守卫。该策略减少单个探测目标引起的重启，不能把一次重启后恢复当作引擎死锁的证明。详见[运行观测规格](../openspec/changes/mac-runtime-stall-bounds/specs/runtime-observation/spec.md)。
+
 状态通信与隧道健康是两类证据。界面取消一次读取不计故障；晚到的旧响应不能覆盖新结果。单次传输失败显示“状态待更新”，连续三次且跨过至少十秒才显示“无法读取本机服务状态”。HTTP 错误与响应格式错误单独显示，均不等价于隧道断开。保留的快照必须带最后读取时间；成功读取后清除警告。此路径不会触发重连或修改节点。
 
 `GET /status` 读取独立的内存 JSON 快照，不等待连接事务或操作队列的锁，也不做网络、磁盘读取。后台每秒尝试发布一次；锁忙则跳过，不刷新旧快照的时间。超过3秒或尚无快照时返回 HTTP 503（`status_snapshot_stale` / `status_snapshot_unavailable`），界面显示“状态更新延迟”，不能据此判定隧道中断。响应头 `X-Adapter-Status-Age-Ms` / `X-Adapter-Status-Capture-Ms` 提供快照年龄和采集耗时；控制决策仍使用原权威状态、原事务锁和原子提交。

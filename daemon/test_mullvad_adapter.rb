@@ -9,7 +9,9 @@ class MullvadAdapterPolicyTest < Minitest::Test
     dir = Dir.mktmpdir('mullvad-adapter-test')
     @tmpdirs ||= []
     @tmpdirs << dir
-    MullvadAdapter.new(state_dir: dir, recovery_quarantine: 900)
+    adapter = MullvadAdapter.new(state_dir: dir, recovery_quarantine: 900)
+    adapter.define_singleton_method(:curl_proxy_test) { |*_| { status: 'fail', detail: 'isolated fake service probe' } }
+    adapter
   end
 
   def teardown
@@ -168,7 +170,7 @@ class MullvadAdapterPolicyTest < Minitest::Test
       }
     })
     chosen = []
-    adapter.define_singleton_method(:activate) do |relay_name, reason:, transport_preference:, expected_state: nil|
+    adapter.define_singleton_method(:activate) do |relay_name, reason:, transport_preference:, expected_state: nil, **_|
       chosen << relay_name
       true
     end
