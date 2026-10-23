@@ -11,12 +11,119 @@ class MullvadRuntimeDeadlineTest < Minitest::Test
   end
 
   def teardown
+    @adapter.instance_variable_get(:@probe_event_writer)&.join(1)
     FileUtils.rm_rf(@dir)
+  end
+
+  def persisted_probe_events
+    @adapter.instance_variable_get(:@probe_event_writer)&.join(1)
+    File.readlines(File.join(@dir, 'logs', 'events.jsonl'))
   end
 
   def run_child(script, timeout: 1)
     @adapter.send(:capture_probe_command, RbConfig.ruby, '-e', script,
                   timeout_seconds: timeout, phase: 'fixture')
+  ensure
+    @adapter.instance_variable_get(:@probe_event_writer)&.join(1)
+  end
+
+  def test_probe_timeout_and_owned_child_cleanup_do_not_wait_for_the_log_mutex
+    path = File.join(@dir, 'blocked-log-child')
+    mutex = @adapter.instance_variable_get(:@log_mutex)
+    mutex.lock
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    runner = Thread.new do
+      begin
+        @adapter.send(:capture_probe_command, RbConfig.ruby, '-e',
+                      "File.write(#{path.dump}, Process.pid); sleep 30",
+                      timeout_seconds: 0.2, phase: 'blocked-log')
+      rescue MullvadAdapter::LocalProbeTimeout => error
+        error
+      end
+    end
+    assert runner.join(0.8), 'probe deadline/cleanup must finish while another thread owns the logger'
+    error = runner.value
+    assert_kind_of MullvadAdapter::LocalProbeTimeout, error
+    assert_equal 'blocked-log', error.phase
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 0.8
+    pid = File.read(path).to_i
+    assert_raises(Errno::ESRCH) { Process.kill(0, pid) }
+    assert_raises(Errno::ECHILD) { Process.waitpid(pid, Process::WNOHANG) }
+    mutex.unlock
+    assert @adapter.instance_variable_get(:@probe_event_writer)&.join(1)
+    event = JSON.parse(persisted_probe_events.last)
+    assert_equal 'local-command-timeout', event['event']
+    assert_operator event.fetch('spawn_ms'), :>=, 0
+    assert_operator event.fetch('max_poll_gap_ms'), :>=, 0
+  ensure
+    mutex&.unlock if mutex&.owned?
+    runner&.join(1)
+  end
+
+  def test_slow_spawn_is_distinguished_from_capture_wait_without_logging_arguments
+    spawn = Process.method(:spawn)
+    Process.stub(:spawn, lambda { |*args, **options| sleep 0.12; spawn.call(*args, **options) }) do
+      assert_raises(MullvadAdapter::LocalProbeTimeout) do
+        run_child('sleep 30 # private fixture', timeout: 0.05)
+      end
+    end
+    event = JSON.parse(persisted_probe_events.last)
+    assert_equal 'local-command-timeout', event['event']
+    assert_operator event.fetch('spawn_ms'), :>=, 120
+    assert_operator event.fetch('capture_ms'), :<, 100
+    refute_includes JSON.generate(event), 'private fixture'
+  end
+
+  def test_writer_thread_creation_failure_cannot_replace_local_timeout
+    Thread.stub(:new, ->(*_, **_) { raise ThreadError, 'fixture thread limit' }) do
+      assert_raises(MullvadAdapter::LocalProbeTimeout) { run_child('sleep 30', timeout: 0.1) }
+    end
+    assert_equal 1, @adapter.instance_variable_get(:@probe_events).length
+    @adapter.send(:log_probe_event, 'fixture-writer-recovered')
+    assert @adapter.instance_variable_get(:@probe_event_writer)&.join(1)
+    events = persisted_probe_events.map { |line| JSON.parse(line) }
+    assert_equal %w[local-command-timeout fixture-writer-recovered], events.map { |event| event['event'] }
+  end
+
+  def test_probe_child_events_retain_parent_attempt_trace
+    keys = %i[adapter_operation_id adapter_recovery_id adapter_attempt_id]
+    previous = keys.to_h { |key| [key, Thread.current[key]] }
+    keys.each { |key| Thread.current[key] = "fixture-#{key}" }
+    probe = @adapter.send(:spawn_probe) { run_child('sleep 30', timeout: 0.1) }
+    assert_equal 'fixture', probe.value[:local_timeout]
+    event = JSON.parse(persisted_probe_events.last)
+    assert_equal 'fixture-adapter_operation_id', event['operation_id']
+    assert_equal 'fixture-adapter_recovery_id', event['recovery_id']
+    assert_equal 'fixture-adapter_attempt_id', event['attempt_id']
+  ensure
+    previous&.each { |key, value| Thread.current[key] = value }
+  end
+
+  def test_slow_log_writer_has_one_bounded_queue_and_reports_discarded_entries
+    entered = Queue.new
+    release = Queue.new
+    original = @adapter.method(:log_event)
+    @adapter.define_singleton_method(:log_event) do |name, fields|
+      if fields[:fixture] == 'first'
+        entered << true
+        release.pop
+      end
+      original.call(name, fields)
+    end
+    @adapter.send(:log_probe_event, 'fixture', fixture: 'first')
+    Timeout.timeout(1) { entered.pop }
+    writer = @adapter.instance_variable_get(:@probe_event_writer)
+    200.times { |i| @adapter.send(:log_probe_event, 'fixture', sequence: i) }
+    assert_equal 128, @adapter.instance_variable_get(:@probe_events).size
+    assert_same writer, @adapter.instance_variable_get(:@probe_event_writer)
+    release << true
+    assert writer.join(1)
+    events = persisted_probe_events.map { |line| JSON.parse(line) }
+    assert_equal 129, events.length
+    assert_equal 72, events.sum { |event| event.fetch('dropped_probe_events', 0) }
+    assert_equal 199, events.last['sequence']
+  ensure
+    release << true if release
   end
 
   def test_runner_drains_both_streams_without_unbounded_retention
@@ -38,7 +145,7 @@ class MullvadRuntimeDeadlineTest < Minitest::Test
     pid = File.read(path).to_i
     assert_raises(Errno::ESRCH) { Process.kill(0, pid) }
     assert_raises(Errno::ECHILD) { Process.waitpid(pid, Process::WNOHANG) }
-    event = JSON.parse(File.readlines(File.join(@dir, 'logs', 'events.jsonl')).last)
+    event = JSON.parse(persisted_probe_events.last)
     assert_equal 'local-command-timeout', event['event']
     assert_equal MullvadAdapter::SOURCE_SHA256, event['source_sha256']
     refute_includes JSON.generate(event), path
@@ -86,7 +193,7 @@ class MullvadRuntimeDeadlineTest < Minitest::Test
     assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 1.2
     pid = File.read(path).to_i
     assert_equal [['KILL', -pid], ['KILL', pid]], signals
-    events = File.readlines(File.join(@dir, 'logs', 'events.jsonl')).map { |line| JSON.parse(line) }
+    events = persisted_probe_events.map { |line| JSON.parse(line) }
     assert_equal %w[group-signal child-signal], events.select { |e| e['event'] == 'local-command-cleanup-deferred' }.map { |e| e['operation'] }
   ensure
     begin
@@ -114,7 +221,7 @@ class MullvadRuntimeDeadlineTest < Minitest::Test
       assert_equal 'fixture', error.phase
       assert_equal 'local probe unavailable: fixture', error.message
     end
-    event = JSON.parse(File.readlines(File.join(@dir, 'logs', 'events.jsonl')).last)
+    event = JSON.parse(persisted_probe_events.last)
     assert_equal 'local-command-unavailable', event['event']
     assert_equal 'spawn', event['operation']
     assert_equal 'Errno::EPERM', event['error_class']
@@ -183,7 +290,7 @@ class MullvadRuntimeDeadlineTest < Minitest::Test
     assert_equal 77_777, @adapter.instance_variable_get(:@front_pid)
     assert_equal 'pass', @adapter.send(:snapshot).dig(:front, :data_path, :status)
     refute @adapter.instance_variable_get(:@health_wake_pending)
-    events = File.readlines(File.join(@dir, 'logs', 'events.jsonl')).map { |line| JSON.parse(line) }
+    events = persisted_probe_events.map { |line| JSON.parse(line) }
     assert_equal 1, events.count { |event| event['event'] == 'front-target-degraded' }
     refute events.any? { |event| event['event'] == 'front-repair-started' }
   end
@@ -234,7 +341,7 @@ class MullvadRuntimeDeadlineTest < Minitest::Test
     refute quarantine.key?('two')
     refute quarantine.key?('three')
     assert_equal 'one', @adapter.send(:snapshot)[:active_relay]
-    events = File.readlines(File.join(@dir, 'logs', 'events.jsonl')).map { |line| JSON.parse(line) }
+    events = persisted_probe_events.map { |line| JSON.parse(line) }
     assert events.any? { |event| event['event'] == 'recovery-local-deferred' }
   end
 
@@ -247,7 +354,7 @@ class MullvadRuntimeDeadlineTest < Minitest::Test
     assert_equal 77_777, @adapter.instance_variable_get(:@front_pid)
     assert_equal 0, @adapter.instance_variable_get(:@front_data_probe_failures)
     refute @adapter.instance_variable_get(:@health_wake_pending)
-    events = File.readlines(File.join(@dir, 'logs', 'events.jsonl')).map { |line| JSON.parse(line) }
+    events = persisted_probe_events.map { |line| JSON.parse(line) }
     assert events.any? { |event| event['event'] == 'front-observation-deferred' }
     refute events.any? { |event| event['event'] == 'front-path-failed' }
   end

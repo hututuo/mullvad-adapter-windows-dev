@@ -10,6 +10,7 @@ require 'optparse'
 require 'rbconfig'
 require 'time'
 require 'socket'
+require_relative 'scripts/mac-launch-agent-policy'
 
 options = {}
 OptionParser.new do |parser|
@@ -39,10 +40,10 @@ rescue StandardError
   nil
 end
 
-def copy_atomic(source, target)
+def copy_atomic(source, target, mode: 0o755)
   temporary = "#{target}.candidate-#{Process.pid}"
   FileUtils.cp(source, temporary)
-  File.chmod(0o755, temporary)
+  File.chmod(mode, temporary)
   File.rename(temporary, target)
 ensure
   FileUtils.rm_f(temporary) if defined?(temporary)
@@ -103,10 +104,13 @@ if options[:rollback]
   end
   backup = File.join(options[:rollback], 'installed-daemon')
   abort 'rollback baseline missing' unless File.file?(backup)
+  previous_plist = File.join(options[:rollback], 'daemon.plist')
+  MullvadLaunchAgentPolicy.validate_backup!(previous_plist)
   abort 'rollback source syntax failed' unless system(RbConfig.ruby, '-c', backup)
   copy_atomic(backup, installed)
   previous_helper = File.join(options[:rollback], 'installed-pq-helper')
   copy_atomic(previous_helper, helper_installed) if File.file?(previous_helper)
+  copy_atomic(previous_plist, plist, mode: File.stat(previous_plist).mode & 0o777)
   restart_service(domain, service, plist)
   state = wait_ready
   puts JSON.generate(rolled_back: true, relay: state['active_relay'], readiness: state['service_readiness'])
@@ -124,7 +128,9 @@ abort 'PQ helper identity check failed' unless helper_status.success? &&
     ['mullvad-pq-negotiator', 1, '19fb87407f4b81fe15372c2c7f8a20e7ab4eb220']
 helper_sha = Digest::SHA256.file(helper_source).hexdigest
 if options[:check]
-  puts JSON.generate(check: 'PASS', source_sha256: source_sha, pq_helper_sha256: helper_sha, installed_helper_matches: File.file?(helper_installed) && Digest::SHA256.file(helper_installed).hexdigest == helper_sha, installed_matches: Digest::SHA256.file(installed).hexdigest == source_sha)
+  puts JSON.generate(check: 'PASS', source_sha256: source_sha, pq_helper_sha256: helper_sha, installed_helper_matches: File.file?(helper_installed) && Digest::SHA256.file(helper_installed).hexdigest == helper_sha, installed_matches: Digest::SHA256.file(installed).hexdigest == source_sha,
+                     current_process_type: MullvadLaunchAgentPolicy.configuration(plist)['ProcessType'],
+                     install_process_type: MullvadLaunchAgentPolicy::PROCESS_TYPE)
   exit
 end
 abort '--canary-report and --backup-dir are required' unless options[:canary] && options[:backup]
@@ -140,6 +146,7 @@ if File.exist?(backup)
   # A failed install may already have rolled back. Reuse its original baseline
   # only when the currently installed bytes still match it exactly.
   abort 'backup exists and does not match current install' unless Digest::SHA256.file(backup).hexdigest == Digest::SHA256.file(installed).hexdigest
+  MullvadLaunchAgentPolicy.validate_backup!(File.join(options[:backup], 'daemon.plist'), current: plist)
 else
   FileUtils.cp(installed, backup, preserve: true)
   FileUtils.cp(helper_installed, File.join(options[:backup], 'installed-pq-helper'), preserve: true) if File.file?(helper_installed)
@@ -147,6 +154,7 @@ else
 end
 report.merge!(source_sha256: source_sha, pq_helper_sha256: helper_sha, previous_sha256: Digest::SHA256.file(backup).hexdigest)
 begin
+  report[:launch_agent_policy_updated] = MullvadLaunchAgentPolicy.apply(plist)
   copy_atomic(helper_source, helper_installed)
   copy_atomic(source, installed)
   restart_service(domain, service, plist)
@@ -158,6 +166,9 @@ rescue StandardError => e
   old_helper = File.join(options[:backup], 'installed-pq-helper')
   copy_atomic(old_helper, helper_installed) if File.file?(old_helper)
   begin
+    old_plist = File.join(options[:backup], 'daemon.plist')
+    MullvadLaunchAgentPolicy.validate_backup!(old_plist)
+    copy_atomic(old_plist, plist, mode: File.stat(old_plist).mode & 0o777)
     restart_service(domain, service, plist)
     report[:rollback_ready] = wait_ready['service_readiness'] == 'ready'
   rescue StandardError => rollback_error

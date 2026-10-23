@@ -49,6 +49,18 @@ Actions手动运行`checks-and-candidate`：先Ruby/Swift/PQ组件检查，再as
 始终继续有界reap与关闭管道；已回收leader不能再按正PID发送信号。无法终止的
 子进程不冒充已成功清理，保留诊断并有界脱离等待。这些边界不能保证操作系统严重卡顿时准点执行。
 
+探针超时、执行不可用、清理拒绝及本地观测暂缓日志使用独立写线程，最多暂存128条；
+检测返回和回收不等待日志锁或磁盘。拥塞时保留较新事件并记录丢弃数，不声称日志零丢失；
+异常退出可能丢失尚未落盘的事件。原观测时间和operation/recovery/attempt关联跨探针线程保留。
+超时记录区分spawn_ms、capture_ms和max_poll_gap_ms；状态发布延误区分循环迟到与
+state_busy/action_busy/capture_error，30秒内最多一条，不续新旧快照年龄或改变隧道健康。
+
+授权执行`install-daemon.rb --install`时，把已有自有LaunchAgent的ProcessType设为Interactive：
+它与子进程承载前台网络和本机状态API，不应按离线后台任务限制CPU/I/O。该服务使用TCP，
+没有XPC事务，因此不使用依赖XPC活跃度的Adaptive。升级保留完整原plist，失败及手动回退
+还原原字节和权限；`--check`只报告当前/目标策略。源码测试或此策略设计均不证明历史某次
+卡顿必然由系统调度造成，也不会自动改变现用服务。依据本机`man launchd.plist`的ProcessType说明。
+
 本地转发监测先测IP地址，失败后再测独立域名HTTPS；同一入口仍有HTTPS流量通过时保留原进程，并记录 `front-target-degraded`。两个目标均失败才进入原有后端对照与连续两次修复阈值，仍保留代次/网络守卫。该策略减少单个探测目标引起的重启，不能把一次重启后恢复当作引擎死锁的证明。详见[运行观测规格](../openspec/changes/mac-runtime-stall-bounds/specs/runtime-observation/spec.md)。
 
 状态通信与隧道健康是两类证据。界面取消一次读取不计故障；晚到的旧响应不能覆盖新结果。单次传输失败显示“状态待更新”，连续三次且跨过至少十秒才显示“无法读取本机服务状态”。HTTP 错误与响应格式错误单独显示，均不等价于隧道断开。保留的快照必须带最后读取时间；成功读取后清除警告。此路径不会触发重连或修改节点。

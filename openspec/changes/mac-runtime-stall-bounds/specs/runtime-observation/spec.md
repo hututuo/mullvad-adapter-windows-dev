@@ -21,3 +21,11 @@ WHEN the literal-IP diagnostic fails but domain HTTPS through the same front suc
 ## RT-4: Explain observation latency
 
 WHEN a local command exceeds its deadline, THEN record the named phase, budget and elapsed time without command arguments, credentials or configuration contents. Probe records include available numeric phase durations, including parent command wall time separately from curl's internal time. These records describe evidence, not an inferred universal root cause.
+
+Timeout/cleanup logging and local probe deferrals must not wait for filesystem I/O or the event-file mutex. A single writer accepts at most 128 queued records, retaining observation timestamps and parent operation/recovery/attempt traces. Overflow drops the oldest queued entries and reports the count; abrupt exit may lose queued records. Writer creation failure must not replace a local-indeterminate result. Command telemetry separates spawn, capture and maximum poll gap; synchronous OS spawn and host scheduling are not hard real-time guarantees.
+
+WHEN the status publisher runs but cannot copy state/action data, THEN stale-publication diagnostics identify that reason separately from delayed publisher ticks, rate-limited to one per 30 seconds. Diagnostics must not renew stale evidence or mark the tunnel down.
+
+## RT-5: Classify the interactive network service correctly
+
+WHEN an explicitly authorized daemon upgrade updates the existing owned launch agent, THEN use Interactive rather than Background batch scheduling for the service and its children. Preserve other job settings, back up the complete original plist, and restore its bytes and permissions on installation failure/manual rollback. Read-only checks never update or restart the job. This TCP service does not use XPC activity to become Adaptive. Scheduling classification is not historical incident root-cause proof.

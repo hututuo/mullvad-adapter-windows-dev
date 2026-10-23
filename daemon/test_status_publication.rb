@@ -47,6 +47,7 @@ class MullvadStatusPublicationTest < Minitest::Test
   end
 
   def teardown
+    @adapter.instance_variable_get(:@probe_event_writer)&.join(1)
     FileUtils.remove_entry(@dir)
   end
 
@@ -146,6 +147,27 @@ class MullvadStatusPublicationTest < Minitest::Test
         lock.unlock if lock.owned?
       end
     end
+  end
+
+  def test_ticking_publisher_reports_stale_lock_contention_without_renewing_age_or_flooding
+    stale = publication.merge(captured_at: Process.clock_gettime(Process::CLOCK_MONOTONIC) - 4).freeze
+    @adapter.instance_variable_set(:@status_publication, stale)
+    lock = @adapter.instance_variable_get(:@mutex)
+    lock.lock
+    tick = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    3.times { tick = bounded_call { @adapter.send(:publish_status_tick, tick) } }
+    assert_same stale, publication
+    lock.unlock
+    assert @adapter.instance_variable_get(:@probe_event_writer)&.join(1)
+    events = File.readlines(File.join(@dir, 'logs', 'events.jsonl')).map { |line| JSON.parse(line) }
+    assert_equal 1, events.length
+    assert_equal 'status-publication-delayed', events.first['event']
+    assert_equal 'state_busy', events.first['reason']
+    assert_operator events.first['snapshot_age_ms'], :>=, 4000
+    assert @adapter.send(:publish_status_snapshot)
+    assert_equal 200, request_status.first
+  ensure
+    lock&.unlock if lock&.owned?
   end
 
   def test_stale_publication_reports_stale_then_refreshes_after_lock_release

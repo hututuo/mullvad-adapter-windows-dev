@@ -127,7 +127,7 @@ class MullvadAdapter
   TRANSPORT_PREFERENCES = (%w[auto] + TRANSPORT_MODES).freeze
   AUTO_TRANSPORT_ORDER = %w[ss ipv6 ipv4].freeze
   DEFAULT_TRANSPORT_PREFERENCE = 'ss'
-  BUILD_ID = '20261023-ordered-city-recovery-1'
+  BUILD_ID = '20261023-probe-liveness-1'
   SOURCE_SHA256 = Digest::SHA256.file(__FILE__).hexdigest
   STATUS_PUBLICATION_INTERVAL = 1.0
   STATUS_PUBLICATION_MAX_AGE = 3.0
@@ -202,6 +202,10 @@ class MullvadAdapter
     @state_dir = @options[:state_dir]
     @log_dir = @options[:log_dir] || (@state_dir == DEFAULTS[:state_dir] ? File.expand_path('~/Library/Logs/MullvadLocalAdapter') : File.join(@state_dir, 'logs'))
     @log_mutex = Mutex.new
+    @probe_event_mutex = Mutex.new
+    @probe_events = []
+    @probe_events_dropped = 0
+    @probe_event_writer = nil
     @mutex = Mutex.new
     @switch_mutex = Mutex.new
     @ordered_recovery_mutex = Mutex.new
@@ -1747,6 +1751,47 @@ class MullvadAdapter
     end
   end
 
+  # Deadline handling and child cleanup must never wait for the log file or
+  # its mutex. One writer drains a bounded queue; a slow disk cannot create
+  # unbounded threads or buffers. Preserve observation time across that wait.
+  def log_probe_event(event, fields = {})
+    trace = { operation_id: Thread.current[:adapter_operation_id],
+              recovery_id: Thread.current[:adapter_recovery_id], attempt_id: Thread.current[:adapter_attempt_id] }.compact
+    entry = trace.merge(fields).merge(at: Time.now.iso8601)
+    @probe_event_mutex.synchronize do
+      if @probe_events.length >= 128
+        @probe_events.shift
+        @probe_events_dropped += 1
+      end
+      @probe_events << [event, entry]
+      unless @probe_event_writer&.alive?
+        @probe_event_writer = Thread.new do
+          Thread.current.name = 'adapter-probe-events'
+          loop do
+            item = @probe_event_mutex.synchronize do
+              if @probe_events.empty?
+                @probe_event_writer = nil
+                nil
+              else
+                name, values = @probe_events.shift
+                dropped = @probe_events_dropped
+                @probe_events_dropped = 0
+                [name, dropped.positive? ? values.merge(dropped_probe_events: dropped) : values]
+              end
+            end
+            break unless item
+            log_event(*item)
+          end
+        end
+      end
+    end
+    nil
+  rescue StandardError
+    # Diagnostics are best effort even when the OS cannot create a writer
+    # thread. Never replace a probe timeout/cancellation with a logging error.
+    nil
+  end
+
   def parse_json_body(body)
     parsed = body.to_s.empty? ? {} : JSON.parse(body)
     raise ArgumentError, 'JSON object required' unless parsed.is_a?(Hash)
@@ -1797,18 +1842,39 @@ class MullvadAdapter
     return if @status_publisher&.alive?
     @status_publisher = Thread.new do
       Thread.current.name = 'adapter-status-publication'
+      previous_tick = monotonic_now
       until @stop_requested
-        publish_status_snapshot
+        previous_tick = publish_status_tick(previous_tick)
         sleep STATUS_PUBLICATION_INTERVAL
       end
     end
+  end
+
+  def publish_status_tick(previous_tick)
+    published = publish_status_snapshot
+    now = monotonic_now
+    publication = @status_publication
+    age = publication && now - publication[:captured_at]
+    delayed = now - previous_tick > STATUS_PUBLICATION_MAX_AGE
+    stale = !published && (!age || age > STATUS_PUBLICATION_MAX_AGE)
+    if (delayed || stale) && (!@last_status_delay_event || now - @last_status_delay_event >= 30)
+      @last_status_delay_event = now
+      log_probe_event('status-publication-delayed',
+                      reason: stale ? @status_publication_defer_reason || 'publisher_busy' : 'loop_delayed',
+                      interval_ms: ((now - previous_tick) * 1000).round,
+                      snapshot_age_ms: age && (age * 1000).round)
+    end
+    now
   end
 
   def publish_status_snapshot
     return false unless @status_publish_gate.try_lock
     begin
       started = monotonic_now
-      return false unless @mutex.try_lock
+      unless @mutex.try_lock
+        @status_publication_defer_reason = 'state_busy'
+        return false
+      end
       begin
         # Capture time precedes the copy, so serialisation/scheduling delay is
         # included in the reported age rather than resetting freshness later.
@@ -1823,7 +1889,10 @@ class MullvadAdapter
       ensure
         @mutex.unlock
       end
-      return false unless @action_gate_mutex.try_lock
+      unless @action_gate_mutex.try_lock
+        @status_publication_defer_reason = 'action_busy'
+        return false
+      end
       begin
         pending = @action_pending
         latest = pending ? @operations[pending[:id]] : @operations.values.last
@@ -1836,10 +1905,12 @@ class MullvadAdapter
       json = JSON.generate(copy).freeze
       @status_publication = { json: json, captured_at: captured_at,
                               capture_ms: [(monotonic_now - started) * 1000, 0].max.round }.freeze
+      @status_publication_defer_reason = nil
       true
     rescue StandardError
       # Never publish partial state, renew its age on error, or do disk/network
       # logging here. Age/error response remains available without these locks.
+      @status_publication_defer_reason = 'capture_error'
       false
     ensure
       @status_publish_gate.unlock
@@ -2130,7 +2201,7 @@ class MullvadAdapter
       @switch_mutex.unlock
       supervise_front_data_path(active_slot, active_worker)
     rescue LocalProbeTimeout => e
-      log_event('front-observation-deferred', phase: e.phase, reason: 'local-probe-timeout-not-front-failure')
+      log_probe_event('front-observation-deferred', phase: e.phase, reason: 'local-probe-timeout-not-front-failure')
       nil
     rescue StandardError => e
       @mutex.synchronize do
@@ -2237,7 +2308,7 @@ class MullvadAdapter
       @switch_mutex.unlock if @switch_mutex.owned?
     end
   rescue LocalProbeTimeout => e
-    log_event('front-observation-deferred', **(context || {}), phase: e.phase,
+    log_probe_event('front-observation-deferred', **(context || {}), phase: e.phase,
               reason: 'local-probe-timeout-not-front-failure')
     nil
   rescue StandardError => e
@@ -2740,7 +2811,7 @@ class MullvadAdapter
       end
 
     rescue LocalProbeTimeout => e
-      log_event('health-local-deferred', relay: expected_relay || context&.dig(:relay), phase: e.phase,
+      log_probe_event('health-local-deferred', relay: expected_relay || context&.dig(:relay), phase: e.phase,
                 reason: 'local-probe-timeout-not-relay-failure')
       return :retry
     rescue StandardError => e
@@ -3267,7 +3338,8 @@ class MullvadAdapter
         begin
           maintain_city_candidates_once
         rescue StandardError => e
-          log_event('city-maintenance-error', error: "#{e.class}: #{e.message}")
+          log_probe_event('city-maintenance-error', error_class: e.class.name,
+                          phase: e.respond_to?(:phase) ? e.phase : nil)
         end
         5.times { break if @stop_requested; sleep 1 }
       end
@@ -5457,7 +5529,9 @@ class MullvadAdapter
   # 一个探针抛异常会连累另外两个还没读完的结果，把一次普通的探测失败升级成
   # "整轮金丝雀失败"，反而更难定位。
   def spawn_probe
+    trace = %i[adapter_operation_id adapter_recovery_id adapter_attempt_id].to_h { |key| [key, Thread.current[key]] }
     thread = Thread.new do
+      trace.each { |key, value| Thread.current[key] = value }
       begin
         yield
       rescue LocalProbeTimeout => e
@@ -5584,7 +5658,7 @@ class MullvadAdapter
   def await_probe(thread, deadline, phase)
     remaining = deadline - monotonic_now
     unless remaining.positive? && thread.join(remaining)
-      log_event('local-probe-timeout', phase: phase, reason: 'aggregate-deadline')
+      log_probe_event('local-probe-timeout', phase: phase, reason: 'aggregate-deadline')
       raise LocalProbeTimeout, phase
     end
     result = thread.value
@@ -6109,6 +6183,9 @@ class MullvadAdapter
   def capture_probe_command(*argv, timeout_seconds:, phase:)
     started = monotonic_now
     deadline = started + timeout_seconds
+    spawned_at = nil
+    last_poll_at = started
+    max_poll_gap = 0.0
     outputs = [String.new(encoding: Encoding::BINARY), String.new(encoding: Encoding::BINARY)]
     readers, writers = [], []
     pid = status = nil
@@ -6119,14 +6196,22 @@ class MullvadAdapter
       writers << writer
     end
     pid = Process.spawn(*argv, in: File::NULL, out: writers[0], err: writers[1], pgroup: true)
+    spawned_at = last_poll_at = monotonic_now
     writers.each(&:close)
     streams = readers.each_with_index.to_h
     until status && streams.empty?
       status ||= Process.waitpid2(pid, Process::WNOHANG)&.last
-      remaining = deadline - monotonic_now
+      now = monotonic_now
+      max_poll_gap = [max_poll_gap, now - last_poll_at].max
+      last_poll_at = now
+      remaining = deadline - now
       if remaining <= 0
-        log_event('local-command-timeout', phase: phase, budget_ms: (timeout_seconds * 1000).round,
-                  duration_ms: ((monotonic_now - started) * 1000).round)
+        log_probe_event('local-command-timeout', phase: phase, budget_ms: (timeout_seconds * 1000).round,
+                        duration_ms: ((now - started) * 1000).round,
+                        spawn_ms: ((spawned_at - started) * 1000).round,
+                        capture_ms: ((now - spawned_at) * 1000).round,
+                        max_poll_gap_ms: (max_poll_gap * 1000).round,
+                        child_reaped: !status.nil?, open_streams: streams.length)
         raise LocalProbeTimeout, phase
       end
       ready = IO.select(streams.keys, nil, nil, [remaining, 0.025].min)
@@ -6142,12 +6227,18 @@ class MullvadAdapter
       end
     end
     complete = true
+    if spawned_at - started > 0.25 || max_poll_gap > 0.25
+      log_probe_event('local-command-delayed', phase: phase,
+                      duration_ms: ((monotonic_now - started) * 1000).round,
+                      spawn_ms: ((spawned_at - started) * 1000).round,
+                      max_poll_gap_ms: (max_poll_gap * 1000).round)
+    end
     [*outputs.map { |output| output.force_encoding(Encoding::UTF_8).scrub }, status,
      ((monotonic_now - started) * 1000).round]
   rescue SystemCallError => e
-    log_event('local-command-unavailable', phase: phase,
-              operation: pid ? 'capture' : 'spawn', error_class: e.class.name,
-              duration_ms: ((monotonic_now - started) * 1000).round)
+    log_probe_event('local-command-unavailable', phase: phase,
+                    operation: pid ? 'capture' : 'spawn', error_class: e.class.name,
+                    duration_ms: ((monotonic_now - started) * 1000).round)
     raise LocalProbeUnavailable, phase
   ensure
     # These are probe children only. KILL also closes inherited output pipes
@@ -6181,8 +6272,8 @@ class MullvadAdapter
     # A denied group signal must not replace the original timeout/cancellation
     # or skip pipe closure/reaping. Fall back only to our own, unreaped child;
     # never resolve or signal other processes by name.
-    log_event('local-command-cleanup-deferred', phase: phase, operation: 'group-signal',
-              error_class: 'Errno::EPERM')
+    log_probe_event('local-command-cleanup-deferred', phase: phase, operation: 'group-signal',
+                    error_class: 'Errno::EPERM', child_unreaped: child_unreaped)
     return unless child_unreaped
     begin
       # waitpid also proves this PID is still our child. An already reaped
@@ -6193,8 +6284,8 @@ class MullvadAdapter
     rescue Errno::ESRCH
       nil
     rescue Errno::EPERM
-      log_event('local-command-cleanup-deferred', phase: phase, operation: 'child-signal',
-                error_class: 'Errno::EPERM')
+      log_probe_event('local-command-cleanup-deferred', phase: phase, operation: 'child-signal',
+                      error_class: 'Errno::EPERM', child_unreaped: true)
     end
   end
 
