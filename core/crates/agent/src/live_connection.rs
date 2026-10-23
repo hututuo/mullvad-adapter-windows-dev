@@ -42,6 +42,7 @@ struct Pending {
     rejected: Option<(u64, adapter_domain::Canary)>,
     retry_stale: bool,
     retry_network: bool,
+    failed_reply: Option<crate::recovery_retry::AttemptFailureDisposition>,
 }
 pub(crate) struct Connections {
     pub(crate) client: connection_tunnel::Client,
@@ -66,6 +67,7 @@ pub(crate) struct Connections {
     chain_relays: BTreeSet<String>,
     chain_mode: adapter_protocol::app::TunnelRoute,
     retry_round: crate::recovery_retry::RecoveryRetry,
+    local_retry: crate::recovery_retry::LocalFailureRetry,
     plan: crate::recovery_plan::RoundPlan,
     active_failures: crate::recovery_plan::ActiveFailures,
     direct_return: crate::recovery_plan::DirectReturn,
@@ -106,6 +108,7 @@ impl Connections {
                 chain_relays: Default::default(),
                 chain_mode: adapter_protocol::app::TunnelRoute::Auto,
                 retry_round: Default::default(),
+                local_retry: Default::default(),
                 plan: Default::default(),
                 active_failures: Default::default(),
                 direct_return: Default::default(),
@@ -132,6 +135,36 @@ impl Connections {
         self.route_trial = None;
         self.forced_route = None;
         self.restore_target = None;
+    }
+    fn begin_route_trial(&mut self) {
+        // Route trials have a temporary target and rollback path. Keep the
+        // persistent city/relay intent used by ordinary recovery.
+        self.plan.clear();
+        self.active_failures.clear();
+        self.route_trial = None;
+        self.forced_route = None;
+        self.restore_target = None;
+        self.inlet_trials.clear();
+        self.chain_relays.clear();
+        self.manual_candidates = None;
+        self.recovering = None;
+        self.deferred = None;
+        self.local_retry.clear();
+        self.next_attempt = Instant::now();
+    }
+    fn begin_recovery_action(
+        &mut self,
+        action: adapter_protocol::app::RecoveryAction,
+        city: Option<&str>,
+        relay: Option<&str>,
+    ) {
+        if let Some(persistent_relay) =
+            crate::recovery_retry::persistent_relay_for_action(action, relay)
+        {
+            self.begin_user_selection(city, persistent_relay);
+        } else {
+            self.begin_route_trial();
+        }
     }
     pub(crate) fn restore_history(&mut self, store: adapter_platform::windows_store::PrivateStore) {
         use adapter_platform::storage_record::RecordKind;
@@ -252,13 +285,14 @@ impl Connections {
         {
             return None;
         }
+        self.local_retry.clear();
         if self.route_trial.is_some() {
             if !canary.alive()
                 && self.advance_trial_inlet(&attempt.path, catalogue, pending.automatic)
             {
                 return Some(true);
             }
-            return Some(self.trial_failed(owner, dashboard));
+            return Some(self.trial_failed(owner, dashboard, true));
         }
         let delay = if !canary.alive() {
             self.plan.short_retry(
@@ -350,10 +384,9 @@ impl Connections {
         if matches!(action, A::TestBackup | A::ChainFallback) && self.chain.is_none() {
             return Err("chain_not_configured");
         }
-        let previous = dashboard
-            .active_relay
-            .as_ref()
-            .and(owner.state().path.clone());
+        // Keep the last committed path as the rollback target even when the
+        // front is currently rejecting traffic after a failed rebuild.
+        let previous = owner.state().path.clone();
         let relay = if action == A::RetryCity {
             None
         } else {
@@ -362,7 +395,8 @@ impl Connections {
                 .map(|p| p.relay.clone())
                 .or_else(|| self.last_relay.clone())
         };
-        self.begin_user_selection(
+        self.begin_recovery_action(
+            action,
             dashboard.settings.selected_city.as_deref(),
             relay.as_deref(),
         );
@@ -444,7 +478,12 @@ impl Connections {
         }
         advanced
     }
-    fn trial_failed(&mut self, owner: &mut ResourceOwner, dashboard: &mut Dashboard) -> bool {
+    fn trial_failed(
+        &mut self,
+        owner: &mut ResourceOwner,
+        dashboard: &mut Dashboard,
+        schedule_retry: bool,
+    ) -> bool {
         let Some(trial) = self.route_trial.as_mut() else {
             return false;
         };
@@ -482,7 +521,9 @@ impl Connections {
             dashboard.backup_test_restored = false;
         }
         dashboard.last_error = Some("route_trial_failed".into());
-        self.schedule_retry(dashboard);
+        if schedule_retry {
+            self.schedule_retry(dashboard);
+        }
         false
     }
     fn trial_connected(
@@ -645,6 +686,7 @@ impl Connections {
         self.recovering = None;
         self.manual_candidates = None;
         self.deferred = None;
+        self.local_retry.clear();
     }
     pub(crate) fn identity_changed(&mut self, owner: &mut ResourceOwner) {
         self.retry_round.cancel();
@@ -672,7 +714,7 @@ impl Connections {
         code: &'static str,
     ) {
         debug_assert!(self.pending.is_none());
-        if self.route_trial.is_some() && self.trial_failed(owner, dashboard) {
+        if self.route_trial.is_some() && self.trial_failed(owner, dashboard, true) {
             return;
         }
         self.inlet_trials.clear();
@@ -726,19 +768,7 @@ impl Connections {
     pub(crate) fn defer_start_failure(&mut self, dashboard: &mut Dashboard, code: &str) {
         // Local failures stay local: do not quarantine/consume an SS inlet. An
         // uncertain stop or invalid identity/configuration must not auto-loop.
-        if matches!(
-            code,
-            "operation_busy"
-                | "tunnel_command_busy"
-                | "worker_runtime_unavailable"
-                | "physical_binding_unavailable"
-                | "worker_route_unavailable"
-                | "worker_chain_resolution_failed"
-                | "worker_start_failed"
-                | "worker_controller_unavailable"
-                | "worker_start_deadline"
-                | "candidate_probe_failed"
-        ) {
+        if crate::recovery_retry::is_retryable_local_failure(code) {
             self.schedule_retry(dashboard);
         }
     }
@@ -746,6 +776,7 @@ impl Connections {
     pub(crate) fn begin_user_selection(&mut self, city: Option<&str>, relay: Option<&str>) {
         self.clear_plan();
         self.retry_round.user_connect(city, relay);
+        self.local_retry.clear();
         self.inlet_trials.clear();
         self.chain_relays.clear();
         self.manual_candidates = None;
@@ -1031,6 +1062,7 @@ impl Connections {
             rejected: None,
             retry_stale: false,
             retry_network: false,
+            failed_reply: None,
         });
         dashboard.active_relay = None;
         dashboard.operation = Some(
@@ -1236,6 +1268,7 @@ impl Connections {
         {
             return false;
         }
+        self.local_retry.clear();
         let next_chain = was_chain;
         let mut allowed = catalogue.shadowsocks_inlets(relay);
         if let Some(selected) = self
@@ -1282,6 +1315,150 @@ impl Connections {
         self.deferred = Some(relay);
         self.next_attempt = Instant::now() + Duration::from_millis(adapter_domain::LOCAL_RETRY_MS);
     }
+    fn defer_local_target(&mut self, relay: String) {
+        // A start/canary transaction failure contains no remote negative
+        // evidence. Retry this exact target with increasing bounded waits;
+        // the current round deadline still limits its total lifetime.
+        self.next_attempt = Instant::now() + self.local_retry.next_delay(&relay);
+        self.deferred = Some(relay);
+    }
+    fn retry_window_open(&self, automatic: bool) -> bool {
+        let now = Instant::now();
+        if automatic {
+            self.recovering
+                .as_ref()
+                .is_some_and(|(deadline, _)| now < *deadline)
+        } else {
+            self.manual_candidates
+                .as_ref()
+                .is_some_and(|(deadline, _, _, _)| now < *deadline)
+        }
+    }
+    fn retry_failed_attempt_locally(
+        &mut self,
+        owner: &mut ResourceOwner,
+        attempt: &CandidateAttempt,
+        automatic: bool,
+    ) -> bool {
+        if !owner.state().current(&attempt.owner) || !self.retry_window_open(automatic) {
+            return false;
+        }
+        let expected_stage = if automatic {
+            matches!(
+                owner.state().stage,
+                adapter_domain::Stage::RebuildOriginal | adapter_domain::Stage::Fallback
+            )
+        } else {
+            owner.state().stage == adapter_domain::Stage::ManualSelection
+        };
+        if !expected_stage {
+            return false;
+        }
+        let relay = attempt.path.relay.clone();
+        if automatic {
+            // This operation is known to have drained, but carries no fresh
+            // negative evidence. Clear its token without requiring the old
+            // attempt freshness deadline, then preserve its domain phase.
+            let now = owner.now();
+            let effect = owner.state_mut().retry_after_local_cleanup(attempt, now);
+            if effect == adapter_domain::Effect::Disconnected {
+                return false;
+            }
+            self.defer_local_target(relay);
+        } else {
+            // The Reply::Failed path has no measurement to justify moving an
+            // explicit selection to another relay or inlet.
+            self.retry_manual_candidate(relay.clone(), true);
+            self.next_attempt = Instant::now() + self.local_retry.next_delay(&relay);
+        }
+        true
+    }
+    fn abandon_failed_attempt(
+        &mut self,
+        owner: &mut ResourceOwner,
+        dashboard: &mut Dashboard,
+        attempt: &CandidateAttempt,
+    ) {
+        if !owner.state().current(&attempt.owner) {
+            return;
+        }
+        let now = owner.now();
+        let _ = owner.state_mut().retry_after_local_cleanup(attempt, now);
+        self.local_retry.clear();
+        self.retry_round.cancel_scheduled_retry();
+        if self.route_trial.is_some() {
+            if !self.trial_failed(owner, dashboard, false) {
+                owner.state_mut().finish_recovery(false);
+            }
+        } else {
+            self.recovering = None;
+            self.manual_candidates = None;
+            self.deferred = None;
+            owner.state_mut().finish_recovery(false);
+        }
+    }
+    fn apply_attempt_failure_disposition(
+        &mut self,
+        owner: &mut ResourceOwner,
+        dashboard: &mut Dashboard,
+        attempt: &CandidateAttempt,
+        disposition: crate::recovery_retry::AttemptFailureDisposition,
+        automatic: bool,
+    ) -> crate::recovery_retry::AttemptFailureDisposition {
+        use crate::recovery_retry::AttemptFailureDisposition as D;
+        if !owner.state().current(&attempt.owner) {
+            return D::StopCleanly;
+        }
+        match disposition {
+            D::RetrySameTarget if self.retry_failed_attempt_locally(owner, attempt, automatic) => {
+                D::RetrySameTarget
+            }
+            D::RetrySameTarget => {
+                if owner.state().current(&attempt.owner)
+                    && (!self.retry_window_open(automatic)
+                        || owner.state().stage == adapter_domain::Stage::Disconnected)
+                {
+                    self.finish_recovery(owner, dashboard, "recovery_budget_exhausted");
+                    D::RoundExpired
+                } else {
+                    self.abandon_failed_attempt(owner, dashboard, attempt);
+                    D::StopCleanly
+                }
+            }
+            D::StopCleanly => {
+                self.abandon_failed_attempt(owner, dashboard, attempt);
+                D::StopCleanly
+            }
+            D::RoundExpired => {
+                self.finish_recovery(owner, dashboard, "recovery_budget_exhausted");
+                D::RoundExpired
+            }
+            D::Freeze => {
+                self.frozen = true;
+                self.retry_round.cancel_scheduled_retry();
+                self.recovering = None;
+                self.manual_candidates = None;
+                self.deferred = None;
+                D::Freeze
+            }
+        }
+    }
+    fn handle_attempt_failure(
+        &mut self,
+        owner: &mut ResourceOwner,
+        dashboard: &mut Dashboard,
+        attempt: &CandidateAttempt,
+        code: &str,
+        automatic: bool,
+    ) -> crate::recovery_retry::AttemptFailureDisposition {
+        self.apply_attempt_failure_disposition(
+            owner,
+            dashboard,
+            attempt,
+            crate::recovery_retry::attempt_failure_disposition(code),
+            automatic,
+        )
+    }
     fn recovery(
         &mut self,
         owner: &mut ResourceOwner,
@@ -1317,6 +1494,7 @@ impl Connections {
             return;
         }
         self.retry_round.round_started();
+        self.local_retry.clear();
         self.inlet_trials.clear();
         self.chain_relays.clear();
         self.plan.start(
@@ -1645,6 +1823,7 @@ impl Connections {
                     self.inlet_trials.clear();
                     self.chain_relays.clear();
                     self.active_failures.clear();
+                    self.local_retry.clear();
                     dashboard.status = "connected".into();
                     dashboard.readiness = owner.state().readiness.map(|r| {
                         if r == adapter_domain::Readiness::Ready {
@@ -1712,6 +1891,7 @@ impl Connections {
                     dashboard.operation = None;
                     if ready {
                         self.active_failures.clear();
+                        self.local_retry.clear();
                         if owner.state().path.as_ref().is_some_and(|path| {
                             self.retry_round
                                 .connection_succeeded(&path.city, &path.relay)
@@ -1950,50 +2130,41 @@ impl Connections {
                     // Prepare failure has positively stopped the candidate. A
                     // promotion rejection still needs explicit reconciliation.
                     if p.promoting {
+                        if let Some(pending) = &mut self.pending {
+                            pending.failed_reply =
+                                Some(crate::recovery_retry::attempt_failure_disposition(code));
+                        }
                         self.abort(owner, code, dashboard);
                         continue;
                     }
                     let p = self.pending.take().unwrap();
                     owner.finish_operation(&p.ticket);
-                    if p.attempt.is_some() {
-                        // Failed Prepare has stopped the old worker and read
-                        // back Reject. Retain owner.path/last_relay for recovery,
-                        // but do not display the previous slot as live.
-                        dashboard.front_selected = "reject".into();
-                        dashboard.active_relay = None;
-                    }
-                    if self.route_trial.is_some() && p.attempt.is_some() {
-                        self.trial_failed(owner, dashboard);
-                        dashboard.operation = None;
-                        dashboard.status = "disconnected".into();
-                        dashboard.last_error = Some(code.into());
-                        continue;
-                    }
-                    if !automatic {
-                        if let Some(attempt) = &p.attempt {
-                            self.retry_manual_candidate(
-                                attempt.path.relay.clone(),
-                                code == "candidate_evidence_stale",
-                            );
+                    if let Some(attempt) = &p.attempt {
+                        let disposition =
+                            self.handle_attempt_failure(owner, dashboard, attempt, code, automatic);
+                        use crate::recovery_retry::AttemptFailureDisposition as D;
+                        if disposition != D::Freeze {
+                            // These classified outcomes confirm the candidate
+                            // transaction stopped before returning its failure.
+                            dashboard.front_selected = "reject".into();
+                            dashboard.active_relay = None;
                         }
-                    }
-                    if automatic && owner.state().stage == adapter_domain::Stage::RebuildOriginal {
-                        if let Some(attempt) = &p.attempt {
-                            let now = owner.now();
-                            let _ = owner.state_mut().original_rebuilt(
-                                attempt,
-                                adapter_domain::RebuildResult::LocalFailure,
-                                now,
-                                now,
-                            );
-                            self.deferred = Some(attempt.path.relay.clone());
-                            self.next_attempt = Instant::now()
-                                + Duration::from_millis(adapter_domain::LOCAL_RETRY_MS);
-                        }
-                    }
-                    if automatic && code == "candidate_evidence_stale" {
-                        if let Some(attempt) = &p.attempt {
-                            self.defer_stale_candidate(attempt.path.relay.clone());
+                        match disposition {
+                            D::RetrySameTarget | D::StopCleanly => {}
+                            D::RoundExpired => {
+                                dashboard.operation = None;
+                                dashboard.readiness = None;
+                                continue;
+                            }
+                            D::Freeze => {
+                                // Unknown ownership/identity results cannot be
+                                // converted into a new start or a relay failure.
+                                dashboard.operation = None;
+                                dashboard.readiness = None;
+                                dashboard.status = "blocked".into();
+                                dashboard.last_error = Some(code.into());
+                                continue;
+                            }
                         }
                     }
                     dashboard.operation = None;
@@ -2005,11 +2176,7 @@ impl Connections {
                         "disconnected"
                     }
                     .into();
-                    if automatic {
-                        if let Some(c) = catalogue {
-                            self.recovery(owner, dashboard, c);
-                        }
-                    } else if self.manual_candidates.is_none() && p.attempt.is_some() {
+                    if !automatic && self.manual_candidates.is_none() && p.attempt.is_some() {
                         self.defer_start_failure(dashboard, code);
                     }
                 }
@@ -2018,30 +2185,19 @@ impl Connections {
                     let _ = self.logs.event("connection", "stopped");
                     let p = self.pending.take().unwrap();
                     let now = owner.now();
-                    if automatic
-                        && (p.retry_stale || p.retry_network)
-                        && p.attempt
-                            .as_ref()
-                            .is_some_and(|attempt| owner.state().candidate_is_current(attempt, now))
-                    {
-                        self.defer_stale_candidate(p.attempt.as_ref().unwrap().path.relay.clone());
-                    }
                     let binding_changed = owner.operation_binding_changed(&p.ticket);
                     let attempt_current = p
                         .attempt
                         .as_ref()
                         .is_some_and(|a| owner.state().current(&a.owner));
-                    if binding_changed {
+                    if !automatic && binding_changed {
                         if let Some(attempt) = &p.attempt {
-                            if automatic {
-                                self.defer_stale_candidate(attempt.path.relay.clone());
-                            } else {
-                                self.retry_manual_candidate(attempt.path.relay.clone(), true);
-                            }
+                            self.retry_manual_candidate(attempt.path.relay.clone(), true);
                         }
                     }
                     if !automatic
                         && p.rejected.is_none()
+                        && p.failed_reply.is_none()
                         && self.route_trial.is_none()
                         && !binding_changed
                     {
@@ -2060,33 +2216,62 @@ impl Connections {
                         None
                     };
                     if classification.is_none()
+                        && p.failed_reply.is_some()
+                        && attempt_current
+                        && !binding_changed
+                    {
+                        if let Some(attempt) = &p.attempt {
+                            self.apply_attempt_failure_disposition(
+                                owner,
+                                dashboard,
+                                attempt,
+                                p.failed_reply.unwrap(),
+                                automatic,
+                            );
+                            classification = Some(true);
+                        }
+                    }
+                    if classification.is_none()
                         && !binding_changed
                         && attempt_current
                         && self.route_trial.is_some()
                         && !p.retry_network
                         && !p.retry_stale
+                        && p.failed_reply.is_none()
                         && !self.disconnecting
                     {
-                        classification = Some(self.trial_failed(owner, dashboard));
+                        classification = Some(self.trial_failed(owner, dashboard, true));
                     }
                     if classification.is_none() {
                         if let Some(attempt) = &p.attempt {
-                            let effect = owner.state_mut().retry_after_local_cleanup(attempt, now);
-                            if automatic
-                                && !matches!(
-                                    effect,
-                                    adapter_domain::Effect::Stale
-                                        | adapter_domain::Effect::Disconnected
-                                )
-                            {
-                                self.defer_stale_candidate(attempt.path.relay.clone());
-                            } else if !automatic
-                                && p.rejected.is_some()
-                                && attempt_current
-                                && !binding_changed
-                                && !self.disconnecting
-                            {
-                                self.retry_manual_candidate(attempt.path.relay.clone(), true);
+                            if p.failed_reply.is_some() {
+                                // The failed reply's code was classified before
+                                // Abort. Stopped now confirms cleanup, so an
+                                // unsafe/unknown code may end the round but may
+                                // not silently turn into a target retry.
+                                self.abandon_failed_attempt(owner, dashboard, attempt);
+                            } else {
+                                let stage = owner.state().stage;
+                                let _ = owner.state_mut().retry_after_local_cleanup(attempt, now);
+                                if automatic
+                                    && attempt_current
+                                    && !owner.state().paused
+                                    && !self.disconnecting
+                                    && matches!(
+                                        stage,
+                                        adapter_domain::Stage::RebuildOriginal
+                                            | adapter_domain::Stage::Fallback
+                                    )
+                                {
+                                    self.defer_local_target(attempt.path.relay.clone());
+                                } else if !automatic
+                                    && p.rejected.is_some()
+                                    && attempt_current
+                                    && !binding_changed
+                                    && !self.disconnecting
+                                {
+                                    self.retry_manual_candidate(attempt.path.relay.clone(), true);
+                                }
                             }
                         }
                     }
@@ -2105,11 +2290,16 @@ impl Connections {
                         self.deferred = self.last_relay.clone();
                     }
                     owner.finish_operation(&p.ticket);
+                    let retry_wait = dashboard.status == "retry_wait";
                     dashboard.front_selected = "reject".into();
                     dashboard.operation = None;
                     dashboard.readiness = None;
-                    dashboard.status = if owner.state().paused {
+                    dashboard.status = if self.frozen {
+                        "blocked"
+                    } else if owner.state().paused {
                         "waiting_network"
+                    } else if retry_wait {
+                        "retry_wait"
                     } else {
                         "disconnected"
                     }
@@ -2192,10 +2382,12 @@ impl Connections {
                     {
                         if !matches!(code, "relay_not_active" | "shadowsocks_inlets_exhausted") {
                             if let Some((_, _, queue, _)) = &mut self.manual_candidates {
-                                queue.push_front(relay);
+                                queue.push_front(relay.clone());
                             }
-                            self.next_attempt = Instant::now()
-                                + Duration::from_millis(adapter_domain::LOCAL_RETRY_MS);
+                            self.next_attempt =
+                                Instant::now() + self.local_retry.next_delay(&relay);
+                        } else {
+                            self.local_retry.clear();
                         }
                         dashboard.last_error = Some(code.into());
                     }
@@ -2226,12 +2418,15 @@ impl Connections {
         {
             match self.connect(owner, dashboard, identity, catalogue, Some(&relay), true) {
                 Ok(_) => self.deferred = None,
-                Err("operation_busy" | "recovery_deferred") => {}
+                Err("operation_busy" | "recovery_deferred") => {
+                    self.defer_local_target(relay.clone());
+                }
                 Err(code) => {
                     if matches!(code, "relay_not_active" | "original_inlet_withdrawn")
                         && owner.state().stage == adapter_domain::Stage::RebuildOriginal
                     {
                         self.deferred = None;
+                        self.local_retry.clear();
                         let now = owner.now();
                         let token = owner.state().token();
                         let _ = owner.state_mut().original_withdrawn(&token, now);
@@ -2243,12 +2438,12 @@ impl Connections {
                             | "shadowsocks_inlets_exhausted"
                     ) {
                         self.deferred = None;
+                        self.local_retry.clear();
                     } else {
                         // No candidate was measured. Local preparation/queue
                         // errors do not prove this relay is dead and must not
                         // consume the original target or the fallback queue.
-                        self.next_attempt =
-                            Instant::now() + Duration::from_millis(adapter_domain::LOCAL_RETRY_MS);
+                        self.defer_local_target(relay.clone());
                     }
                     dashboard.last_error = Some(code.into());
                 }
@@ -2311,6 +2506,7 @@ impl Connections {
                         rejected: None,
                         retry_stale: false,
                         retry_network: false,
+                        failed_reply: None,
                     });
                     let _ = self.logs.event("connection", "probing");
                 } else {

@@ -136,12 +136,199 @@ fn fixture(kind: TrialKind) -> Fixture {
     }
 }
 
+fn domain_fallback_owner(original: &Path, target: &Path) -> (ResourceOwner, CandidateAttempt) {
+    use adapter_control::observer::ObservedOwner;
+    use adapter_domain::{Canary, Effect, RebuildResult, State};
+    use adapter_platform::physical_attachment::{Attachment as Physical, Observation};
+
+    let mut state = State::new("synthetic-fallback".into());
+    state.path = Some(original.clone());
+    state.city = Some(original.city.clone());
+    state.observe(adapter_domain::Attachment::Available, 0);
+    state.request_original_rebuild(0).unwrap();
+
+    let mut rebuilt_path = original.clone();
+    rebuilt_path.instance += 1;
+    let original_attempt = state.begin_original_rebuild(rebuilt_path, 1).unwrap();
+    assert!(matches!(
+        state.original_rebuilt(
+            &original_attempt,
+            RebuildResult::Canary {
+                path: original_attempt.path.clone(),
+                canary: Canary {
+                    ip: false,
+                    dns: false,
+                    https: false,
+                },
+            },
+            1,
+            1,
+        ),
+        Effect::SameCity(_, _)
+    ));
+
+    let attempt = state.begin_fallback(target.clone(), 2).unwrap();
+    let observation = ObservedOwner::new(state, || Observation {
+        attachment: Physical::Unknown,
+        bindings: vec![],
+    })
+    .unwrap();
+    (ResourceOwner::new(observation), attempt)
+}
+
 fn kinds() -> [(TrialKind, &'static str); 3] {
     [
         (TrialKind::TestBackup, "TestBackup"),
         (TrialKind::ChainFallback, "ChainFallback"),
         (TrialKind::ReturnDirect, "ReturnDirect"),
     ]
+}
+
+#[test]
+fn native_route_trial_entry_preserves_the_persistent_city_or_pin() {
+    use adapter_protocol::app::RecoveryAction as A;
+    for action in [A::ReturnDirect, A::TestBackup, A::ChainFallback] {
+        for pin in [None, Some("user-selected-relay")] {
+            let mut f = fixture(TrialKind::ReturnDirect);
+            f.connections.begin_user_selection(Some("xx-aaa"), pin);
+            f.connections
+                .begin_recovery_action(action, Some("xx-aaa"), Some("temporary-relay"));
+            assert_eq!(f.connections.retry_round.city(), Some("xx-aaa"));
+            assert_eq!(f.connections.retry_round.exact_relay(), pin);
+        }
+    }
+}
+
+fn fallback_fixture() -> (Fixture, ResourceOwner, CandidateAttempt) {
+    let mut f = fixture(TrialKind::ChainFallback);
+    let original = f.previous.clone();
+    let next_relay = f
+        .catalogue
+        .active_in_city(&original.city)
+        .find(|relay| relay.hostname() != original.relay)
+        .expect("fixture needs a second relay in the same city");
+    let inlet = f.catalogue.shadowsocks_inlets(next_relay)[0];
+    let target = Path {
+        relay: next_relay.hostname().into(),
+        city: original.city.clone(),
+        inlet: format!("{}:{}", inlet.address, inlet.port),
+        transport: "wireguard-over-shadowsocks".into(),
+        entry_relay: None,
+        slot: "b".into(),
+        instance: original.instance + 2,
+        front: original.front,
+    };
+    let (owner, attempt) = domain_fallback_owner(&original, &target);
+
+    f.connections.route_trial = None;
+    f.connections.manual_candidates = None;
+    f.connections.deferred = None;
+    let remaining = VecDeque::from(["later-city-candidate".into()]);
+    f.connections.recovering = Some((Instant::now() + Duration::from_secs(30), remaining.clone()));
+    f.connections
+        .retry_round
+        .user_connect(Some(&original.city), None);
+    f.dashboard.settings.selected_city = Some(original.city);
+    f.dashboard.settings.automatic_recovery = true;
+    f.dashboard.physical_attachment = "available".into();
+    (f, owner, attempt)
+}
+
+#[test]
+fn local_reply_failure_keeps_the_actual_domain_fallback_target_and_round_queue() {
+    use crate::recovery_retry::AttemptFailureDisposition as D;
+    let (mut f, mut owner, attempt) = fallback_fixture();
+    let remaining = f.connections.recovering.as_ref().unwrap().1.clone();
+    let before = Instant::now();
+    assert_eq!(
+        f.connections.handle_attempt_failure(
+            &mut owner,
+            &mut f.dashboard,
+            &attempt,
+            "worker_route_unavailable",
+            true,
+        ),
+        D::RetrySameTarget
+    );
+    assert_eq!(owner.state().stage, adapter_domain::Stage::Fallback);
+    assert_eq!(
+        f.connections.deferred.as_deref(),
+        Some(attempt.path.relay.as_str())
+    );
+    assert_eq!(f.connections.recovering.as_ref().unwrap().1, remaining);
+    assert!(f.connections.next_attempt >= before + Duration::from_secs(1));
+    assert!(!owner.state().candidate_is_current(&attempt, owner.now()));
+    assert_eq!(
+        f.connections.retry_round.city(),
+        Some(attempt.path.city.as_str())
+    );
+}
+
+#[test]
+fn expired_local_retry_round_schedules_cooldown_without_losing_city_intent() {
+    use crate::recovery_retry::AttemptFailureDisposition as D;
+    let (mut f, mut owner, attempt) = fallback_fixture();
+    f.connections.recovering.as_mut().unwrap().0 = Instant::now() - Duration::from_secs(1);
+    assert_eq!(
+        f.connections.handle_attempt_failure(
+            &mut owner,
+            &mut f.dashboard,
+            &attempt,
+            "candidate_probe_failed",
+            true
+        ),
+        D::RoundExpired
+    );
+    assert_eq!(owner.state().stage, adapter_domain::Stage::Disconnected);
+    assert_eq!(
+        f.connections.retry_round.city(),
+        Some(attempt.path.city.as_str())
+    );
+    assert_eq!(f.connections.retry_round.exact_relay(), None);
+    assert!(f
+        .connections
+        .retry_round
+        .remaining(Instant::now())
+        .is_some());
+    assert!(f.connections.recovering.is_none() && f.connections.deferred.is_none());
+    assert_eq!(f.dashboard.status, "retry_wait");
+}
+
+#[test]
+fn unsafe_attempt_failure_never_schedules_another_worker_or_remote_sample() {
+    use crate::recovery_retry::AttemptFailureDisposition as D;
+    for (code, expected) in [
+        ("worker_configuration_rejected", D::StopCleanly),
+        ("cleanup_uncertain", D::Freeze),
+        ("tunnel_transaction_failed", D::Freeze),
+    ] {
+        let (mut f, mut owner, attempt) = fallback_fixture();
+        assert_eq!(
+            f.connections.handle_attempt_failure(
+                &mut owner,
+                &mut f.dashboard,
+                &attempt,
+                code,
+                true
+            ),
+            expected
+        );
+        assert!(f.connections.deferred.is_none());
+        assert!(f.connections.recovering.is_none());
+        assert!(f.connections.manual_candidates.is_none());
+        assert!(f
+            .connections
+            .retry_round
+            .remaining(Instant::now())
+            .is_none());
+        if expected == D::Freeze {
+            assert!(f.connections.frozen);
+            // Uncertain ownership remains reserved, rather than being released.
+            assert!(owner.state().candidate_is_current(&attempt, 2));
+        } else {
+            assert_eq!(owner.state().stage, adapter_domain::Stage::Disconnected);
+        }
+    }
 }
 
 #[test]
