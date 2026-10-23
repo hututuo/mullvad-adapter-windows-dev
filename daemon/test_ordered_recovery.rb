@@ -246,4 +246,12 @@ class OrderedRecoveryTest < Minitest::Test
     end
   end
 
+  def test_preempted_round_cannot_impose_cooldown_on_the_new_manual_intent
+    @adapter.interrupt_at = ->(adapter, _) { adapter.send(:interrupt_ordered_recovery, stopped: false) }
+    refute run_round
+    assert_equal 1, @adapter.paths.length
+    refute @adapter.send(:ordered_recovery_blocked?)
+    assert_nil @adapter.instance_variable_get(:@recovery_retry_at)
+  end
+
 end

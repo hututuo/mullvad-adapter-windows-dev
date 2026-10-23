@@ -3161,7 +3161,7 @@ class MullvadAdapter
             state[:message] = @recovery_stopped ? '自动恢复已停止，当前通道保留' : '环境或操作已变化，旧恢复结果已作废'
             state[:next_step] = @recovery_stopped ? '可手动重试' : '本机联网稳定后先验证原路径；手动操作优先'
           end
-          unless ok || @recovery_stopped
+          unless ok || @recovery_stopped || !valid
             delay = state[:phase] == 'local_wait' ? @options[:local_network_interval] : @options[:recovery_cooldown]
             @recovery_retry_at = monotonic_now + delay
             state[:_retry_mono] = @recovery_retry_at
@@ -5253,8 +5253,8 @@ class MullvadAdapter
       @state[:workers][slot] = public_worker_state(info).merge(state: 'candidate')
       @state[:updated_at] = Time.now.iso8601
     end
-    log_event('worker-path-started', **info.slice(:slot, :relay, :transport_mode, :endpoint, :endpoint_port, :endpoint_kind, :interface, :instance_token),
-              network_epoch: network_epoch)
+    log_event('worker-path-started', **info.slice(:slot, :relay, :transport_mode, :endpoint, :endpoint_port, :endpoint_kind, :interface),
+              worker_instance: info[:instance_token], network_epoch: network_epoch)
     info
   end
 
