@@ -402,6 +402,386 @@ pub(crate) fn open_writer_file(
         open_log_file(path, options)
     }
 }
+
+// Keep the report export independent from the public Dashboard DTO. That DTO is
+// consumed by the renderer and intentionally contains account, device and
+// local-path details that must never be copied wholesale into a report.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReportStatusValue {
+    StartingFront,
+    Disconnected,
+    Blocked,
+    WaitingNetwork,
+    UnknownNetwork,
+    NetworkRecovering,
+    ConfirmingPath,
+    Connecting,
+    Disconnecting,
+    Connected,
+    RetryWait,
+}
+impl ReportStatusValue {
+    fn from_dashboard(value: &str) -> Option<Self> {
+        Some(match value {
+            "starting_front" => Self::StartingFront,
+            "disconnected" => Self::Disconnected,
+            "blocked" => Self::Blocked,
+            "waiting_network" => Self::WaitingNetwork,
+            "unknown_network" => Self::UnknownNetwork,
+            "network_recovering" => Self::NetworkRecovering,
+            "confirming_path" => Self::ConfirmingPath,
+            "connecting" => Self::Connecting,
+            "disconnecting" => Self::Disconnecting,
+            "connected" => Self::Connected,
+            "retry_wait" => Self::RetryWait,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReportAttachment {
+    Available,
+    Unavailable,
+    Unknown,
+}
+impl ReportAttachment {
+    fn from_dashboard(value: &str) -> Option<Self> {
+        Some(match value {
+            "available" => Self::Available,
+            "unavailable" => Self::Unavailable,
+            "unknown" => Self::Unknown,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReportFrontSelection {
+    Reject,
+    SlotA,
+    SlotB,
+    Unavailable,
+}
+impl ReportFrontSelection {
+    fn from_dashboard(value: &str) -> Option<Self> {
+        Some(match value {
+            "reject" => Self::Reject,
+            "slot_a" => Self::SlotA,
+            "slot_b" => Self::SlotB,
+            "unavailable" => Self::Unavailable,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReportMetadataSource {
+    Missing,
+    LocalCache,
+    OfficialApi,
+}
+impl ReportMetadataSource {
+    fn from_dashboard(value: &str) -> Option<Self> {
+        Some(match value {
+            "missing" => Self::Missing,
+            "local_cache" => Self::LocalCache,
+            "official_api" => Self::OfficialApi,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReportReadiness {
+    Ready,
+    Degraded,
+}
+impl ReportReadiness {
+    fn from_dashboard(value: &str) -> Option<Self> {
+        Some(match value {
+            "ready" => Self::Ready,
+            "degraded" => Self::Degraded,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReportConnectionPhase {
+    Starting,
+    Prepared,
+    Connected,
+    Health,
+    Failed,
+    Stopped,
+}
+impl ReportConnectionPhase {
+    fn from_dashboard(value: &str) -> Option<Self> {
+        Some(match value {
+            "starting" => Self::Starting,
+            "prepared" => Self::Prepared,
+            "connected" => Self::Connected,
+            "health" => Self::Health,
+            "failed" => Self::Failed,
+            "stopped" => Self::Stopped,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReportRecoveryStage {
+    WaitingNetwork,
+    RestoringPrevious,
+    ReturningDirect,
+    TestingBackup,
+    LocalFront,
+    Confirming,
+    Exhausted,
+    ChainConnected,
+    Connected,
+    VerifyingOriginal,
+    Idle,
+    ChainFallback,
+    SameCity,
+    OriginalInlet,
+    SameRelayInlets,
+}
+impl ReportRecoveryStage {
+    fn from_dashboard(value: &str) -> Option<Self> {
+        Some(match value {
+            "waiting_network" => Self::WaitingNetwork,
+            "restoring_previous" => Self::RestoringPrevious,
+            "returning_direct" => Self::ReturningDirect,
+            "testing_backup" => Self::TestingBackup,
+            "local_front" => Self::LocalFront,
+            "confirming" => Self::Confirming,
+            "exhausted" => Self::Exhausted,
+            "chain_connected" => Self::ChainConnected,
+            "connected" => Self::Connected,
+            "verifying_original" => Self::VerifyingOriginal,
+            "idle" => Self::Idle,
+            "chain_fallback" => Self::ChainFallback,
+            "same_city" => Self::SameCity,
+            "original_inlet" => Self::OriginalInlet,
+            "same_relay_inlets" => Self::SameRelayInlets,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReportBackupTestStatus {
+    Passed,
+    Failed,
+}
+impl ReportBackupTestStatus {
+    fn from_dashboard(value: &str) -> Option<Self> {
+        Some(match value {
+            "passed" => Self::Passed,
+            "failed" => Self::Failed,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(serde::Serialize)]
+struct ReportSettings {
+    automatic_recovery: bool,
+    connect_on_start: bool,
+    tunnel_route: adapter_protocol::app::TunnelRoute,
+    required_multihop: bool,
+    required_pq: bool,
+}
+
+#[derive(serde::Serialize)]
+struct ReportConnection {
+    phase: Option<ReportConnectionPhase>,
+    ping: Option<adapter_protocol::app::PingMeasurement>,
+    chained: bool,
+    ip: Option<bool>,
+    dns: Option<bool>,
+    https: Option<bool>,
+    probes: Option<adapter_protocol::app::ProbeMeasurements>,
+}
+impl From<&adapter_protocol::app::ConnectionInfo> for ReportConnection {
+    fn from(value: &adapter_protocol::app::ConnectionInfo) -> Self {
+        Self {
+            phase: ReportConnectionPhase::from_dashboard(&value.phase),
+            ping: value.ping,
+            chained: value.chained,
+            ip: value.ip,
+            dns: value.dns,
+            https: value.https,
+            probes: value
+                .probes
+                .as_ref()
+                .map(|probes| adapter_protocol::app::ProbeMeasurements {
+                    ip: probes.ip,
+                    dns: probes.dns,
+                    https: probes.https,
+                }),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct ReportRecovery {
+    stage: Option<ReportRecoveryStage>,
+    attempt: u32,
+    elapsed_seconds: u64,
+    budget_seconds: u64,
+    wait_seconds: u64,
+    direct_return_in_seconds: Option<u64>,
+}
+
+#[derive(serde::Serialize)]
+struct ReportQuickTest {
+    total: usize,
+    completed: usize,
+    replies: usize,
+    no_reply: usize,
+    local_errors: usize,
+    discarded: usize,
+    unmeasured: usize,
+    active: bool,
+    cancelled: bool,
+    finished_at: Option<u64>,
+}
+impl From<&adapter_protocol::app::QuickTestState> for ReportQuickTest {
+    fn from(value: &adapter_protocol::app::QuickTestState) -> Self {
+        Self {
+            total: value.total,
+            completed: value.completed,
+            replies: value.replies,
+            no_reply: value.no_reply,
+            local_errors: value.local_errors,
+            discarded: value.discarded,
+            unmeasured: value.unmeasured,
+            active: value.active,
+            cancelled: value.cancelled,
+            finished_at: value.finished_at,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct ReportStatus {
+    status_observation: Option<adapter_protocol::app::StatusObservation>,
+    sequence: u64,
+    status: Option<ReportStatusValue>,
+    physical_attachment: Option<ReportAttachment>,
+    settings: ReportSettings,
+    front_ready: bool,
+    front_selected: Option<ReportFrontSelection>,
+    identity_configured: bool,
+    connection: Option<ReportConnection>,
+    readiness: Option<ReportReadiness>,
+    metadata_refreshing: bool,
+    metadata_source: Option<ReportMetadataSource>,
+    metadata_updated_at: Option<u64>,
+    metadata_error: Option<String>,
+    retry_in_seconds: Option<u64>,
+    recovery: Option<ReportRecovery>,
+    backup_verified: bool,
+    backup_test_status: Option<ReportBackupTestStatus>,
+    backup_test_restored: bool,
+    last_error: Option<String>,
+    logging_degraded: bool,
+    logging_dropped: u64,
+    quick_test: Option<ReportQuickTest>,
+    city_count: usize,
+    city_candidate_count: usize,
+}
+impl From<&Dashboard> for ReportStatus {
+    fn from(value: &Dashboard) -> Self {
+        Self {
+            status_observation: value.status_observation.as_ref().map(|observation| {
+                adapter_protocol::app::StatusObservation {
+                    age_ms: observation.age_ms,
+                    capture_ms: observation.capture_ms,
+                    native_elapsed_ms: observation.native_elapsed_ms,
+                }
+            }),
+            sequence: value.sequence,
+            status: ReportStatusValue::from_dashboard(&value.status),
+            physical_attachment: ReportAttachment::from_dashboard(&value.physical_attachment),
+            settings: ReportSettings {
+                automatic_recovery: value.settings.automatic_recovery,
+                connect_on_start: value.settings.connect_on_start,
+                tunnel_route: value.settings.tunnel_route,
+                required_multihop: value.settings.required_multihop,
+                required_pq: value.settings.required_pq,
+            },
+            front_ready: value.front_ready,
+            front_selected: ReportFrontSelection::from_dashboard(&value.front_selected),
+            identity_configured: value.identity_configured,
+            connection: value
+                .connection
+                .as_ref()
+                .filter(|connection| connection.valid())
+                .map(ReportConnection::from),
+            readiness: value
+                .readiness
+                .as_deref()
+                .and_then(ReportReadiness::from_dashboard),
+            metadata_refreshing: value.metadata_refreshing,
+            metadata_source: ReportMetadataSource::from_dashboard(&value.metadata_source),
+            metadata_updated_at: value.metadata_updated_at,
+            metadata_error: safe_report_code(value.metadata_error.as_deref()),
+            retry_in_seconds: value.retry_in_seconds,
+            recovery: value.recovery.as_ref().map(|progress| ReportRecovery {
+                stage: ReportRecoveryStage::from_dashboard(&progress.stage),
+                attempt: progress.attempt,
+                elapsed_seconds: progress.elapsed_seconds,
+                budget_seconds: progress.budget_seconds,
+                wait_seconds: progress.wait_seconds,
+                direct_return_in_seconds: progress.direct_return_in_seconds,
+            }),
+            backup_verified: value.backup_verified_at.is_some(),
+            backup_test_status: value
+                .backup_test_status
+                .as_deref()
+                .and_then(ReportBackupTestStatus::from_dashboard),
+            backup_test_restored: value.backup_test_restored,
+            last_error: safe_report_code(value.last_error.as_deref()),
+            logging_degraded: value.logging_degraded,
+            logging_dropped: value.logging_dropped,
+            quick_test: value
+                .quick_test
+                .as_ref()
+                .filter(|test| test.valid())
+                .map(ReportQuickTest::from),
+            city_count: value.cities.len(),
+            city_candidate_count: value.city_candidates.len(),
+        }
+    }
+}
+
+fn safe_report_code(value: Option<&str>) -> Option<String> {
+    value
+        .filter(|code| {
+            safe_event(&LogEvent {
+                time: 0,
+                layer: "agent".into(),
+                stage: "api".into(),
+                code: (*code).into(),
+                connection: None,
+                quick_test: None,
+            })
+        })
+        .map(str::to_owned)
+}
+
 pub struct Logs {
     pub root: PathBuf,
 }
@@ -457,8 +837,8 @@ impl Logs {
             return Err(io::Error::other("invalid_report_id"));
         }
         let path = self.root.join(format!("report-{report_id}.json"));
-        // Snapshot's DTO contains only public identity information. Include a
-        // bounded tail of our allowlisted events, never engine stderr/config.
+        // Include a strict, identity-free status projection and a bounded tail
+        // of allowlisted events, never engine stderr/config.
         let mut history = VecDeque::new();
         for name in ["events.previous.jsonl", "events.jsonl"] {
             let mut options = OpenOptions::new();
@@ -486,9 +866,11 @@ impl Logs {
             }
         }
         let mut file = open_writer_file(&path, false, true)?;
+        let source_sha = option_env!("ADAPTER_SOURCE_SHA")
+            .filter(|value| value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit()));
         serde_json::to_writer_pretty(
             &mut file,
-            &serde_json::json!({"schema":1,"generated_at":now_seconds(),"status":snapshot,"events":history,"scope":"adapter_only_no_system_kill_switch"}),
+            &serde_json::json!({"schema":2,"agent_version":env!("CARGO_PKG_VERSION"),"source_sha":source_sha,"generated_at":now_seconds(),"status":ReportStatus::from(snapshot),"events":history,"scope":"adapter_only_no_system_kill_switch"}),
         )?;
         file.sync_all()?;
         Ok(path)
@@ -934,6 +1316,234 @@ mod tests {
             city_candidates: vec![],
         }
     }
+
+    #[test]
+    fn report_status_is_a_strict_allowlist_without_identity_or_paths() {
+        use adapter_protocol::app::{
+            Account, City, CityCandidate, ConnectionInfo, Device, DeviceDraft, PingMeasurement,
+            ProbeMeasurements, ProbeOutcome, QuickTestState, RecoveryProgress, StatusObservation,
+            TunnelRoute,
+        };
+
+        let root = temporary();
+        let logs = Logs { root: root.clone() };
+        let mut dashboard = snapshot();
+        dashboard.status_observation = Some(StatusObservation {
+            age_ms: 11,
+            capture_ms: 7,
+            native_elapsed_ms: 3,
+        });
+        dashboard.sequence = 17;
+        dashboard.status = "connected".into();
+        dashboard.physical_attachment = "available".into();
+        dashboard.settings.favorite_cities = vec!["xx-aaa".into()];
+        dashboard.settings.selected_city = Some("xx-aaa".into());
+        dashboard.settings.chain_selection = Some("settings-chain-path-sentinel".into());
+        dashboard.settings.tunnel_route = TunnelRoute::Chain;
+        dashboard.settings.automatic_recovery = true;
+        dashboard.settings.required_multihop = true;
+        dashboard.front_ready = true;
+        dashboard.front_selected = "slot_a".into();
+        dashboard.identity_configured = true;
+        dashboard.device_draft = Some(DeviceDraft {
+            state: "draft-state-sentinel".into(),
+            public_key: "draft-public-key-sentinel".into(),
+            device_id: Some("draft-device-id-sentinel".into()),
+            device_name: Some("draft-device-name-sentinel".into()),
+        });
+        dashboard.device_name = Some("dashboard-device-name-sentinel".into());
+        dashboard.public_key = Some("dashboard-public-key-sentinel".into());
+        dashboard.active_relay = Some("active-relay-path-sentinel".into());
+        dashboard.connection = Some(ConnectionInfo {
+            ping: Some(PingMeasurement {
+                rtt_ms: 42,
+                measured_at: 99,
+            }),
+            chained: true,
+            relay: "connection-relay-path-sentinel".into(),
+            city: "xx-aaa".into(),
+            inlet: "192.0.2.1:20484".into(),
+            interface_index: 5,
+            instance: 17,
+            phase: "connected".into(),
+            ip: Some(true),
+            dns: Some(false),
+            https: Some(false),
+            probes: Some(ProbeMeasurements {
+                ip: ProbeOutcome::Passed,
+                dns: ProbeOutcome::Timeout,
+                https: ProbeOutcome::NotRunDnsFailed,
+            }),
+        });
+        dashboard.readiness = Some("ready".into());
+        dashboard.metadata_source = "official_api".into();
+        dashboard.metadata_updated_at = Some(123);
+        dashboard.metadata_refreshing = true;
+        dashboard.metadata_error = Some("metadata_refresh_unavailable".into());
+        dashboard.chain_node = Some("chain-node-path-sentinel".into());
+        dashboard.chain_fingerprint = Some("chain-fingerprint-sentinel".into());
+        dashboard.retry_in_seconds = Some(8);
+        dashboard.recovery = Some(RecoveryProgress {
+            stage: "waiting_network".into(),
+            relay: Some("recovery-relay-path-sentinel".into()),
+            inlet: Some("recovery-inlet-path-sentinel".into()),
+            attempt: 3,
+            elapsed_seconds: 12,
+            budget_seconds: 300,
+            wait_seconds: 8,
+            next: "recovery-next-path-sentinel".into(),
+            direct_return_in_seconds: Some(5),
+        });
+        dashboard.backup_verified_at = Some(100);
+        dashboard.backup_test_id = 101;
+        dashboard.backup_test_status = Some("passed".into());
+        dashboard.backup_test_restored = true;
+        dashboard.account = Account {
+            authenticated: true,
+            expiry: Some("account-expiry-sentinel".into()),
+            devices: vec![Device {
+                id: "account-device-id-sentinel".into(),
+                name: "account-device-name-sentinel".into(),
+                public_key: "account-public-key-sentinel".into(),
+                created: "account-created-sentinel".into(),
+                current: true,
+            }],
+            error_code: Some("account-error-sentinel".into()),
+        };
+        dashboard.operation = Some("operation-sentinel".into());
+        dashboard.last_error = Some("active_front_repair_failed".into());
+        dashboard.logs_path = "/synthetic/logs-path-sentinel/events.jsonl".into();
+        dashboard.last_report_path =
+            Some("/synthetic/last-report-path-sentinel/report.json".into());
+        dashboard.logging_degraded = true;
+        dashboard.logging_dropped = 2;
+        dashboard.quick_test = Some(QuickTestState {
+            city: "yy-bbb".into(),
+            total: 5,
+            completed: 2,
+            replies: 1,
+            no_reply: 1,
+            local_errors: 0,
+            discarded: 0,
+            unmeasured: 3,
+            active: false,
+            cancelled: false,
+            finished_at: Some(200),
+        });
+        dashboard.cities = vec![City {
+            id: "city-id-sentinel".into(),
+            name: "city-name-sentinel".into(),
+            country: "country-sentinel".into(),
+            relay_count: 2,
+        }];
+        dashboard.city_candidates = vec![CityCandidate {
+            city: "zz-ccc".into(),
+            hostname: "candidate-path-sentinel".into(),
+            ping_ms: 13,
+            measured_at: 201,
+        }];
+
+        let report_path = logs
+            .report(&dashboard, "44444444-4444-4444-4444-444444444444")
+            .unwrap();
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+        let status = &report["status"];
+        let text = report.to_string();
+
+        assert_eq!(report["schema"], 2);
+        assert_eq!(status["sequence"], 17);
+        assert_eq!(status["status"], "connected");
+        assert_eq!(status["physical_attachment"], "available");
+        assert_eq!(status["front_ready"], true);
+        assert_eq!(status["front_selected"], "slot_a");
+        assert_eq!(status["identity_configured"], true);
+        assert_eq!(status["settings"]["tunnel_route"], "chain");
+        assert_eq!(status["connection"]["phase"], "connected");
+        assert_eq!(status["connection"]["ping"]["rtt_ms"], 42);
+        assert_eq!(status["connection"]["probes"]["dns"], "timeout");
+        assert_eq!(status["readiness"], "ready");
+        assert_eq!(status["metadata_error"], "metadata_refresh_unavailable");
+        assert_eq!(status["recovery"]["stage"], "waiting_network");
+        assert_eq!(status["recovery"]["attempt"], 3);
+        assert_eq!(status["backup_test_status"], "passed");
+        assert_eq!(status["last_error"], "active_front_repair_failed");
+        assert_eq!(status["quick_test"]["total"], 5);
+        assert_eq!(status["city_count"], 1);
+        assert_eq!(status["city_candidate_count"], 1);
+
+        for field in [
+            "boot_id",
+            "device_draft",
+            "device_name",
+            "public_key",
+            "active_relay",
+            "account",
+            "operation",
+            "logs_path",
+            "last_report_path",
+            "chain_node",
+            "chain_fingerprint",
+            "cities",
+            "city_candidates",
+        ] {
+            assert!(
+                status.get(field).is_none(),
+                "unexpected status field {field}"
+            );
+        }
+        for (object, fields) in [
+            (
+                &status["settings"],
+                &["favorite_cities", "selected_city", "chain_selection"][..],
+            ),
+            (
+                &status["connection"],
+                &["relay", "city", "inlet", "interface_index", "instance"][..],
+            ),
+            (&status["recovery"], &["relay", "inlet", "next"][..]),
+        ] {
+            for field in fields {
+                assert!(object.get(field).is_none(), "unexpected {field} identifier");
+            }
+        }
+        for sentinel in [
+            "draft-state-sentinel",
+            "draft-public-key-sentinel",
+            "draft-device-id-sentinel",
+            "draft-device-name-sentinel",
+            "dashboard-device-name-sentinel",
+            "dashboard-public-key-sentinel",
+            "active-relay-path-sentinel",
+            "connection-relay-path-sentinel",
+            "chain-node-path-sentinel",
+            "chain-fingerprint-sentinel",
+            "recovery-relay-path-sentinel",
+            "recovery-inlet-path-sentinel",
+            "recovery-next-path-sentinel",
+            "account-expiry-sentinel",
+            "account-device-id-sentinel",
+            "account-device-name-sentinel",
+            "account-public-key-sentinel",
+            "account-created-sentinel",
+            "account-error-sentinel",
+            "operation-sentinel",
+            "logs-path-sentinel",
+            "last-report-path-sentinel",
+            "settings-chain-path-sentinel",
+            "city-id-sentinel",
+            "city-name-sentinel",
+            "country-sentinel",
+            "candidate-path-sentinel",
+            "xx-aaa",
+            "yy-bbb",
+            "zz-ccc",
+        ] {
+            assert!(!text.contains(sentinel), "report exposed {sentinel}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn recovery_transitions_survive_diagnostic_export_without_accepting_free_text() {
         let root = temporary();
