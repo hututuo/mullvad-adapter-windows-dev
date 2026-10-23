@@ -7,3 +7,5 @@
 - [ ] Fresh installed-runtime acceptance and incident correlation. Not run: the user currently requests tests only, with no packaging or installation.
 
 This is a hand-maintained incremental specification. No OpenSpec CLI validation or archive has been run.
+
+- [x] RT-1/4: Preserve local timeout/cancellation through denied group/child signals, reject positive-PID fallback for reaped leaders, classify spawn/pipe errors locally, and add four permission/cleanup regressions. Installation evidence remains private and distinct from source tests.

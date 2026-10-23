@@ -42,7 +42,12 @@ Actions手动运行`checks-and-candidate`：先Ruby/Swift/PQ组件检查，再as
 
 就绪验证保留隧道IP、DNS、HTTPS检查；外层ICMP并行采样供界面参考，未及时完成时不阻塞就绪结论。完整测速仍保留ICMP检查。事件携带实际后台源码的SHA256，避免仅凭历史固定 `build` 标签混淆已安装版本。
 
-短命探测命令（lsof监听归属、配置验证、ping、curl）由父进程按单调时钟限制等待，双流并行读取、各保留最多64KiB，超时/取消只结束本次探测拥有的进程组。控制器等待把监听归属检查计入总预算，本机HTTP禁止隐式重试。readiness/full canary分别有24/34秒汇总预算及有界清理；本地执行超时独立记为不确定，不能作为节点/SS失效样本。日志记录 `local-command-timeout`、`health-local-deferred`、`recovery-local-deferred` 和数值阶段耗时，区分父进程等待与curl自报耗时。这些边界不能保证操作系统严重卡顿时准点执行。
+短命探测命令（lsof监听归属、配置验证、ping、curl）由父进程按单调时钟限制等待，双流并行读取、各保留最多64KiB，超时/取消只结束本次探测拥有的进程组。控制器等待把监听归属检查计入总预算，本机HTTP禁止隐式重试。readiness/full canary分别有24/34秒汇总预算及有界清理；本地执行超时独立记为不确定，不能作为节点/SS失效样本。日志记录 `local-command-timeout`、`health-local-deferred`、`recovery-local-deferred` 和数值阶段耗时，区分父进程等待与curl自报耗时。本地spawn/pipe系统错误用`local-command-unavailable`
+记录允许的阶段/操作/错误类，不回显命令参数；它仍是不确定观测，不算远端失败。
+超时清理遇到进程组信号权限拒绝时记录`local-command-cleanup-deferred`，只在waitpid
+仍证明是自己未回收的子进程时尝试单PID结束。清理权限错误不覆盖原超时/取消，
+始终继续有界reap与关闭管道；已回收leader不能再按正PID发送信号。无法终止的
+子进程不冒充已成功清理，保留诊断并有界脱离等待。这些边界不能保证操作系统严重卡顿时准点执行。
 
 本地转发监测先测IP地址，失败后再测独立域名HTTPS；同一入口仍有HTTPS流量通过时保留原进程，并记录 `front-target-degraded`。两个目标均失败才进入原有后端对照与连续两次修复阈值，仍保留代次/网络守卫。该策略减少单个探测目标引起的重启，不能把一次重启后恢复当作引擎死锁的证明。详见[运行观测规格](../openspec/changes/mac-runtime-stall-bounds/specs/runtime-observation/spec.md)。
 

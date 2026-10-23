@@ -2,7 +2,13 @@
 
 ## RT-1: Bound owned diagnostic commands
 
-WHEN a listener-ownership, config-validation, ping or curl diagnostic stops progressing, THEN the observer enforces a monotonic parent-side deadline, bounds retained stdout/stderr, closes its pipes, and terminates/reaps only its own short-lived process group. It must not signal a pre-existing front or worker. Cancellation follows the same cleanup path. Operating-system scheduling can delay deadline handling; this is not a real-time guarantee.
+WHEN a listener-ownership, config-validation, ping or curl diagnostic stops progressing, THEN the observer enforces a monotonic parent-side deadline, bounds retained stdout/stderr, closes its pipes, and terminates/reaps only its own short-lived process group. It must not signal a pre-existing front or worker. Cancellation follows the same cleanup path. A denied group signal must not
+replace the timeout/cancellation or skip bounded reap and pipe closure. A
+positive-PID fallback requires an unreaped owned child, revalidated with waitpid;
+an already reaped group leader must never be signalled by positive PID. Failure
+to signal is recorded as cleanup-deferred, not successful termination. Local
+spawn/pipe system errors are indeterminate observations with phase/operation/error
+class only, never a negative relay sample or a dump of command arguments. Operating-system scheduling can delay deadline handling; this is not a real-time guarantee.
 
 ## RT-2: Bound aggregate canaries
 

@@ -2,6 +2,7 @@
 
 require_relative 'test_reliability'
 require 'rbconfig'
+require 'minitest/mock'
 
 class MullvadRuntimeDeadlineTest < Minitest::Test
   def setup
@@ -49,6 +50,75 @@ class MullvadRuntimeDeadlineTest < Minitest::Test
       run_child('fork { sleep 30 }; exit!', timeout: 0.25)
     end
     assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 1
+  end
+
+  def test_group_signal_permission_error_preserves_timeout_and_reaps_owned_child
+    path = File.join(@dir, 'permission-child-pid')
+    kill = Process.method(:kill)
+    signals = []
+    denied_group = lambda do |signal, pid|
+      signals << [signal, pid]
+      raise Errno::EPERM if pid.negative?
+      kill.call(signal, pid)
+    end
+    Process.stub(:kill, denied_group) do
+      error = assert_raises(MullvadAdapter::LocalProbeTimeout) do
+        run_child("File.write(#{path.dump}, Process.pid); sleep 30", timeout: 0.25)
+      end
+      assert_equal 'fixture', error.phase
+    end
+    pid = File.read(path).to_i
+    assert_equal [['KILL', -pid], ['KILL', pid]], signals
+    assert_raises(Errno::ESRCH) { kill.call(0, pid) }
+    assert_raises(Errno::ECHILD) { Process.waitpid(pid, Process::WNOHANG) }
+  end
+
+  def test_denied_child_cleanup_is_bounded_and_does_not_mask_timeout
+    path = File.join(@dir, 'denied-child-pid')
+    signals = []
+    deny = lambda { |signal, pid| signals << [signal, pid]; raise Errno::EPERM }
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    Process.stub(:kill, deny) do
+      assert_raises(MullvadAdapter::LocalProbeTimeout) do
+        run_child("File.write(#{path.dump}, Process.pid); sleep 0.6", timeout: 0.25)
+      end
+    end
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 1.2
+    pid = File.read(path).to_i
+    assert_equal [['KILL', -pid], ['KILL', pid]], signals
+    events = File.readlines(File.join(@dir, 'logs', 'events.jsonl')).map { |line| JSON.parse(line) }
+    assert_equal %w[group-signal child-signal], events.select { |e| e['event'] == 'local-command-cleanup-deferred' }.map { |e| e['operation'] }
+  ensure
+    begin
+      if path && File.file?(path)
+        pid = File.read(path).to_i
+        Process.kill('KILL', pid) unless Process.waitpid(pid, Process::WNOHANG)
+      end
+    rescue Errno::ESRCH, Errno::ECHILD
+      nil
+    end
+  end
+
+  def test_reaped_group_leader_is_never_signalled_by_positive_pid
+    signals = []
+    Process.stub(:kill, lambda { |signal, pid| signals << [signal, pid]; raise Errno::EPERM }) do
+      @adapter.send(:terminate_probe_group, 99_999, 'fixture', child_unreaped: false)
+    end
+    assert_equal [['KILL', -99_999]], signals
+  end
+
+  def test_local_spawn_permission_failure_is_indeterminate_without_secret_arguments
+    Process.stub(:spawn, ->(*_, **_) { raise Errno::EPERM }) do
+      error = assert_raises(MullvadAdapter::LocalProbeUnavailable) { run_child('private fixture argument') }
+      assert_kind_of MullvadAdapter::LocalProbeTimeout, error
+      assert_equal 'fixture', error.phase
+      assert_equal 'local probe unavailable: fixture', error.message
+    end
+    event = JSON.parse(File.readlines(File.join(@dir, 'logs', 'events.jsonl')).last)
+    assert_equal 'local-command-unavailable', event['event']
+    assert_equal 'spawn', event['operation']
+    assert_equal 'Errno::EPERM', event['error_class']
+    refute_includes JSON.generate(event), 'private fixture argument'
   end
 
   def test_cancelled_probe_thread_reaps_only_its_own_child

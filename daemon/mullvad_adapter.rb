@@ -31,6 +31,14 @@ class MullvadAdapter
       super("local probe deadline exceeded: #{phase}")
     end
   end
+  # Preserve the existing local-indeterminate handling without calling a
+  # spawn/pipe permission error a negative observation of the remote relay.
+  class LocalProbeUnavailable < LocalProbeTimeout
+    def message
+      "local probe unavailable: #{phase}"
+    end
+    alias to_s message
+  end
   # Local decoder only: never monkey-patch Resolv or allocate globally cached
   # resource classes from response-controlled type/class numbers.
   class DnsCanaryDecoder < Resolv::DNS::Message::MessageDecoder
@@ -6071,15 +6079,16 @@ class MullvadAdapter
     complete = true
     [*outputs.map { |output| output.force_encoding(Encoding::UTF_8).scrub }, status,
      ((monotonic_now - started) * 1000).round]
+  rescue SystemCallError => e
+    log_event('local-command-unavailable', phase: phase,
+              operation: pid ? 'capture' : 'spawn', error_class: e.class.name,
+              duration_ms: ((monotonic_now - started) * 1000).round)
+    raise LocalProbeUnavailable, phase
   ensure
     # These are probe children only. KILL also closes inherited output pipes
     # held by descendants. Bounded reap preserves caller responsiveness.
     if pid && !complete
-      begin
-        Process.kill('KILL', -pid)
-      rescue Errno::ESRCH
-        nil
-      end
+      terminate_probe_group(pid, phase, child_unreaped: status.nil?)
       unless status
         reap_deadline = monotonic_now + 0.25
         begin
@@ -6097,6 +6106,31 @@ class MullvadAdapter
       end
     end
     (readers.to_a + writers.to_a).each { |io| io.close unless io.closed? }
+  end
+
+  def terminate_probe_group(pid, phase, child_unreaped:)
+    Process.kill('KILL', -pid)
+  rescue Errno::ESRCH
+    nil
+  rescue Errno::EPERM
+    # A denied group signal must not replace the original timeout/cancellation
+    # or skip pipe closure/reaping. Fall back only to our own, unreaped child;
+    # never resolve or signal other processes by name.
+    log_event('local-command-cleanup-deferred', phase: phase, operation: 'group-signal',
+              error_class: 'Errno::EPERM')
+    return unless child_unreaped
+    begin
+      # waitpid also proves this PID is still our child. An already reaped
+      # group leader may have been reused while a descendant held the pipe.
+      Process.kill('KILL', pid) unless Process.waitpid(pid, Process::WNOHANG)
+    rescue Errno::ECHILD
+      nil
+    rescue Errno::ESRCH
+      nil
+    rescue Errno::EPERM
+      log_event('local-command-cleanup-deferred', phase: phase, operation: 'child-signal',
+                error_class: 'Errno::EPERM')
+    end
   end
 
   def http_json(port, path, method: :get, body: nil, open_timeout: 1, read_timeout: 5)
