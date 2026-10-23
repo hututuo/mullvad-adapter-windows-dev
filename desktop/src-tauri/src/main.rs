@@ -18,6 +18,7 @@ fn begin_shutdown(app: tauri::AppHandle) -> Result<(), String> {
     STOP_IN_FLIGHT
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .map_err(|_| "operation_busy".to_owned())?;
+    clash::cancel_preparation();
     STOPPING.store(true, Ordering::Release);
     let _ = app.emit("backend-stopping", "stopping");
     let handle = app.clone();
@@ -90,6 +91,10 @@ async fn copy_last_report(
 }
 #[tauri::command]
 async fn app_request(app: tauri::AppHandle, command: AppCommand) -> Result<AppReply, String> {
+    // Invalidate even a native task still queued for execution, before dispatch.
+    if command.supersedes_chain_preparation() {
+        clash::cancel_preparation();
+    }
     // Reuse verified dashboard replies for passive tray status.
     tauri::async_runtime::spawn_blocking(move || {
         let reply = transact(command)?;

@@ -163,9 +163,13 @@ pub enum AppCommand {
         settings: Settings,
     },
     RefreshCatalogue,
+    /// Reserve a cancellable native qualification intent; the receipt is its token.
+    BeginChainPreparation,
     /// Only the native Clash reader constructs this credential-bearing value.
     ConfigureChain {
         proxy: SecretText,
+        #[serde(default)]
+        preparation: Option<String>,
         #[serde(default)]
         expected_revision: Option<u64>,
     },
@@ -227,6 +231,31 @@ pub enum RecoveryAction {
     TestBackup,
     ChainFallback,
     ReturnDirect,
+}
+
+impl AppCommand {
+    /// A new user intent invalidates any outstanding automatic chain proposal.
+    pub fn supersedes_chain_preparation(&self) -> bool {
+        matches!(
+            self,
+            Self::Disconnect
+                | Self::CancelOperation
+                | Self::Shutdown
+                | Self::SelectCity { .. }
+                | Self::Connect
+                | Self::ConnectRelay { .. }
+                | Self::SaveSettings { .. }
+                | Self::RecoveryAction { .. }
+                | Self::ConfigureChain {
+                    preparation: None,
+                    ..
+                }
+                | Self::RestoreVerifiedChain { .. }
+                | Self::AccountLogin { .. }
+                | Self::AccountLogout
+                | Self::UseCreatedDevice { .. }
+        )
+    }
 }
 
 /// Current owner-produced plan, never inferred by the renderer from log text.

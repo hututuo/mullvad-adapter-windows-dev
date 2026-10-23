@@ -176,6 +176,7 @@ fn api_worker(
     store: PrivateStore,
     report_root: PathBuf,
     logs: LogClient,
+    preparation_fence: std::sync::Arc<crate::chain_preparation::PreparationFence>,
 ) -> io::Result<(mpsc::SyncSender<ApiJob>, mpsc::Receiver<ApiDone>)> {
     let (send, receive) = mpsc::sync_channel::<ApiJob>(1);
     let (done, results) = mpsc::sync_channel(1);
@@ -209,6 +210,12 @@ fn api_worker(
                     let command = match command {
                         command @ (AppCommand::ConfigureChain { .. }
                         | AppCommand::RestoreVerifiedChain { .. }) => {
+                            let preparation = match &command {
+                                AppCommand::ConfigureChain { preparation, .. } => {
+                                    preparation.clone()
+                                }
+                                _ => None,
+                            };
                             let parsed = if let AppCommand::ConfigureChain { proxy, .. } = command {
                                 let proxy = proxy.into_value();
                                 adapter_engine_mihomo::chain::UpstreamSs::decode(proxy.as_bytes())
@@ -229,15 +236,23 @@ fn api_worker(
                             };
                             let encoded =
                                 parsed.encode().map_err(|_| "chain_configuration_invalid")?;
-                            store
+                            let prepared = store
                                 .prepare(RecordKind::ChainProxy, &encoded)
-                                .and_then(|p| p.commit())
                                 .map_err(|_| "chain_write_failed")?;
-                            let readback = store
-                                .load(RecordKind::ChainProxy)
-                                .map_err(|_| "chain_write_failed")?;
-                            if readback.expose() != encoded.as_slice() {
-                                return Err("chain_write_failed");
+                            let commit = || {
+                                prepared.commit().map_err(|_| "chain_write_failed")?;
+                                let readback = store
+                                    .load(RecordKind::ChainProxy)
+                                    .map_err(|_| "chain_write_failed")?;
+                                if readback.expose() != encoded.as_slice() {
+                                    return Err("chain_write_failed");
+                                }
+                                Ok(())
+                            };
+                            if let Some(ticket) = preparation {
+                                preparation_fence.commit(&ticket, commit)?;
+                            } else {
+                                commit()?;
                             }
                             return Ok(ApiValue::Chain(std::sync::Arc::new(parsed)));
                         }
@@ -652,7 +667,14 @@ pub fn serve(scope: &str) -> io::Result<()> {
     let mut owner = ResourceOwner::new(observer);
     let commands = ipc_worker(pipe_identity, boot.clone())?;
     let logs = LogClient::start(root.path().to_owned())?;
-    let (api, api_results) = api_worker(store.clone(), root.path().to_owned(), logs.clone())?;
+    let preparation_fence =
+        std::sync::Arc::new(crate::chain_preparation::PreparationFence::default());
+    let (api, api_results) = api_worker(
+        store.clone(),
+        root.path().to_owned(),
+        logs.clone(),
+        preparation_fence.clone(),
+    )?;
     logs.event("start", "agent_started")?;
     let mut dashboard = Dashboard {
         status_observation: None,
@@ -1215,10 +1237,33 @@ pub fn serve(scope: &str) -> io::Result<()> {
                     request_id: id.clone(),
                     command: request.command,
                 };
-                if let Err(code) = checked.validate(&dashboard.boot_id) {
+                let validation = checked.validate(&dashboard.boot_id);
+                let cancelled =
+                    if validation.is_ok() && checked.command.supersedes_chain_preparation() {
+                        preparation_fence.cancel()
+                    } else {
+                        Ok(false)
+                    };
+                if let Err(code) = validation {
+                    failure(code)
+                } else if let Err(code) = cancelled {
                     failure(code)
                 } else {
                     match checked.command {
+                        AppCommand::BeginChainPreparation => {
+                            if pending_work.is_some()
+                                || connections.busy()
+                                || dashboard.operation.is_some()
+                            {
+                                failure("operation_busy")
+                            } else {
+                                let operation_id = boot_id()?;
+                                match preparation_fence.begin(operation_id.clone()) {
+                                    Ok(()) => AppReply::Accepted { operation_id },
+                                    Err(code) => failure(code),
+                                }
+                            }
+                        }
                         AppCommand::Dashboard => failure("status_channel_required"),
                         AppCommand::RefreshCatalogue => {
                             if !catalogue_refresh.try_start_manual() {
@@ -1626,6 +1671,10 @@ pub fn serve(scope: &str) -> io::Result<()> {
                                 owner.cancel_current_operation();
                                 AppReply::Accepted {
                                     operation_id: "quick-cancel".into(),
+                                }
+                            } else if cancelled == Ok(true) {
+                                AppReply::Accepted {
+                                    operation_id: "chain-preparation-cancel".into(),
                                 }
                             } else if pending_work.is_some() {
                                 failure("operation_cannot_cancel")

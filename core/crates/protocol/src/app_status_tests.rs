@@ -6,6 +6,32 @@ const BOOT: &str = "boot-fixture-1";
 const SOURCE: &str = "0123456789abcdef0123456789abcdef01234567";
 const BUILD: &str = "0.1.0-fixture";
 
+#[test]
+fn chain_preparation_is_superseded_by_explicit_intent_and_legacy_config_remains_valid() {
+    for command in [
+        AppCommand::Disconnect,
+        AppCommand::CancelOperation,
+        AppCommand::ConnectRelay {
+            hostname: "xx-relay-1".into(),
+        },
+        AppCommand::RestoreVerifiedChain {
+            expected_revision: None,
+        },
+    ] {
+        assert!(command.supersedes_chain_preparation());
+    }
+    let legacy: AppCommand =
+        serde_json::from_str(r#"{"kind":"configure_chain","proxy":"fixture"}"#).unwrap();
+    assert!(legacy.supersedes_chain_preparation());
+    assert!(!AppCommand::ConfigureChain {
+        proxy: SecretText::new("fixture".into()),
+        preparation: Some("ticket".into()),
+        expected_revision: None
+    }
+    .supersedes_chain_preparation());
+    assert!(!AppCommand::Dashboard.supersedes_chain_preparation());
+}
+
 fn dashboard(sequence: u64, status: &str) -> Dashboard {
     Dashboard {
         status_observation: None,
@@ -281,8 +307,10 @@ fn status_reader_rejects_every_non_dashboard_command_including_private_key_acces
             settings: Settings::default(),
         },
         AppCommand::RefreshCatalogue,
+        AppCommand::BeginChainPreparation,
         AppCommand::ConfigureChain {
             proxy: SecretText::new("fixture-secret".into()),
+            preparation: None,
             expected_revision: None,
         },
         AppCommand::RestoreVerifiedChain {

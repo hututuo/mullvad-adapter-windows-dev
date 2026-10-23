@@ -15,6 +15,17 @@ pub struct Request {
     #[serde(default)]
     exclude_fingerprints: Vec<String>,
 }
+static CHAIN_INTENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) fn cancel_preparation() {
+    CHAIN_INTENT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+fn check_preparation(intent: u64) -> Result<(), String> {
+    if CHAIN_INTENT.load(std::sync::atomic::Ordering::Acquire) == intent {
+        Ok(())
+    } else {
+        Err("connection_cancelled".into())
+    }
+}
 static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static CHAIN_PROBE_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(windows)]
@@ -80,16 +91,35 @@ pub async fn copy_clash_config(window: tauri::Window) -> Result<(), String> {
 }
 #[tauri::command]
 pub async fn clash_request(input: Request) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || execute(input))
+    if matches!(
+        input.kind.as_str(),
+        "chain_auto" | "chain_configure" | "profile_import" | "apply" | "enable" | "undo"
+    ) {
+        cancel_preparation();
+    }
+    let intent = CHAIN_INTENT.load(std::sync::atomic::Ordering::Acquire);
+    tauri::async_runtime::spawn_blocking(move || execute(input, intent))
         .await
         .map_err(|_| "clash_worker_failed".to_owned())?
 }
+#[cfg(test)]
+#[test]
+fn queued_qualification_cannot_begin_after_native_intent_changes() {
+    let queued = CHAIN_INTENT.load(std::sync::atomic::Ordering::Acquire);
+    assert!(check_preparation(queued).is_ok());
+    cancel_preparation();
+    assert_eq!(
+        check_preparation(queued),
+        Err("connection_cancelled".into())
+    );
+    assert!(check_preparation(CHAIN_INTENT.load(std::sync::atomic::Ordering::Acquire)).is_ok());
+}
 #[cfg(not(windows))]
-fn execute(_input: Request) -> Result<Value, String> {
+fn execute(_input: Request, _intent: u64) -> Result<Value, String> {
     Err("clash_windows_required".into())
 }
 #[cfg(windows)]
-fn execute(input: Request) -> Result<Value, String> {
+fn execute(input: Request, intent: u64) -> Result<Value, String> {
     use std::path::PathBuf;
     // Read-only SS qualification must not occupy profile/import transactions.
     // Re-read source fingerprints and backend intent before applying its result.
@@ -177,6 +207,7 @@ fn execute(input: Request) -> Result<Value, String> {
             input.chain_name.as_deref(),
             input.chain_fingerprint.as_deref(),
             &input.exclude_fingerprints,
+            intent,
         );
     }
     if input.kind == "chain_list" {
@@ -213,6 +244,7 @@ fn execute(input: Request) -> Result<Value, String> {
         .map_err(|_| "clash_chain_configuration_invalid")?;
         return match super::transact(adapter_protocol::app::AppCommand::ConfigureChain {
             proxy: adapter_protocol::app::SecretText::new(bytes),
+            preparation: None,
             expected_revision: Some(dashboard.chain_revision),
         })? {
             adapter_protocol::app::AppReply::Accepted { .. } => Ok(json!({"accepted":true})),
@@ -428,6 +460,7 @@ fn automatic_chain(
     selected_name: Option<&str>,
     fingerprint: Option<&str>,
     excluded: &[String],
+    intent: u64,
 ) -> Result<Value, String> {
     use adapter_clash_integration::chain_source;
     use adapter_control::{observer::ObservedOwner, owned_lifecycle::BoundNetwork};
@@ -442,6 +475,14 @@ fn automatic_chain(
     {
         return Err("clash_chain_choice_missing".into());
     }
+    check_preparation(intent)?;
+    let preparation =
+        match super::transact(adapter_protocol::app::AppCommand::BeginChainPreparation)? {
+            adapter_protocol::app::AppReply::Accepted { operation_id } => operation_id,
+            adapter_protocol::app::AppReply::Error { code } => return Err(code),
+            _ => return Err("invalid_response".into()),
+        };
+    check_preparation(intent)?;
     let active_chain = dashboard.connection.as_ref().is_some_and(|c| c.chained)
         && dashboard.active_relay.is_some();
     let preferred_name = selected_name.or(dashboard.settings.chain_selection.as_deref());
@@ -494,6 +535,7 @@ fn automatic_chain(
         let proxy = adapter_engine_mihomo::chain::UpstreamSs::decode(bytes.as_bytes())
             .map_err(|_| "clash_chain_configuration_invalid")?;
         use sha2::{Digest, Sha256};
+        check_preparation(intent)?;
         let encoded = proxy
             .encode()
             .map_err(|_| "clash_chain_configuration_invalid")?;
@@ -575,6 +617,7 @@ fn automatic_chain(
         .map_err(|_| "physical_binding_unavailable")?;
     let private = AppRoot::open("WindowsClash").map_err(|_| "clash_private_store_unavailable")?;
     for choice in candidates {
+        check_preparation(intent)?;
         if network.is_cancelled() {
             return Err("network_binding_changed".into());
         }
@@ -635,8 +678,10 @@ fn automatic_chain(
             .encode()
             .map_err(|_| "clash_chain_configuration_invalid")?;
         let expected = format!("{:x}", Sha256::digest(&encoded));
+        check_preparation(intent)?;
         match super::transact(adapter_protocol::app::AppCommand::ConfigureChain {
             proxy: adapter_protocol::app::SecretText::from_protected(bytes),
+            preparation: Some(preparation.clone()),
             expected_revision: Some(dashboard.chain_revision),
         })? {
             adapter_protocol::app::AppReply::Accepted { .. } => {}
