@@ -16,6 +16,15 @@ The candidate config requests NSIS current-user mode and `offlineInstaller` for 
 
 On a Windows x64 build host with the repository's locked Node/Rust dependencies,
 run `python packaging/windows/build_candidate.py --source-sha FULL_SHA --output NEW_DIRECTORY --target-dir DEDICATED_CACHE`.
+The builder requires `FULL_SHA` to equal the checkout's Git `HEAD` and rejects
+tracked edits or untracked/ignored build inputs before creating the candidate
+directory. It rechecks the source inputs around Cargo, runtime staging and the
+Tauri build, so a persistent input change stops packaging before `candidate.json`
+is written. The existing Cargo targets, Tauri output, `node_modules`, generated
+Tauri files, Python bytecode, and the explicitly selected output/cache paths are
+treated as build artifacts; unexpected ignored files such as a local desktop
+environment file remain errors.
+
 The script builds the agent with the exact SHA, stages the checksum-pinned official
 Mihomo, pins that runtime manifest into the desktop binary, and enables NSIS only
 for this candidate. All five runtime files map to `runtime/` next to the installed
