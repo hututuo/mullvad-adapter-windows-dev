@@ -13,6 +13,7 @@ class MullvadProtectionTest < Minitest::Test
   end
 
   def teardown
+    @adapter&.instance_variable_get(:@probe_event_writer)&.join(2)
     Thread.current[:adapter_protection_profile] = nil
     Thread.current[:adapter_operation_id] = nil
     FileUtils.remove_entry(@dir)
@@ -46,6 +47,8 @@ class MullvadProtectionTest < Minitest::Test
     relay = @adapter.send(:find_relay, 'one')
     descriptor = @adapter.send(:endpoint_candidates_for_transport, relay, 'ss').first
     config, info = @adapter.send(:worker_tunnel_config, { mixed: 18000, controller: 18001 }, relay, 'ss', descriptor)
+    assert_equal @adapter.send(:controller_secret, 18001), config.fetch('secret')
+    refute_includes JSON.generate(info), config.fetch('secret')
     ss, entry, exit_node = config['proxies']
     assert_operator entry.fetch('mtu'), :>=, 1280
     assert_operator exit_node.fetch('mtu'), :>=, 1280
@@ -73,6 +76,7 @@ class MullvadProtectionTest < Minitest::Test
       relay = @adapter.send(:find_relay, 'one')
       candidate = @adapter.send(:endpoint_candidates_for_transport, relay, mode).first
       config, = @adapter.send(:worker_tunnel_config, { mixed: 18000, controller: 18001 }, relay, mode, candidate)
+      assert_equal @adapter.send(:controller_secret, 18001), config.fetch('secret')
       entry, exit_node = config['proxies']
       assert_operator entry.fetch('mtu'), :>=, 1280
       assert_operator exit_node.fetch('mtu'), :>=, 1280

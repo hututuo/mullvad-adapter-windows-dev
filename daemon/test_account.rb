@@ -46,6 +46,7 @@ class MullvadAccountTest < Minitest::Test
   end
 
   def teardown
+    @adapter&.instance_variable_get(:@probe_event_writer)&.join(2)
     FileUtils.remove_entry(@dir)
   end
 

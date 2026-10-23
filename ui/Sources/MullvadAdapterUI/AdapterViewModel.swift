@@ -943,14 +943,15 @@ final class AdapterViewModel: ObservableObject {
 
     private func readStatusSnapshot() async -> AdapterStatus? {
         let id = statusReadHealth.begin()
+        let correlationID = UUID().uuidString
         let started = statusClock()
         do {
-            let observation = try await client.fetchStatusObservation()
+            let observation = try await client.fetchStatusObservation(requestID: correlationID)
             let newStatus = observation.snapshot
             let now = statusClock()
             let age = Double(observation.ageMilliseconds ?? 0) / 1000 + max(0, now - started)
             guard !Task.isCancelled else {
-                recordStatusRead("status-read-cancelled", id: id, started: started, failure: .init(kind: "cancelled", code: nil, connectivity: false))
+                recordStatusRead("status-read-cancelled", id: id, started: started, correlationID: correlationID, failure: .init(kind: "cancelled", code: nil, connectivity: false))
                 return nil
             }
             // Header age is measured at the server. Include request/scheduling
@@ -960,39 +961,41 @@ final class AdapterViewModel: ObservableObject {
             }
             let recovering = statusReadHealth.lastFailure != nil
             guard statusReadHealth.finish(id, failure: nil, at: now, observationAge: age) else {
-                recordStatusRead("status-read-discarded", id: id, started: started)
+                recordStatusRead("status-read-discarded", id: id, started: started, correlationID: correlationID)
                 return nil
             }
             let first = lastUpdated == nil
             applyStatusSnapshot(newStatus)
             lastUpdated = Date().addingTimeInterval(-age)
             if first || recovering || now - started >= 1 || (observation.ageMilliseconds ?? 0) >= 1500 || (observation.captureMilliseconds ?? 0) >= 50 {
-                recordStatusRead(first ? "status-read-ready" : (recovering ? "status-read-recovered" : "status-read-slow"), id: id, started: started, observation: observation)
+                recordStatusRead(first ? "status-read-ready" : (recovering ? "status-read-recovered" : "status-read-slow"), id: id, started: started, correlationID: correlationID, observation: observation)
             }
             return newStatus
         } catch {
             let failure = Task.isCancelled ? StatusReadFailure(kind: "cancelled", code: nil, connectivity: false) : StatusReadFailure.classify(error)
             if failure.kind == "cancelled" {
-                recordStatusRead("status-read-cancelled", id: id, started: started, failure: failure)
+                recordStatusRead("status-read-cancelled", id: id, started: started, correlationID: correlationID, failure: failure)
                 return nil
             }
             guard statusReadHealth.finish(id, failure: failure, at: statusClock()) else {
-                recordStatusRead("status-read-discarded", id: id, started: started, failure: failure)
+                recordStatusRead("status-read-discarded", id: id, started: started, correlationID: correlationID, failure: failure)
                 return nil
             }
             connectionError = statusReadHealth.message(at: statusClock())
-            recordStatusRead("status-read-failed", id: id, started: started, failure: failure)
+            recordStatusRead("status-read-failed", id: id, started: started, correlationID: correlationID, failure: failure)
             return nil
         }
     }
 
-    private func recordStatusRead(_ event: String, id: Int, started: TimeInterval, failure: StatusReadFailure? = nil, observation: StatusObservation? = nil) {
+    private func recordStatusRead(_ event: String, id: Int, started: TimeInterval, correlationID: String? = nil, failure: StatusReadFailure? = nil, observation: StatusObservation? = nil) {
         let now = statusClock()
         statusEventSink(StatusReadEvent(event: event, requestID: id, durationMs: max(0, Int((now - started) * 1000)),
             failureKind: failure?.kind, errorCode: failure?.code, consecutiveFailures: statusReadHealth.failureCount,
             snapshotAgeSeconds: statusReadHealth.lastSuccessAt.map { max(0, Int(now - $0)) },
             displayState: statusReadHealth.displayStatus(at: now),
-            publicationAgeMs: observation?.ageMilliseconds, publicationCaptureMs: observation?.captureMilliseconds))
+            publicationAgeMs: observation?.ageMilliseconds, publicationCaptureMs: observation?.captureMilliseconds,
+            correlationID: correlationID, serverDispatchMs: observation?.dispatchMilliseconds,
+            serverRequestReadMs: observation?.requestReadMilliseconds))
     }
 
     func loadCities() async {

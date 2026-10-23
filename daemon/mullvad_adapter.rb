@@ -127,7 +127,7 @@ class MullvadAdapter
   TRANSPORT_PREFERENCES = (%w[auto] + TRANSPORT_MODES).freeze
   AUTO_TRANSPORT_ORDER = %w[ss ipv6 ipv4].freeze
   DEFAULT_TRANSPORT_PREFERENCE = 'ss'
-  BUILD_ID = '20261023-probe-liveness-1'
+  BUILD_ID = '20261023-audit-reliability-1'
   SOURCE_SHA256 = Digest::SHA256.file(__FILE__).hexdigest
   STATUS_PUBLICATION_INTERVAL = 1.0
   STATUS_PUBLICATION_MAX_AGE = 3.0
@@ -253,6 +253,8 @@ class MullvadAdapter
     @protection_profile = { multihop: false, entry_city: nil, post_quantum: false }.freeze
     @protection_error = nil
     @front_pid = nil
+    @controller_secret_mutex = Mutex.new
+    @controller_secrets = {}
     @workers = {}
     @worker_state_tokens = {}
     @speed_tests = {}
@@ -1353,7 +1355,8 @@ class MullvadAdapter
         break if @stop_requested
         begin
           client = @server.accept
-          Thread.new(client) { |sock| handle_http(sock) }
+          accepted_at = monotonic_now
+          Thread.new(client, accepted_at) { |sock, accepted| handle_http(sock, accepted) }
         rescue IOError, Errno::EBADF
           break
         rescue StandardError => e
@@ -1363,7 +1366,8 @@ class MullvadAdapter
     end
   end
 
-  def handle_http(sock)
+  def handle_http(sock, accepted_at = monotonic_now)
+    handler_started = monotonic_now
     method = raw_path = nil
     headers = {}
     body = ''
@@ -1426,7 +1430,17 @@ class MullvadAdapter
       end
       accepted_async(sock, relay, 'protection-change', nil, profile: profile)
     when ['GET', '/status']
-      respond_status(sock)
+      request_id = headers['x-adapter-request-id'].to_s
+      request_id = nil unless request_id.match?(/\A[0-9a-fA-F-]{36}\z/)
+      timing = { request_id: request_id, dispatch_ms: ((handler_started - accepted_at) * 1000).round,
+                 request_read_ms: ((monotonic_now - handler_started) * 1000).round }
+      log_probe_event('status-request-received', timing)
+      status_started = monotonic_now
+      begin
+        respond_status(sock, timing: timing)
+      ensure
+        log_probe_event('status-request-finished', timing.merge(response_ms: ((monotonic_now - status_started) * 1000).round))
+      end
     when ['GET', '/metrics']
       respond(sock, 200, @mutex.synchronize { @metrics.dup })
     when ['GET', '/relays']
@@ -1512,6 +1526,8 @@ class MullvadAdapter
     else
       respond(sock, 404, { error: 'not found' })
     end
+  rescue LocalProbeTimeout => e
+    log_probe_event('local-status-write-timeout', phase: e.phase)
   rescue JSON::ParserError, ArgumentError, Timeout::Error => e
     respond(sock, 400, { error: e.message })
   rescue StandardError => e
@@ -1667,7 +1683,7 @@ class MullvadAdapter
     return unless id
     @action_gate_mutex.synchronize { @operations[id]&.merge!(values) }
     if %w[succeeded recovered preserved failed cancelled].include?(values[:state])
-      log_event('operation-finished', values.merge(id: id))
+      log_probe_event('operation-finished', values.merge(id: id))
     end
   end
 
@@ -1704,7 +1720,8 @@ class MullvadAdapter
       policy[:last_preempted_connections] = connections.to_i unless connections.nil?
       @state[:updated_at] = now
     end
-    log_event(event, relay: relay, reason: reason, detail: detail, connections: connections)
+    writer = event == 'action-accepted' ? :log_probe_event : :log_event
+    send(writer, event, relay: relay, reason: reason, detail: detail, connections: connections)
   end
 
   def redact_log(value)
@@ -1823,14 +1840,23 @@ class MullvadAdapter
   # The public read path only consumes an immutable publication. In particular,
   # it must not queue behind a profile commit, history work, or operation lock.
   # Internal control decisions continue using the authoritative snapshot below.
-  def respond_status(sock)
+  def respond_status(sock, timing: {})
+    Timeout.timeout(1, LocalProbeTimeout, 'status-response') do
+      write_status_publication(sock, timing)
+    end
+  end
+
+  def write_status_publication(sock, timing)
     publication = @status_publication
     unless publication
       return respond(sock, 503, { code: 'status_snapshot_unavailable', error: '本机状态尚未发布' })
     end
     age_ms = [(monotonic_now - publication[:captured_at]) * 1000, 0].max.round
     headers = { 'X-Adapter-Status-Age-Ms' => age_ms,
-                'X-Adapter-Status-Capture-Ms' => publication[:capture_ms] }
+                'X-Adapter-Status-Capture-Ms' => publication[:capture_ms],
+                'X-Adapter-Dispatch-Ms' => timing.fetch(:dispatch_ms, 0),
+                'X-Adapter-Request-Read-Ms' => timing.fetch(:request_read_ms, 0) }
+    headers['X-Adapter-Request-Id'] = timing[:request_id] if timing[:request_id]
     if age_ms > (STATUS_PUBLICATION_MAX_AGE * 1000).to_i
       body = { code: 'status_snapshot_stale', error: '本机服务仍能响应，状态发布暂缓', snapshot_age_ms: age_ms }
       return respond_json(sock, 503, JSON.generate(body), headers: headers)
@@ -1999,6 +2025,7 @@ class MullvadAdapter
     config = {
       'mixed-port' => @options[:front_mixed],
       'external-controller' => "127.0.0.1:#{@options[:front_controller]}",
+      'secret' => controller_secret(@options[:front_controller]),
       'allow-lan' => false,
       'mode' => 'rule',
       'log-level' => 'warning',
@@ -2022,7 +2049,7 @@ class MullvadAdapter
 
     dir = File.join(@state_dir, 'front')
     path = File.join(dir, 'config.json')
-    write_json_private(path, config, secret: false)
+    write_json_private(path, config, secret: true)
     validate_runtime_config(path, dir) if @options[:validate_configs]
     @front_pid = File.open(File.join(dir, 'core.log'), 'a', 0o600) do |log|
       Process.spawn(@options[:core], '-d', dir, '-f', path, out: log, err: log)
@@ -2679,13 +2706,13 @@ class MullvadAdapter
   # Wakeups are coalesced. A backend failure no longer waits for a 30s poll,
   # and a busy transaction retries promptly instead of losing a whole cycle.
   def wake_health_monitor(reason)
-    @health_wait_mutex.synchronize do
-      unless @health_wake_pending
-        @health_wake_pending = true
-        log_event('health-check-requested', reason: reason)
-      end
+    requested = @health_wait_mutex.synchronize do
+      fresh = !@health_wake_pending
+      @health_wake_pending = true
       @health_cv.broadcast
+      fresh
     end
+    log_probe_event('health-check-requested', reason: reason) if requested
   end
 
   def wait_for_health_check(timeout = nil)
@@ -3202,7 +3229,7 @@ class MullvadAdapter
           break
         end
         if evidence[:local_failure] || !evidence[:attempted] || !evidence[:relay_failed]
-          log_event('recovery-local-deferred', relay: relay, phase: evidence[:local_failure] || 'candidate-not-started', reason: 'ordered-local-indeterminate')
+          log_probe_event('recovery-local-deferred', relay: relay, phase: evidence[:local_failure] || 'candidate-not-started', reason: 'ordered-local-indeterminate')
           recovery_progress('local_wait', message: '本机组件或槽位未就绪，暂停换节点', next_step: '清理完成后有限重试；这不计为节点失效')
           break
         end
@@ -3217,7 +3244,7 @@ class MullvadAdapter
       ok
     rescue LocalProbeTimeout => error
       recovery_progress('local_wait', message: '本机组件等待超时，暂不继续换节点', next_step: '清理完成后再试；不记为远端节点失效') if entered
-      log_event('recovery-local-deferred', relay: relay_name, phase: error.phase, reason: 'ordered-local-indeterminate')
+      log_probe_event('recovery-local-deferred', relay: relay_name, phase: error.phase, reason: 'ordered-local-indeterminate')
       false
     ensure
       if entered
@@ -3393,7 +3420,7 @@ class MullvadAdapter
         )
         return true if ok
         if evidence[:local_failure]
-          log_event('recovery-local-deferred', relay: candidate, phase: evidence[:local_failure], reason: 'local-bootstrap')
+          log_probe_event('recovery-local-deferred', relay: candidate, phase: evidence[:local_failure], reason: 'local-bootstrap')
           return false
         end
         return false unless automatic_recovery_context_valid?(current[:generation], current[:active_relay])
@@ -5226,6 +5253,9 @@ class MullvadAdapter
     # payload path is alive. Do not churn relays solely because Cloudflare's
     # diagnostic endpoint is selectively slow/unavailable.
     data_ok = ip_ok || domain_ok
+    if !data_ok && %i[ip_data inner_dns https_data].any? { |key| canary.dig(key, :local_failure) || canary.dig(key, :status) == 'unknown' }
+      return { relay_liveness: 'unknown', service_readiness: 'unknown' }
+    end
     readiness = if data_ok && dns_ok && domain_ok
                   'ready'
                 elsif data_ok && !dns_ok
@@ -5247,6 +5277,9 @@ class MullvadAdapter
   end
 
   def start_worker(slot, relay, transport_mode: 'ss', ss_candidate: nil)
+    unless @switch_mutex.owned?
+      return @switch_mutex.synchronize { start_worker(slot, relay, transport_mode: transport_mode, ss_candidate: ss_candidate) }
+    end
     raise '隧道尚未初始化；请先安装本机 WireGuard 身份' if @account_only_mode
     raise 'shutdown requested' if @stop_requested
     raise LocalNetworkInterrupted unless network_attempt_current?
@@ -5268,17 +5301,34 @@ class MullvadAdapter
     FileUtils.rm_f(Dir.glob(File.join(dir, '*')).select { |p| File.file?(p) })
     path = File.join(dir, 'config.json')
     pid = nil
+    info = {
+      slot: slot, pid: nil, instance_token: SecureRandom.uuid,
+      relay: relay['hostname'], peer_key: peer_key, **path_info,
+      transport_mode: mode, location: relay['location'],
+      mixed_port: spec[:mixed], controller_port: spec[:controller],
+      started_at: Time.now.iso8601
+    }
+    register = lambda do |spawned|
+      pid = spawned
+      info[:pid] = spawned
+      @mutex.synchronize do
+        @workers[slot] = info.dup
+        @worker_state_tokens[slot] = info[:instance_token]
+        @state[:workers][slot] = public_worker_state(info).merge(state: 'starting')
+      end
+    end
+    worker_ready = cleanup_attempted = false
     phase = 'bootstrap-config'
     begin
       write_json_private(path, config, secret: true)
       validate_runtime_config(path, dir) if @options[:validate_configs]
       phase = 'bootstrap-controller'
-      pid = spawn_worker_core(dir, path, spec)
+      pid = spawn_worker_core(dir, path, spec, &register)
       if protection_profile[:post_quantum]
         log_event('pq-negotiation-started', relay: relay['hostname'], slot: slot)
         phase = 'pq-config-service'
         secrets = negotiate_pq(spec[:mixed])
-        stop_pid(pid)
+        stop_worker(slot)
         pid = nil
         wireguard = config['proxies'].find { |proxy| proxy['name'] == 'MULLVAD' }
         wireguard['private-key'] = secrets.fetch('ephemeral_private_key')
@@ -5286,7 +5336,7 @@ class MullvadAdapter
         write_json_private(path, config, secret: true)
         validate_runtime_config(path, dir) if @options[:validate_configs]
         phase = 'final-controller'
-        pid = spawn_worker_core(dir, path, spec)
+        pid = spawn_worker_core(dir, path, spec, &register)
         # The core has loaded its configuration. Do not retain ephemeral keys
         # on disk or expose them through public worker state.
         FileUtils.rm_f(path)
@@ -5296,7 +5346,14 @@ class MullvadAdapter
                   helper_sha256: path_info[:pq_helper_sha256])
       end
     rescue StandardError => error
-      stop_pid(pid)
+      cleanup_attempted = true
+      # Keep the registered owner/config when cleanup is uncertain. A later
+      # attempt cannot reserve this slot or peer until stop_worker succeeds.
+      if @workers[slot]
+        stop_worker(slot)
+      elsif pid
+        stop_pid(pid)
+      end
       FileUtils.rm_f(path)
       @mutex.synchronize { @metrics[:worker_start_failures] += 1 }
       log_event('worker-start-failed', relay: relay['hostname'], slot: slot,
@@ -5305,19 +5362,7 @@ class MullvadAdapter
       raise 'protected worker could not start; no unprotected fallback was selected'
     end
 
-    info = {
-      slot: slot,
-      pid: pid,
-      instance_token: SecureRandom.uuid,
-      relay: relay['hostname'],
-      peer_key: peer_key,
-      **path_info,
-      transport_mode: mode,
-      location: relay['location'],
-      mixed_port: spec[:mixed],
-      controller_port: spec[:controller],
-      started_at: Time.now.iso8601
-    }
+    info.merge!(pid: pid, **path_info)
     @mutex.synchronize do
       @workers[slot] = info
       @worker_state_tokens[slot] = info[:instance_token]
@@ -5325,9 +5370,15 @@ class MullvadAdapter
       @state[:workers][slot] = public_worker_state(info).merge(state: 'candidate')
       @state[:updated_at] = Time.now.iso8601
     end
-    log_event('worker-path-started', **info.slice(:slot, :relay, :transport_mode, :endpoint, :endpoint_port, :endpoint_kind, :interface),
+    worker_ready = true
+    log_probe_event('worker-path-started', **info.slice(:slot, :relay, :transport_mode, :endpoint, :endpoint_port, :endpoint_kind, :interface),
               worker_instance: info[:instance_token], network_epoch: network_epoch)
     info
+  ensure
+    # Thread.kill bypasses rescue clauses, but never the resource cleanup path.
+    if info && !worker_ready && !cleanup_attempted && @workers[slot]&.dig(:instance_token) == info[:instance_token]
+      stop_worker(slot)
+    end
   end
 
   def ensure_pq_available!(profile)
@@ -5338,11 +5389,14 @@ class MullvadAdapter
   end
 
   def spawn_worker_core(dir, path, spec)
-    pid = File.open(File.join(dir, 'core.log'), 'a', 0o600) do |log|
-      Process.spawn(@options[:core], '-d', dir, '-f', path, out: log, err: log)
+    pid = nil
+    Thread.handle_interrupt(Object => :never) do
+      pid = File.open(File.join(dir, 'core.log'), 'a', 0o600) do |log|
+        Process.spawn(@options[:core], '-d', dir, '-f', path, out: log, err: log)
+      end
+      yield pid
     end
     return pid if wait_controller(spec[:controller], 8, pid: pid)
-    stop_pid(pid)
     raise LocalProbeTimeout, 'worker-controller'
   end
 
@@ -5500,6 +5554,7 @@ class MullvadAdapter
     config = {
       'mixed-port' => spec[:mixed],
       'external-controller' => "127.0.0.1:#{spec[:controller]}",
+      'secret' => controller_secret(spec[:controller]),
       'allow-lan' => false,
       'mode' => 'rule',
       'log-level' => 'warning',
@@ -5637,6 +5692,10 @@ class MullvadAdapter
                   end
     elapsed = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round
 
+    local_failure = [ip_result, dns_result, https_result].filter_map { |r| r[:local_failure] }.first
+    if local_failure && ip_result[:status] != 'pass' && https_result[:status] != 'pass'
+      raise LocalProbeUnavailable, local_failure
+    end
     {
       at: Time.now.iso8601,
       duration_ms: elapsed,
@@ -5718,6 +5777,8 @@ class MullvadAdapter
         { status: 'fail', delay_ms: elapsed, resolver: '10.64.0.1:53/tcp', qname: qname, detail: 'invalid or unrelated DNS response' }
       end
     end
+  rescue LocalProbeTimeout => e
+    { status: 'unknown', local_failure: e.phase, resolver: '10.64.0.1:53/tcp', qname: qname }
   rescue StandardError => e
     { status: 'fail', resolver: '10.64.0.1:53/tcp', qname: qname, detail: "#{e.class}: #{e.message}" }
   ensure
@@ -5785,10 +5846,15 @@ class MullvadAdapter
   end
 
   def socks5_connect(proxy_port, host, port, timeout_seconds)
-    socket = Socket.tcp('127.0.0.1', proxy_port, connect_timeout: timeout_seconds)
-    socket.write([5, 1, 0].pack('C*'))
-    hello = read_exact(socket, 2, timeout_seconds).bytes
-    raise 'SOCKS5 authentication negotiation failed' unless hello == [5, 0]
+    socket = nil
+    begin
+      socket = Socket.tcp('127.0.0.1', proxy_port, connect_timeout: timeout_seconds)
+      socket.write([5, 1, 0].pack('C*'))
+      hello = read_exact(socket, 2, timeout_seconds).bytes
+      raise 'SOCKS5 authentication negotiation failed' unless hello == [5, 0]
+    rescue StandardError
+      raise LocalProbeUnavailable, 'local-socks-handshake'
+    end
 
     address = IPAddr.new(host).hton
     request = [5, 1, 0, 1].pack('C*') + address + [port].pack('n')
@@ -5836,6 +5902,9 @@ class MullvadAdapter
     code = stdout[/code=(\d+)/, 1].to_i
     evidence = { exit_code: status.exitstatus, wall_duration_ms: command_ms, elapsed_seconds: stdout[/total=([\d.]+)/, 1]&.to_f,
                  proxy_port: port, target: url, timeout_seconds: timeout }
+    if [5, 7].include?(status.exitstatus)
+      return { **evidence, status: 'unknown', http_code: code, local_failure: 'local-socks-connect' }
+    end
     if status.success? && code >= 200 && code < 400
       { **evidence, status: 'pass', http_code: code, detail: stdout.strip, dependency: 'inner_dns+data' }
     else
@@ -5854,6 +5923,9 @@ class MullvadAdapter
     code = stdout[/code=(\d+)/, 1].to_i
     evidence = { exit_code: status.exitstatus, wall_duration_ms: command_ms, elapsed_seconds: stdout[/total=([\d.]+)/, 1]&.to_f,
                  proxy_port: port, target: url, timeout_seconds: timeout }
+    if [5, 7].include?(status.exitstatus)
+      return { **evidence, status: 'unknown', http_code: code, local_failure: 'local-socks-connect' }
+    end
     if status.success? && code >= 200 && code < 400
       { **evidence, status: 'pass', http_code: code, detail: stdout.strip, dependency: 'data' }
     else
@@ -6008,7 +6080,7 @@ class MullvadAdapter
     begin
       stop_pid(info[:pid])
     rescue SystemCallError => error
-      log_event('worker-cleanup-deferred', slot: slot, relay: info[:relay], error_class: error.class.name)
+      log_probe_event('worker-cleanup-deferred', slot: slot, relay: info[:relay], error_class: error.class.name)
       raise LocalProbeUnavailable, 'worker-cleanup'
     end
     @mutex.synchronize { @workers.delete(slot) if @workers[slot]&.dig(:instance_token) == info[:instance_token] }
@@ -6190,12 +6262,14 @@ class MullvadAdapter
     readers, writers = [], []
     pid = status = nil
     complete = false
-    2.times do
-      reader, writer = IO.pipe
-      readers << reader
-      writers << writer
+    Thread.handle_interrupt(Object => :never) do
+      2.times do
+        reader, writer = IO.pipe
+        readers << reader
+        writers << writer
+      end
+      pid = Process.spawn(*argv, in: File::NULL, out: writers[0], err: writers[1], pgroup: true)
     end
-    pid = Process.spawn(*argv, in: File::NULL, out: writers[0], err: writers[1], pgroup: true)
     spawned_at = last_poll_at = monotonic_now
     writers.each(&:close)
     streams = readers.each_with_index.to_h
@@ -6289,10 +6363,17 @@ class MullvadAdapter
     end
   end
 
+  # Credentials belong to this daemon's managed controller lifetime, never the
+  # public UI capability or a general snapshot. Every generated config uses it.
+  def controller_secret(port)
+    @controller_secret_mutex.synchronize { @controller_secrets[Integer(port)] ||= SecureRandom.hex(32).freeze }
+  end
+
   def http_json(port, path, method: :get, body: nil, open_timeout: 1, read_timeout: 5)
     uri = URI("http://127.0.0.1:#{port}#{path}")
     klass = method == :put ? Net::HTTP::Put : (method == :post ? Net::HTTP::Post : Net::HTTP::Get)
     request = klass.new(uri)
+    request['Authorization'] = "Bearer #{controller_secret(port)}"
     if body
       request['Content-Type'] = 'application/json'
       request.body = JSON.generate(body)

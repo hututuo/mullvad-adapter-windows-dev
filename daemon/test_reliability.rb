@@ -122,6 +122,7 @@ class MullvadReliabilityTest < Minitest::Test
   end
 
   def teardown
+    @adapter&.instance_variable_get(:@probe_event_writer)&.join(2)
     Thread.current[:adapter_operation_id] = nil
     FileUtils.rm_rf(@dir)
   end

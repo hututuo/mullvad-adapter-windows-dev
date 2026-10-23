@@ -28,6 +28,7 @@ class MullvadCityRecoveryTest < Minitest::Test
   end
 
   def teardown
+    @adapter&.instance_variable_get(:@probe_event_writer)&.join(2)
     Thread.current[:adapter_operation_id] = nil
     FileUtils.rm_rf(@dir)
   end
@@ -152,6 +153,7 @@ class MullvadCityRecoveryTest < Minitest::Test
     @adapter.send(:wait_for_health_check)
     refute @adapter.instance_variable_get(:@health_wake_pending)
 
+    @adapter.instance_variable_get(:@probe_event_writer)&.join(1)
     events = event_log
     assert_equal 1, events.count { |event| event['event'] == 'health-check-requested' }
   end

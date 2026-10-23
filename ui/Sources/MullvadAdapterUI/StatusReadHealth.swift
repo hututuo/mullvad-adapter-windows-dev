@@ -107,6 +107,9 @@ struct StatusReadEvent: Encodable, Sendable {
     let displayState: String?
     var publicationAgeMs: Int? = nil
     var publicationCaptureMs: Int? = nil
+    var correlationID: String? = nil
+    var serverDispatchMs: Int? = nil
+    var serverRequestReadMs: Int? = nil
 
     enum CodingKeys: String, CodingKey {
         case event, requestID = "request_id", durationMs = "duration_ms"
@@ -114,6 +117,7 @@ struct StatusReadEvent: Encodable, Sendable {
         case consecutiveFailures = "consecutive_failures", snapshotAgeSeconds = "snapshot_age_seconds"
         case displayState = "display_state"
         case publicationAgeMs = "publication_age_ms", publicationCaptureMs = "publication_capture_ms"
+        case correlationID = "correlation_id", serverDispatchMs = "server_dispatch_ms", serverRequestReadMs = "server_request_read_ms"
     }
 }
 

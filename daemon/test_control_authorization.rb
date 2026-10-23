@@ -10,6 +10,7 @@ class MullvadControlAuthorizationTest < Minitest::Test
     @capability = @adapter.instance_variable_get(:@account_capability)
   end
   def teardown
+    @adapter&.instance_variable_get(:@probe_event_writer)&.join(2)
     FileUtils.remove_entry(@dir)
   end
   def request(path, authorization: nil, origin: nil, method: 'POST')

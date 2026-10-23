@@ -68,7 +68,7 @@ and [portable profile requirements](../openspec/changes/clash-portable-profile/s
 
 ## City workspace and recovery
 
-`/cities` is the daemon-owned view of up to three favorite location IDs, the selected city, its current worker, and two ranked backup candidates. `POST /cities` atomically saves favorites; `POST /cities/select` returns an operation receipt and validates a same-city candidate before committing. Existing installations seed the workspace from the first committed relay; UI pins remain a separate browser preference. An explicit node selection changes the selected city and adds it to favorites, replacing the last favorite if all three slots are occupied.
+`/cities` is the daemon-owned view of up to three favorite location IDs, the selected city, its current worker, and up to four ranked backup candidates. `POST /cities` atomically saves favorites; `POST /cities/select` returns an operation receipt and validates a same-city candidate before committing. Existing installations seed the workspace from the first committed relay; UI pins remain a separate browser preference. An explicit node selection changes the selected city and adds it to favorites, replacing the last favorite if all three slots are occupied.
 
 Every automatic recovery entry uses the selected metadata location as a hard boundary, including startup retries when a saved node has disappeared. If there is no trustworthy city or no candidate, recovery remains disconnected rather than choosing another city. Explicit city/node selections can change this boundary.
 

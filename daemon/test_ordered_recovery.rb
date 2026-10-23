@@ -54,6 +54,7 @@ class OrderedRecoveryTest < Minitest::Test
   end
 
   def teardown
+    @adapter&.instance_variable_get(:@probe_event_writer)&.join(2)
     FileUtils.rm_rf(@dir)
     %i[adapter_recovery_token adapter_recovery_inlet adapter_recovery_id adapter_network_epoch adapter_recovery_deadline].each { |key| Thread.current[key] = nil }
   end

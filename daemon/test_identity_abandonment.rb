@@ -26,6 +26,7 @@ class MullvadIdentityAbandonmentTest < Minitest::Test
   end
 
   def teardown
+    @adapter&.instance_variable_get(:@probe_event_writer)&.join(2)
     @fixture.teardown
   end
 

@@ -80,3 +80,22 @@ The [Mac recovery contract](../openspec/changes/mac-ordered-city-recovery/specs/
 Home exposes actual recovery progress and authenticated `POST /recovery` controls: `{"action":"retry-current"}`, `{"action":"retry-round"}`, `{"action":"stop"}`. Retry controls return the existing operation receipt; stop acknowledges cancellation and lets bounded cleanup finish. Use the existing owner capability; browser-origin mutations remain rejected. The status `recovery` object is optional for older UI/daemon compatibility. Its countdown is a fresh daemon observation; stale reads must not be shown as current progress. Mac has no chain fallback yet.
 
 Regression: include `daemon/test_ordered_recovery.rb` in the existing Ruby suite and `RecoveryTests` in Swift tests. Do not launch desktop windows or interrupt the user's network to simulate this contract. Keep runtime/install/long-term results separate from these deterministic tests.
+
+## Controller ownership and status latency
+
+Generated front/worker controllers require separate random Bearer credentials;
+their config files are private (0600). Credentials belong to the daemon lifetime
+and are never returned through status. Controller bootstrap registers its process
+before waiting; uncertain cleanup retains the slot/peer reservation.
+
+Status requests send `X-Adapter-Request-Id`, a random per-read UUID. The daemon
+echoes validated IDs and returns `X-Adapter-Dispatch-Ms` (accept to handler) and
+`X-Adapter-Request-Read-Ms` (handler to parsed request), alongside publication-age
+headers. Bounded queued events `status-request-received` and
+`status-request-finished` record that ID and numeric timing; the latter includes
+`response_ms`. UI failure/recovery/slow events retain `correlation_id`, and successful
+reads can include `server_dispatch_ms` and `server_request_read_ms`. Legacy daemon
+responses without these headers remain compatible. A status write has a one-second
+application deadline. Scheduler stalls can exceed deadlines; missing queued events
+alone do not prove a request never arrived. These observations support diagnosis
+without treating every local timeout as a tunnel failure.

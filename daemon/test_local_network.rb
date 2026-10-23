@@ -15,6 +15,7 @@ class MullvadLocalNetworkTest < Minitest::Test
   end
 
   def teardown
+    @adapter&.instance_variable_get(:@probe_event_writer)&.join(2)
     %i[adapter_network_epoch adapter_resume_path adapter_protection_profile adapter_attempt_id].each { |key| Thread.current[key] = nil }
     FileUtils.rm_rf(@dir)
   end

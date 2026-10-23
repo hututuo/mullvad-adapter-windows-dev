@@ -22,13 +22,16 @@ class MullvadPQTest < Minitest::Test
     @stopped, @configs = [], []
     stopped, configs = @stopped, @configs
     @adapter.define_singleton_method(:stop_pid) { |pid| stopped << pid }
-    @adapter.define_singleton_method(:spawn_worker_core) do |_dir, path, _spec|
+    @adapter.define_singleton_method(:spawn_worker_core) do |_dir, path, _spec, &register|
       configs << JSON.parse(File.read(path))
-      100 + configs.length
+      pid = 100 + configs.length
+      register.call(pid)
+      pid
     end
   end
 
   def teardown
+    @adapter&.instance_variable_get(:@probe_event_writer)&.join(2)
     Thread.current[:adapter_protection_profile] = nil
     FileUtils.remove_entry(@dir)
   end

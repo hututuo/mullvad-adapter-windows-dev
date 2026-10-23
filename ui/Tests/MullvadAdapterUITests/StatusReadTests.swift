@@ -27,6 +27,13 @@ private final class ReadFixtureProtocol: URLProtocol {
             Self.state.hold(self); return
         }
         if request.url!.path == "/status" {
+            if mode == "timed" || mode == "wrong-request" || mode == "bad-dispatch" {
+                respond(200, CityPreview.data("status"), headers: [
+                    "X-Adapter-Request-Id": mode == "wrong-request" ? UUID().uuidString : request.value(forHTTPHeaderField: "X-Adapter-Request-Id")!,
+                    "X-Adapter-Dispatch-Ms": mode == "bad-dispatch" ? "-1" : "12",
+                    "X-Adapter-Request-Read-Ms": "3"])
+                return
+            }
             if mode == "stale" { respond(503, Data(#"{"code":"status_snapshot_stale"}"#.utf8)); return }
             if mode == "aged" { respond(200, CityPreview.data("status"), headers: ["X-Adapter-Status-Age-Ms": "2300", "X-Adapter-Status-Capture-Ms": "51"]); return }
             if mode == "expired" { respond(200, CityPreview.data("status"), headers: ["X-Adapter-Status-Age-Ms": "3001"]); return }
@@ -247,7 +254,7 @@ final class StatusReadTests: XCTestCase {
         let legacy = try await subject.fetchStatusObservation()
         XCTAssertNil(legacy.ageMilliseconds)
         XCTAssertEqual(legacy.snapshot.serviceReadiness, "ready")
-        for mode in ["expired", "bad-age"] {
+        for mode in ["expired", "bad-age", "wrong-request", "bad-dispatch"] {
             ReadFixtureProtocol.state.set(mode)
             do { _ = try await subject.fetchStatusObservation(); XCTFail("must reject \(mode)") }
             catch {
@@ -256,6 +263,22 @@ final class StatusReadTests: XCTestCase {
                 XCTAssertEqual(failure.kind, mode == "expired" ? "snapshot_stale" : "invalid_response")
             }
         }
+    }
+
+    @MainActor func testStatusCorrelationAndServerTimingSurviveIntoSafeEvents() async throws {
+        let events = ReadEvents(), m = model(events)
+        ReadFixtureProtocol.state.set("timed")
+        await m.refreshStatusOnly()
+        let event = try XCTUnwrap(events.all.last)
+        XCTAssertNotNil(UUID(uuidString: try XCTUnwrap(event.correlationID)))
+        XCTAssertEqual(event.serverDispatchMs, 12)
+        XCTAssertEqual(event.serverRequestReadMs, 3)
+        ReadFixtureProtocol.state.set("timeout")
+        await m.refreshStatusOnly()
+        let timeout = try XCTUnwrap(events.all.last)
+        XCTAssertNotNil(UUID(uuidString: try XCTUnwrap(timeout.correlationID)))
+        XCTAssertNotEqual(timeout.correlationID, event.correlationID)
+        XCTAssertNil(timeout.serverDispatchMs)
     }
 
     @MainActor func testPollingContinuesWhileCityReadRemainsBlocked() async throws {

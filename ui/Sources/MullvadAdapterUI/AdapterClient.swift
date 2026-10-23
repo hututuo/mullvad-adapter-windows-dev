@@ -4,6 +4,9 @@ struct StatusObservation: Sendable {
     let snapshot: AdapterStatus
     let ageMilliseconds: Int?
     let captureMilliseconds: Int?
+    var requestID: String? = nil
+    var dispatchMilliseconds: Int? = nil
+    var requestReadMilliseconds: Int? = nil
 }
 
 struct AdapterClient: Sendable {
@@ -117,11 +120,12 @@ struct AdapterClient: Sendable {
         try await fetchStatusObservation().snapshot
     }
 
-    func fetchStatusObservation() async throws -> StatusObservation {
+    func fetchStatusObservation(requestID: String = UUID().uuidString) async throws -> StatusObservation {
         var request = URLRequest(url: baseURL.appendingPathComponent("status"))
         request.timeoutInterval = 5
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(requestID, forHTTPHeaderField: "X-Adapter-Request-Id")
         let (data, response) = try await response(for: request, using: statusSession)
         func milliseconds(_ name: String) throws -> Int? {
             guard let value = response.value(forHTTPHeaderField: name) else { return nil }
@@ -134,7 +138,11 @@ struct AdapterClient: Sendable {
         let age = try milliseconds("X-Adapter-Status-Age-Ms")
         let capture = try milliseconds("X-Adapter-Status-Capture-Ms")
         if let age, age > 3000 { throw AdapterClientError.statusSnapshotStale(age) }
-        return try StatusObservation(snapshot: decode(data, path: "/status"), ageMilliseconds: age, captureMilliseconds: capture)
+        if let echoed = response.value(forHTTPHeaderField: "X-Adapter-Request-Id"), echoed != requestID {
+            throw AdapterClientError.invalidResponse("本机状态请求标记不匹配")
+        }
+        return try StatusObservation(snapshot: decode(data, path: "/status"), ageMilliseconds: age, captureMilliseconds: capture,
+            requestID: requestID, dispatchMilliseconds: milliseconds("X-Adapter-Dispatch-Ms"), requestReadMilliseconds: milliseconds("X-Adapter-Request-Read-Ms"))
     }
 
     func fetchMetrics() async throws -> AdapterMetrics {
