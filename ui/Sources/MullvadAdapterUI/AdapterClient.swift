@@ -193,6 +193,11 @@ struct AdapterClient: Sendable {
         return try decode(data, path: path)
     }
 
+    func controlRecovery(_ action: String) async throws -> OperationReceipt? {
+        let data = try await post("recovery", json: ["action": action])
+        return action == "stop" ? nil : try decode(data, path: "recovery")
+    }
+
     func fetchOperation(_ id: String) async throws -> AdapterOperation {
         try await get("operations/\(id)", as: AdapterOperation.self)
     }

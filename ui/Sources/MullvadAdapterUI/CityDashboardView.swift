@@ -47,15 +47,12 @@ struct CityDashboardView: View {
 
                 HStack(alignment: .top, spacing: 14) {
                     primaryCard.frame(maxWidth: .infinity).frame(height: 206, alignment: .top)
-                    AppCard("自动恢复") {
-                        policyRow("1", "本机断网先等待", "暂停重试和节点切换")
-                        policyRow("2", "恢复后先验证原连接", "原路径确实不通，才换同城节点")
-                        policyRow("3", "城市由你决定", "自动恢复不会跳到其他城市")
-                    }.frame(maxWidth: .infinity).frame(height: 206, alignment: .top)
+                    RecoveryProgressView(model: model)
+                        .frame(maxWidth: .infinity).frame(height: 288, alignment: .top)
                 }
 
                 AppCard("同城备用候选") {
-                    ForEach(0..<2, id: \.self) { index in
+                    ForEach(0..<4, id: \.self) { index in
                         if index > 0 { Divider() }
                         backupRow(index < (model.cityWorkspace?.selected?.backups.count ?? 0)
                                   ? model.cityWorkspace?.selected?.backups[index] : nil, index: index)
@@ -126,17 +123,6 @@ struct CityDashboardView: View {
         }
     }
 
-    private func policyRow(_ number: String, _ title: String, _ detail: String) -> some View {
-        HStack(alignment: .top, spacing: 10) {
-            Text(number).font(.caption.weight(.semibold)).frame(width: 22, height: 22)
-                .background(Color.secondary.opacity(0.1), in: Circle())
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title).font(.subheadline.weight(.medium))
-                Text(detail).font(.caption).foregroundStyle(.secondary)
-            }
-        }.frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
-    }
-
     private func backupRow(_ node: CityNodeEvidence?, index: Int) -> some View {
         HStack(spacing: 14) {
             Text("\(index + 1)").font(.headline).foregroundStyle(.secondary)
@@ -152,6 +138,12 @@ struct CityDashboardView: View {
                     .font(.caption.weight(.medium))
                     .foregroundStyle(node?.evidence == "recent_ready" ? Color.green : .secondary)
                 Text(outerDescription(node?.outerProbe)).font(.caption).foregroundStyle(.secondary)
+            }
+            if let node {
+                Button { model.selectRelay(hostname: node.relay,
+                                           transport: TransportPreference(rawValue: model.status?.transportPreference ?? "auto")) } label: {
+                    Text("连接此节点").padding(.horizontal, 8).padding(.vertical, 7).contentShape(Rectangle())
+                }.disabled(model.connectionError != nil || model.isBusy || model.isSpeedTesting || model.status?.localNetwork?.paused == true)
             }
         }.frame(height: 64)
     }

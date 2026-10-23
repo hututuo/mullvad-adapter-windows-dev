@@ -44,7 +44,8 @@ class ReliabilityAdapter < MullvadAdapter
     @candidate_calls += 1
     worker = { pid: 99_999, slot: slot, relay: relay['hostname'], instance_token: SecureRandom.uuid,
                transport_mode: transport_mode, transport: transport_mode, mixed_port: 17_910,
-               endpoint: ss_candidate&.first || '192.0.2.2', started_at: Time.now.iso8601 }
+               endpoint: ss_candidate&.first || '192.0.2.2', endpoint_port: ss_candidate&.[](1) || EXTRA_SS_PORT,
+               endpoint_kind: ss_candidate&.[](2) || 'extra-ss-ipv4', started_at: Time.now.iso8601 }
     @workers[slot] = worker
     @worker_state_tokens[slot] = worker[:instance_token]
     @state[:workers][slot] = public_worker_state(worker).merge(state: 'candidate')

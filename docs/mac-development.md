@@ -60,3 +60,11 @@ Actions手动运行`checks-and-candidate`：先Ruby/Swift/PQ组件检查，再as
 `~/Library/Logs/MullvadLocalAdapter/ui-status.jsonl` 及 `.1` 各最多256 KiB，仅记录状态请求编号、错误类别/数值码、耗时、连续失败数、快照年龄、可选的发布年龄/采集耗时、界面版本和会话编号。正常快速轮询不逐条落盘；启动、失败、取消、丢弃旧结果、恢复与慢请求留痕。日志不接收任意错误正文、URL、HTTP响应或账号密钥。串行写队列最多64条待写事件，超额丢弃计数随下一条记录保存；导出等待刷新最多一秒。文件0600、目录0700，拒绝链接和特殊文件；复制排查资料包含两份日志。文件上限并非按天保留承诺。
 
 只改界面时可单独构建并替换签名UI bundle，不必重启Ruby后台或Mihomo。替换前保存完整旧bundle，替换后核对后台/前端/worker/Clash进程身份和真实代理HTTPS。不要运行`install-daemon.rb`来部署UI补丁；不要通过真实断网、睡眠、同身份备用隧道或反复开关主窗制造测试故障。
+
+## Ordered recovery and main-page controls
+
+The [Mac recovery contract](../openspec/changes/mac-ordered-city-recovery/specs/recovery/spec.md) defines the current ladder: original authorized inlet up to 3 starts (0/1/5-second cleanup-relative waits), at most 2 other SS inlets, then at most 4 eligible same-city nodes with 2 inlets each. The 300-second ordered-round admission budget is distinct from the existing cold-start/city-selection budget. DNS-only degradation preserves the live tunnel. Local offline/probe/cleanup problems pause or defer instead of scoring all nodes as dead.
+
+Home exposes actual recovery progress and authenticated `POST /recovery` controls: `{"action":"retry-current"}`, `{"action":"retry-round"}`, `{"action":"stop"}`. Retry controls return the existing operation receipt; stop acknowledges cancellation and lets bounded cleanup finish. Use the existing owner capability; browser-origin mutations remain rejected. The status `recovery` object is optional for older UI/daemon compatibility. Its countdown is a fresh daemon observation; stale reads must not be shown as current progress. Mac has no chain fallback yet.
+
+Regression: include `daemon/test_ordered_recovery.rb` in the existing Ruby suite and `RecoveryTests` in Swift tests. Do not launch desktop windows or interrupt the user's network to simulate this contract. Keep runtime/install/long-term results separate from these deterministic tests.

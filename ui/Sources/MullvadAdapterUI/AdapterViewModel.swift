@@ -289,6 +289,28 @@ final class AdapterViewModel: ObservableObject {
         }
     }
 
+    @Published var isRecoveryControlPending = false
+
+    func controlRecovery(_ action: String) {
+        guard !isRecoveryControlPending, connectionError == nil,
+              action == "stop" || (!isBusy && !isSpeedTesting && status?.localNetwork?.paused != true) else { return }
+        isRecoveryControlPending = true
+        Task {
+            defer { isRecoveryControlPending = false }
+            do {
+                let receipt = try await client.controlRecovery(action)
+                if let receipt {
+                    Task {
+                        do { try await waitForOperation(receipt.id) }
+                        catch { errorMessage = error.localizedDescription }
+                        await refreshStatusBestEffort()
+                    }
+                }
+            } catch { errorMessage = error.localizedDescription }
+            await refreshStatusBestEffort()
+        }
+    }
+
     func reconnect() {
         startReconnect(transport: nil, applyingPreference: false)
     }

@@ -41,6 +41,7 @@ struct AdapterStatus: Decodable {
     let status: String?
     let buildID: String?
     let operation: AdapterOperation?
+    let recovery: RecoveryStatus?
     let diagnosis: NetworkDiagnosis?
     let generation: Int?
     let activeSlot: String?
@@ -72,7 +73,7 @@ struct AdapterStatus: Decodable {
     enum CodingKeys: String, CodingKey {
         case status
         case buildID = "build_id"
-        case operation, diagnosis
+        case operation, diagnosis, recovery
         case generation
         case activeSlot = "active_slot"
         case activeRelay = "active_relay"

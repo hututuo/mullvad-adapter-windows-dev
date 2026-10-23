@@ -221,7 +221,7 @@ class MullvadRuntimeDeadlineTest < Minitest::Test
     @adapter.define_singleton_method(:run_readiness_canary) do |_|
       { ip_data: { status: 'fail' }, inner_dns: { status: 'fail' }, https_data: { status: 'skip' } }
     end
-    @adapter.define_singleton_method(:ss_endpoint_candidates) { |_| [['192.0.2.1', 20_484, 'fixture']] }
+    @adapter.define_singleton_method(:ss_endpoint_candidates) { |_, **_|  [['192.0.2.1', 20_484, 'fixture']] }
     @adapter.define_singleton_method(:recovery_relay_candidates) { |*_, **_| %w[two three] }
     attempts = []
     @adapter.define_singleton_method(:start_worker) do |_, relay, **_|
@@ -229,7 +229,7 @@ class MullvadRuntimeDeadlineTest < Minitest::Test
       raise MullvadAdapter::LocalProbeTimeout, 'worker-controller'
     end
     @adapter.send(:check_active_health_once)
-    assert_equal ['two'], attempts
+    assert_equal ['one'], attempts
     quarantine = @adapter.instance_variable_get(:@recovery_quarantine)
     refute quarantine.key?('two')
     refute quarantine.key?('three')
@@ -362,7 +362,7 @@ class MullvadRuntimeDeadlineTest < Minitest::Test
       raise MullvadAdapter::LocalProbeTimeout, 'worker-controller'
     end
     refute @adapter.send(:repair_connection)
-    assert_equal ['two'], attempts
+    assert_equal ['one'], attempts
     assert_empty @adapter.instance_variable_get(:@recovery_quarantine)
   end
 end

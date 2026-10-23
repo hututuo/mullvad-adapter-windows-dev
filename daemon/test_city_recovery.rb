@@ -368,7 +368,7 @@ class MullvadCityRecoveryTest < Minitest::Test
     assert_equal 'recovery-round-finished', event_log.last['event']
   end
 
-  def test_health_round_does_not_expand_to_three_backup_nodes_when_candidates_fail
+  def test_health_round_retries_original_then_only_bounded_same_city_nodes
     @adapter.seed_active
     metadata = @adapter.instance_variable_get(:@metadata)
     %w[seven eight].each do |name|
@@ -380,13 +380,16 @@ class MullvadCityRecoveryTest < Minitest::Test
       { ip_data: { status: 'fail' }, inner_dns: { status: 'fail' }, https_data: { status: 'fail' } }
     end
     attempted = []
-    @adapter.define_singleton_method(:activate) do |name, **_options|
+    @adapter.define_singleton_method(:recovery_wait) { |_| true }
+    @adapter.define_singleton_method(:activate) do |name, **options|
       attempted << name
+      options[:attempt_evidence].merge!(attempted: true, relay_failed: true)
       false
     end
     @adapter.send(:check_active_health_once)
-    assert_equal 2, attempted.uniq.length
-    refute_includes attempted, 'one'
+    assert_equal ['one'] * 3, attempted.first(3)
+    assert_operator attempted.uniq.length, :<=, 5
+    assert attempted.drop(3).all? { |name| CITIES[name] == 'us-sjc' || %w[seven eight].include?(name) }
   end
 
   def test_failed_favorites_persist_leaves_in_memory_policy_unchanged

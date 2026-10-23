@@ -127,7 +127,7 @@ class MullvadAdapter
   TRANSPORT_PREFERENCES = (%w[auto] + TRANSPORT_MODES).freeze
   AUTO_TRANSPORT_ORDER = %w[ss ipv6 ipv4].freeze
   DEFAULT_TRANSPORT_PREFERENCE = 'ss'
-  BUILD_ID = '20261005-local-network-recovery-1'
+  BUILD_ID = '20261023-ordered-city-recovery-1'
   SOURCE_SHA256 = Digest::SHA256.file(__FILE__).hexdigest
   STATUS_PUBLICATION_INTERVAL = 1.0
   STATUS_PUBLICATION_MAX_AGE = 3.0
@@ -160,8 +160,9 @@ class MullvadAdapter
     health_recheck_interval: 2,
     recovery_cooldown: 30,
     attempt_budget: 35,
-    recovery_batch_size: 2,
+    recovery_batch_size: 4,
     recovery_round_budget: 45,
+    ordered_recovery_budget: 300,
     local_network_interval: 2,
     local_network_settle: 2,
     clash_socket: "/var/run/clash-verge-service/users/#{Process.uid}/verge-mihomo.sock",
@@ -203,6 +204,9 @@ class MullvadAdapter
     @log_mutex = Mutex.new
     @mutex = Mutex.new
     @switch_mutex = Mutex.new
+    @ordered_recovery_mutex = Mutex.new
+    @recovery_control_epoch = 0
+    @recovery_stopped = false
     @speed_test_mutex = Mutex.new
     @action_gate_mutex = Mutex.new
     @history_mutex = Mutex.new
@@ -289,6 +293,9 @@ class MullvadAdapter
       build_id: BUILD_ID,
       source_sha256: SOURCE_SHA256,
       generation: 0,
+      recovery: { phase: 'idle', running: false, attempt: 0, budget_seconds: @options[:ordered_recovery_budget],
+                  message: '连接异常确认后：原入口重试 → 同节点备用 SS → 最多 4 个同城节点',
+                  next_step: '本机断网先等待；本地入口故障先修入口，不跨城切换' },
       local_network: { status: 'unknown', paused: false, recovery_pending: false, epoch: 0,
                        source: 'not-observed', checked_at: nil, detail: '本机链路尚未检查' },
       active_slot: nil,
@@ -1451,6 +1458,17 @@ class MullvadAdapter
     when ['POST', '/speedtest/start']
       payload = parse_json_body(body)
       accepted_async(sock, payload['relay'].to_s, 'speedtest', payload['transport'])
+    when ['POST', '/recovery']
+      command = parse_json_body(body)['action'].to_s
+      raise ArgumentError, 'unsupported recovery action' unless %w[retry-current retry-round stop].include?(command)
+      if command == 'stop'
+        interrupt_ordered_recovery(stopped: true)
+        respond(sock, 202, { ok: true })
+      else
+        relay = @mutex.synchronize { @state[:active_relay] } || load_persisted_relay
+        raise ArgumentError, '请先选择节点' if relay.to_s.empty?
+        accepted_async(sock, relay, command)
+      end
     when ['POST', '/repair']
       accepted_async(sock, snapshot[:active_relay].to_s, 'repair')
     when ['POST', '/diagnose']
@@ -1507,6 +1525,7 @@ class MullvadAdapter
       end
       transport_candidates(preference, find_relay(relay))
     end
+    admission_epoch = @mutex.synchronize { @recovery_control_epoch }
     id = SecureRandom.uuid
     accepted = @action_gate_mutex.synchronize do
       if @action_pending
@@ -1539,10 +1558,17 @@ class MullvadAdapter
       return
     end
 
+    preserve_stop = %w[diagnose speedtest].include?(reason) && @mutex.synchronize { @recovery_stopped }
+    recovery_ticket = interrupt_ordered_recovery(stopped: preserve_stop, expected_epoch: admission_epoch)
     record_routing_event('action-accepted', relay: relay, reason: reason)
     Thread.new do
       Thread.current[:adapter_operation_id] = id
+      Thread.current[:adapter_recovery_request_epoch] = recovery_ticket
       begin
+        unless recovery_ticket
+          update_operation(state: 'cancelled', stage: 'finished', message: '请求已被较新的停止操作取消', finished_at: Time.now.iso8601)
+          next
+        end
         update_operation(state: 'running')
         action_evidence = {}
         ok = case reason
@@ -1561,6 +1587,8 @@ class MullvadAdapter
              when 'diagnose'
                diagnose_network
                true
+             when 'retry-current', 'retry-round'
+               run_ordered_recovery(relay, reason: reason, current_only: reason == 'retry-current', manual: true)
              when 'repair'
                repair_connection
              when 'protection-change'
@@ -1592,7 +1620,7 @@ class MullvadAdapter
         messages = {
           'succeeded' => reason == 'speedtest' ? '测速完成' : '检查 / 操作完成',
           'recovered' => "原节点未能恢复，已自动连接 #{current[:active_relay]}",
-          'cancelled' => '测速已停止，当前连接保持原样',
+          'cancelled' => reason == 'speedtest' ? '测速已停止，当前连接保持原样' : '恢复已停止，当前通道保留',
           'preserved' => '本次操作未完成，原连接已保留或恢复',
           'failed' => '尚未恢复连接，后台将继续有限重试'
         }
@@ -1613,6 +1641,7 @@ class MullvadAdapter
       ensure
         @action_gate_mutex.synchronize { @action_pending = nil }
         Thread.current[:adapter_operation_id] = nil
+        Thread.current[:adapter_recovery_request_epoch] = nil
       end
     end
     # Launch before replying: a closed UI socket must not leave a permanent busy flag.
@@ -1818,6 +1847,7 @@ class MullvadAdapter
   end
 
   def decorate_status_snapshot(copy)
+    decorate_recovery_snapshot(copy)
     if copy.dig(:local_network, :paused)
       copy[:status] = copy[:service_readiness] = 'waiting_network'
       copy[:relay_liveness] = 'unknown'
@@ -1837,6 +1867,7 @@ class MullvadAdapter
 
   def snapshot
     copy = @mutex.synchronize { Marshal.load(Marshal.dump(@state)) }
+    decorate_recovery_snapshot(copy)
     if copy.dig(:local_network, :paused)
       copy[:status] = 'waiting_network'
       copy[:service_readiness] = 'waiting_network'
@@ -1993,8 +2024,10 @@ class MullvadAdapter
 
   def retry_disconnected_runtime
     return if @stop_requested || action_pending? || !@metadata
+    return if @ordered_recovery_mutex.locked? || ordered_recovery_blocked?
     return if local_network_paused? || local_network_recovery_pending?
-    return if Time.now - @last_disconnected_retry_at < @options[:recovery_cooldown]
+    ordered = @mutex.synchronize { @state[:recovery][:started_at] }
+    return if !ordered && Time.now - @last_disconnected_retry_at < @options[:recovery_cooldown]
     return unless @switch_mutex.try_lock
     begin
       current = @mutex.synchronize { @state.slice(:generation, :active_slot, :active_relay) }
@@ -2003,10 +2036,8 @@ class MullvadAdapter
     ensure
       @switch_mutex.unlock
     end
-    activate_startup_with_fallback(
-      current[:active_relay] || load_persisted_relay || @options[:default_relay],
-      current_transport_preference, reason: 'startup-retry', expected_state: current
-    )
+    relay = current[:active_relay] || load_persisted_relay || @options[:default_relay]
+    run_ordered_recovery(relay, reason: 'startup-retry', expected_state: current)
   end
 
   def supervise_front_runtime
@@ -2230,7 +2261,7 @@ class MullvadAdapter
   def supervise_worker_runtime
     # Keep the failed worker identity until local recovery owns the rebuild.
     # A dead process during a Wi-Fi outage is not a relay-health observation.
-    return if local_network_paused? || local_network_recovery_pending?
+    return if local_network_paused? || local_network_recovery_pending? || @ordered_recovery_mutex.locked? || ordered_recovery_blocked?
     return unless @switch_mutex.try_lock
     recovery = nil
     begin
@@ -2274,7 +2305,6 @@ class MullvadAdapter
         @state[:last_error] = "active worker-#{slot} exited unexpectedly"
         @state[:updated_at] = Time.now.iso8601
         @metrics[:worker_crash_recoveries] += 1
-        @metrics[:auto_recovery_attempts] += 1
         @state[:health][:last_attempt_at] = Time.now.iso8601
       end
       stop_worker(slot)
@@ -2289,51 +2319,7 @@ class MullvadAdapter
     end
 
     return unless recovery
-    with_recovery_budget('worker-crash-recovery', recovery[:relay]) do
-      evidence = {}
-      ok = activate(
-        recovery[:relay],
-        reason: 'worker-crash-recovery',
-        transport_preference: recovery[:preference],
-        expected_state: recovery[:expected_state],
-        attempt_evidence: evidence
-      )
-      unless ok
-        if evidence[:local_failure]
-          log_event('recovery-local-deferred', relay: recovery[:relay], phase: evidence[:local_failure], reason: 'local-bootstrap')
-          return false
-        end
-        return unless automatic_recovery_context_valid?(recovery[:expected_state][:generation], recovery[:relay])
-        quarantine_relay(recovery[:relay], 'worker-crash-rebuild-failed')
-        recovery_relay_candidates(recovery[:relay]).each do |fallback|
-          break unless recovery_budget_remaining?
-          break unless automatic_recovery_context_valid?(recovery[:expected_state][:generation], recovery[:relay])
-          current = @mutex.synchronize do
-            {
-              generation: @state[:generation],
-              active_slot: @state[:active_slot],
-              active_relay: @state[:active_relay]
-            }
-          end
-          evidence = {}
-          ok = activate(
-            fallback,
-            reason: 'health-recovery',
-            transport_preference: recovery[:preference],
-            expected_state: current,
-            attempt_evidence: evidence
-          )
-          break if ok
-          if evidence[:local_failure]
-            log_event('recovery-local-deferred', relay: fallback, phase: evidence[:local_failure], reason: 'local-bootstrap')
-            return false
-          end
-          quarantine_relay(fallback, 'recovery-candidate-failed', 300)
-        end
-      end
-      @mutex.synchronize { @metrics[:auto_recovery_failures] += 1 unless ok }
-      ok
-    end
+    run_ordered_recovery(recovery[:relay], reason: 'worker-crash-recovery', expected_state: recovery[:expected_state])
   end
 
   def start_control_plane_monitor
@@ -2442,8 +2428,14 @@ class MullvadAdapter
     status = observation[:status]
     status = 'unknown' unless %w[available unavailable unknown].include?(status)
     event = nil
+    interface_change = nil
     @mutex.synchronize do
       local = @state[:local_network]
+      before = Array(local[:active_interfaces]).sort
+      after = Array(observation[:active_interfaces]).sort
+      if status == 'available' && local[:status] == 'available' && before != after
+        interface_change = { previous: before, current: after, epoch: local[:epoch] }
+      end
       was_paused = local[:paused]
       local.merge!(observation.slice(:source, :interfaces, :active_interfaces, :detail))
       local[:status], local[:checked_at] = status, Time.now.iso8601
@@ -2483,6 +2475,7 @@ class MullvadAdapter
       end
       @state[:updated_at] = Time.now.iso8601
     end
+    log_event('local-network-interface-set-changed', **interface_change) if interface_change
     if event
       log_event(event, **@mutex.synchronize { @state[:local_network].dup }, relay: @network_resume_path&.dig(:relay))
       wake_health_monitor(event)
@@ -2506,6 +2499,8 @@ class MullvadAdapter
   end
 
   def network_attempt_current?
+    token = Thread.current[:adapter_recovery_token]
+    return false if token && (@mutex.synchronize { token != @recovery_control_epoch } || action_conflicts?)
     epoch = Thread.current[:adapter_network_epoch]
     epoch ? network_epoch_current?(epoch) : !local_network_paused?
   end
@@ -2574,49 +2569,14 @@ class MullvadAdapter
     relay = current&.dig(:relay) || path[:relay] || load_persisted_relay || @options[:default_relay]
     return if action_pending? || !network_epoch_current?(epoch)
     return unless @mutex.synchronize { @state.slice(:generation, :active_slot, :active_relay) == expected && @state[:local_network][:recovery_pending] }
-    preference = current_transport_preference
-    with_recovery_budget('network-resume', relay) do
-      @mutex.synchronize { @state[:local_network][:recovery_stage] = 'rebuild-original' }
-      Thread.current[:adapter_resume_path] = path.merge(relay: relay)
-      evidence = {}
-      original_available = Array(@metadata.dig('wireguard', 'relays')).any? { |r| r['hostname'] == relay && r['active'] == true }
-      if original_available
-        ok = activate(relay, reason: 'network-resume', transport_preference: path[:transport_mode] || preference,
-                      expected_state: expected, attempt_evidence: evidence)
-      else
-        ok = false
-        evidence[:withdrawn] = true
-        log_event('local-network-original-withdrawn', relay: relay, epoch: epoch)
-      end
-      return unless network_epoch_current?(epoch)
-      return unless @mutex.synchronize { @state[:local_network][:recovery_pending] && (ok || @state[:generation] == expected[:generation]) }
-      return defer_local_network_recovery(evidence) if !ok && !evidence[:relay_failed] && !evidence[:withdrawn]
-      Thread.current[:adapter_resume_path] = previous_path
-      if ok
-        @mutex.synchronize { @state[:transport_preference] = preference }
-        persist_transport_preference(preference)
-      else
-        return if action_conflicts?
-        quarantine_relay(relay, 'network-resume-original-failed', 300) unless evidence[:withdrawn]
-        @mutex.synchronize { @state[:local_network][:recovery_stage] = 'same-city-fallback' }
-        recovery_relay_candidates(relay, preference: preference).each do |candidate|
-          break unless recovery_budget_remaining? && network_epoch_current?(epoch)
-          break if action_conflicts?
-          expected = @mutex.synchronize { @state.slice(:generation, :active_slot, :active_relay) }
-          evidence = {}
-          ok = activate(candidate, reason: 'network-resume-fallback', transport_preference: preference,
-                        expected_state: expected, attempt_evidence: evidence)
-          return unless network_epoch_current?(epoch)
-          return unless @mutex.synchronize { @state[:local_network][:recovery_pending] && (ok || @state[:generation] == expected[:generation]) }
-          return defer_local_network_recovery(evidence) if !ok && !evidence[:relay_failed]
-          break if ok
-          quarantine_relay(candidate, 'network-resume-candidate-failed', 300)
-        end
-      end
-      ready = ok && @mutex.synchronize { @state[:service_readiness] == 'ready' }
-      outcome = !ok ? 'same-city-exhausted' : ready ? 'validated-rebuild' : 'original-rebuild-live-partial'
-      finish_local_network_recovery(epoch, restored: ready, outcome: outcome)
-    end
+    return if ordered_recovery_blocked?
+    ok = run_ordered_recovery(relay, reason: 'network-resume', expected_state: expected, original_path: path)
+    return unless network_epoch_current?(epoch)
+    return defer_local_network_recovery(local_failure: 'ordered-local-deferred') if @mutex.synchronize { @state.dig(:recovery, :phase) == 'local_wait' }
+    return unless @mutex.synchronize { %w[restored exhausted].include?(@state.dig(:recovery, :phase)) }
+    ready = ok && @mutex.synchronize { @state[:service_readiness] == 'ready' }
+    finish_local_network_recovery(epoch, restored: ready, outcome: ok ? (ready ? 'validated-rebuild' : 'original-rebuild-live-partial') : 'same-city-exhausted')
+
   ensure
     Thread.current[:adapter_resume_path] = previous_path if defined?(previous_path)
   end
@@ -2698,19 +2658,14 @@ class MullvadAdapter
   end
 
   def check_active_health_once
-    return :retry if action_pending?
+    return :retry if action_pending? || @ordered_recovery_mutex.locked?
     return if local_network_paused?
     return recover_local_network_once if local_network_recovery_pending?
 
-    recovery = nil
-    recovery_reason = 'health-recovery'
-    recovery_candidates = []
     expected_relay = nil
     expected_generation = nil
     expected_slot = nil
     recovery_requested = false
-    recovery_handled = false
-    dns_recovery_requested = false
     active_mode = nil
     begin
       pending = @pending_health_observation
@@ -2764,10 +2719,7 @@ class MullvadAdapter
             @metrics[:health_dns_failures] += 1
             @state[:health][:consecutive_dns_failures] = @dns_fail_streak
             @state[:last_error] = "active relay inner DNS failed #{@dns_fail_streak}/#{@options[:health_fail_threshold]}"
-            if @dns_fail_streak >= @options[:health_fail_threshold].to_i &&
-               recovery_due?(generation, now)
-              dns_recovery_requested = true
-            end
+
           else
             @dns_fail_streak = 0
             @state[:health][:consecutive_dns_failures] = 0
@@ -2787,32 +2739,6 @@ class MullvadAdapter
         @state[:updated_at] = now.iso8601
       end
 
-      if dns_recovery_requested
-        if inner_dns_breaker_open?
-          @mutex.synchronize { @metrics[:inner_dns_breaker_suppressed] += 1 }
-          dns_recovery_requested = false
-        else
-          recovery_reason = 'dns-recovery-probe'
-          recovery_candidates = recovery_relay_candidates(relay_name)
-          recovery = recovery_candidates.shift
-        end
-      elsif recovery_requested
-        if active_mode == 'ss'
-          current_relay = find_relay(relay_name) rescue nil
-          if current_relay && ss_endpoint_candidates(current_relay).length > 1
-            # Before abandoning a Relay, rotate to another SS inlet for
-            # the same peer. This is still break-before-make and strictly
-            # serialized, so no duplicate WireGuard peer exists.
-            recovery = relay_name
-            recovery_reason = 'ss-endpoint-recovery'
-          end
-        end
-        unless recovery
-          quarantine_relay(relay_name, 'active-health-failure')
-          recovery_candidates = recovery_relay_candidates(relay_name)
-          recovery = recovery_candidates.shift
-        end
-      end
     rescue LocalProbeTimeout => e
       log_event('health-local-deferred', relay: expected_relay || context&.dig(:relay), phase: e.phase,
                 reason: 'local-probe-timeout-not-relay-failure')
@@ -2823,114 +2749,12 @@ class MullvadAdapter
       @switch_mutex.unlock if @switch_mutex.owned?
     end
 
-    unless recovery && expected_relay
-      if recovery_requested || dns_recovery_requested
-        log_event('recovery-city-exhausted', relay: expected_relay, city: recovery_city(expected_relay), reason: 'no-eligible-same-city-candidate')
-        @mutex.synchronize { @state[:last_error] = '当前城市暂无可尝试的备用节点；后台继续复检，不会跨城切换' }
-      end
-      return
+    if recovery_requested && expected_relay
+      return if ordered_recovery_blocked?
+      return run_ordered_recovery(expected_relay, reason: 'health-recovery',
+                                  expected_state: { generation: expected_generation, active_slot: expected_slot, active_relay: expected_relay })
     end
-    return if action_pending?
 
-    round_started = monotonic_now
-    recovery_id = SecureRandom.uuid
-    log_event('recovery-round-started', recovery_id: recovery_id, relay: expected_relay, city: recovery_city(expected_relay), reason: recovery_reason, generation: expected_generation)
-    previous_recovery = Thread.current[:adapter_recovery_id]
-    previous_deadline = Thread.current[:adapter_recovery_deadline]
-    Thread.current[:adapter_recovery_id] = recovery_id
-    Thread.current[:adapter_recovery_deadline] = round_started + @options[:recovery_round_budget]
-    begin
-      @last_auto_recovery_at = Time.now
-      @last_recovery_generation = expected_generation
-      @mutex.synchronize do
-        @metrics[:auto_recovery_attempts] += 1
-        @state[:health][:last_attempt_at] = @last_auto_recovery_at.iso8601
-      end
-      attempt_evidence = {}
-      ok = activate(
-        recovery,
-        reason: recovery_reason,
-        transport_preference: current_transport_preference,
-        attempt_evidence: attempt_evidence,
-        expected_state: {
-          generation: expected_generation,
-          active_slot: expected_slot,
-          active_relay: expected_relay
-        }
-      )
-      unless ok
-        if attempt_evidence[:local_failure]
-          log_event('recovery-local-deferred', relay: expected_relay, phase: attempt_evidence[:local_failure],
-                    reason: 'local-component-timeout-not-relay-failure')
-          return
-        end
-        context_valid = automatic_recovery_context_valid?(expected_generation, expected_relay)
-        unless context_valid
-          @mutex.synchronize { @metrics[:auto_recovery_failures] += 1 }
-          return
-        end
-
-        if recovery_reason == 'dns-recovery-probe' && inner_dns_breaker_open?
-          recovery_handled = true
-          record_routing_event(
-            'common-dns-failure-detected',
-            relay: expected_relay,
-            reason: recovery_reason,
-            detail: 'alternate relay also had live data but failed inner DNS; relay churn suppressed'
-          )
-        elsif recovery_reason == 'ss-endpoint-recovery'
-          quarantine_relay(expected_relay, 'same-node-retry-failed')
-          recovery_candidates = recovery_relay_candidates(expected_relay)
-        else
-          quarantine_relay(recovery, 'recovery-candidate-failed', 300)
-          recovery_candidates = recovery_relay_candidates(expected_relay).reject { |candidate| candidate == recovery }
-            .first([@options[:recovery_batch_size] - 1, 0].max)
-        end
-
-        recovery_candidates.each do |fallback_relay|
-          break if monotonic_now - round_started >= @options[:recovery_round_budget]
-          break if recovery_handled
-          break unless automatic_recovery_context_valid?(expected_generation, expected_relay)
-          current = @mutex.synchronize do
-            {
-              generation: @state[:generation],
-              active_slot: @state[:active_slot],
-              active_relay: @state[:active_relay]
-            }
-          end
-          attempt_evidence = {}
-          ok = activate(
-            fallback_relay,
-            reason: 'health-recovery',
-            transport_preference: current_transport_preference,
-            expected_state: current,
-            attempt_evidence: attempt_evidence
-          )
-          break if ok
-          if attempt_evidence[:local_failure]
-            log_event('recovery-local-deferred', relay: expected_relay, phase: attempt_evidence[:local_failure],
-                      reason: 'local-component-timeout-not-relay-failure')
-            return
-          end
-          if recovery_reason == 'dns-recovery-probe' && inner_dns_breaker_open?
-            recovery_handled = true
-            record_routing_event(
-              'common-dns-failure-detected',
-              relay: expected_relay,
-              reason: recovery_reason,
-              detail: 'cross-relay inner DNS failure confirmed; further failover suppressed'
-            )
-            break
-          end
-          quarantine_relay(fallback_relay, 'recovery-candidate-failed', 300)
-        end
-      end
-      @mutex.synchronize { @metrics[:auto_recovery_failures] += 1 unless ok || recovery_handled }
-    ensure
-      log_event('recovery-round-finished', recovery_id: recovery_id, restored: ok, suppressed: recovery_handled, duration_ms: ((monotonic_now - round_started) * 1000).round, active_relay: snapshot[:active_relay])
-      Thread.current[:adapter_recovery_id] = previous_recovery
-      Thread.current[:adapter_recovery_deadline] = previous_deadline
-    end
   end
 
   def observe_inner_dns_result(relay_name, canary)
@@ -3123,6 +2947,235 @@ class MullvadAdapter
 
   # A round limits the start of new attempts, never interrupts an in-flight
   # lifecycle transaction. Preserve caller trace/deadline even on early return.
+  # One recovery owner. State publication never waits for this lifecycle gate.
+  def ordered_recovery_blocked?
+    @mutex.synchronize do
+      @recovery_stopped || (@recovery_retry_at && monotonic_now < @recovery_retry_at)
+    end
+  end
+
+  def interrupt_ordered_recovery(stopped:, expected_epoch: nil)
+    token = @mutex.synchronize do
+      return nil if expected_epoch && expected_epoch != @recovery_control_epoch
+      @recovery_control_epoch += 1
+      @recovery_stopped = stopped
+      @recovery_retry_at = nil
+      if stopped || @state[:recovery][:running]
+        @state[:recovery].merge!(phase: stopped ? 'stopped' : 'interrupted',
+                               message: stopped ? '自动恢复已停止；当前通道保留，可手动重试' : '正在结束上一轮，随后执行你的操作',
+                               next_step: stopped ? '点击重试原节点或重新自动恢复' : '等待当前有界检查完成并清理')
+      end
+      @recovery_control_epoch
+    end
+    if stopped
+      @action_gate_mutex.synchronize do
+        operation = @action_pending && @operations[@action_pending[:id]]
+        operation[:cancel_requested] = true if operation && %w[retry-current retry-round].include?(operation[:kind])
+      end
+    end
+    wake_health_monitor('recovery-control')
+    token
+  end
+
+  def recovery_progress(phase, **fields)
+    @mutex.synchronize do
+      token = Thread.current[:adapter_recovery_token]
+      return if token && token != @recovery_control_epoch
+      @state[:recovery].merge!(phase: phase, updated_at: Time.now.iso8601, **fields)
+    end
+    log_event('recovery-progress', phase: phase, **fields.reject { |key, _| key.to_s.start_with?('_') })
+  end
+
+  def decorate_recovery_snapshot(copy)
+    recovery = copy[:recovery]
+    return unless recovery
+    now = monotonic_now
+    started = recovery.delete(:_started_mono)
+    finished = recovery.delete(:_finished_mono)
+    retry_at = recovery.delete(:_retry_mono)
+    recovery[:elapsed_seconds] = started ? [(finished || now) - started, 0].max.round : 0
+    recovery[:remaining_seconds] = [recovery[:budget_seconds].to_i - recovery[:elapsed_seconds], 0].max
+    recovery[:retry_in_seconds] = retry_at ? [(retry_at - now).ceil, 0].max : nil
+  end
+
+  # Reuse catalogue-authorized inlet tuples and their history ranking. The
+  # bounded ladder explicitly re-tests cooling inlets, but never invents one.
+  def recovery_inlets(relay_name, mode, original = nil)
+    relay = find_relay(relay_name)
+    entry_name = original&.dig(:entry_relay)
+    if protection_profile[:multihop]
+      entry = entry_name ? find_relay(entry_name) : multihop_entries(relay, mode).first
+      return [] unless entry && entry['hostname'] != relay_name
+      entries = mode == 'ss' ? ss_endpoint_candidates(entry, include_cooling: true).first(3) : [nil]
+      return entries.map { |inlet| { entry: entry['hostname'], inlet: inlet } }
+    end
+    mode == 'ss' ? ss_endpoint_candidates(relay, include_cooling: true).first(3) : [nil]
+  rescue RuntimeError, ArgumentError
+    [] # A withdrawn relay/entry must not be resurrected from a saved path.
+  end
+
+  def original_recovery_inlet(path, relay_name, mode)
+    return nil unless path && path[:relay] == relay_name && path[:transport_mode] == mode
+    relay = find_relay(path[:entry_relay] || relay_name)
+    inlet = nil
+    if mode == 'ss'
+      ip, port = path.values_at(:endpoint, :endpoint_port)
+      return nil unless ipv4?(ip) && port
+      extra = Array(relay['shadowsocks_extra_addr_in'])
+      authorized = extra.include?(ip) && port.to_i == EXTRA_SS_PORT
+      ranges = validated_port_ranges(@metadata.dig('wireguard', 'shadowsocks_port_ranges'), 'shadowsocks port ranges')
+      authorized ||= extra.empty? && relay['ipv4_addr_in'] == ip && ranges.any? { |low, high| port.to_i.between?(low, high) }
+      return nil unless authorized
+      inlet = [ip, port.to_i, path[:endpoint_kind]]
+    end
+    candidate = path[:entry_relay] ? { entry: path[:entry_relay], inlet: inlet } : inlet
+    { candidate: candidate }
+  rescue RuntimeError, ArgumentError
+    nil
+  end
+
+  def recovery_inlet_key(candidate)
+    entry = candidate.is_a?(Hash) ? candidate[:entry] : nil
+    inlet = candidate.is_a?(Hash) ? candidate[:inlet] : candidate
+    [entry, inlet&.first, inlet&.[](1)]
+  end
+
+  def recovery_wait(seconds)
+    target = monotonic_now + seconds
+    while monotonic_now < target
+      return false unless network_attempt_current? && !@stop_requested
+      sleep [target - monotonic_now, 0.1].min
+    end
+    true
+  end
+
+  def run_ordered_recovery(relay_name, reason:, expected_state: nil, original_path: nil, current_only: false, manual: false)
+    # Manual callers have already invalidated the old token, so its bounded
+    # attempt cleans up before the new owner starts. Automatic callers never queue.
+    request_epoch = Thread.current[:adapter_recovery_request_epoch] || @mutex.synchronize { @recovery_control_epoch }
+    return false unless manual ? @ordered_recovery_mutex.lock : @ordered_recovery_mutex.try_lock
+    previous = %i[adapter_recovery_token adapter_recovery_id adapter_recovery_deadline adapter_network_epoch adapter_recovery_inlet].to_h { |key| [key, Thread.current[key]] }
+    started = monotonic_now
+    ok = false
+    entered = false
+    begin
+      return false if !manual && ordered_recovery_blocked?
+      return false if @stop_requested || operation_cancelled? || local_network_paused? || action_conflicts?
+      current = @mutex.synchronize { @state.slice(:generation, :active_slot, :active_relay) }
+      return false if expected_state && expected_state != current
+      generation = current[:generation]
+      path = original_path
+      path = @mutex.synchronize { (@workers[current[:active_slot]] || @last_network_path || {}).dup } if !path || path.empty?
+      preference = current_transport_preference
+      mode = path[:transport_mode] || (preference == 'auto' ? 'ss' : preference)
+      token = @mutex.synchronize do
+        @recovery_control_epoch if !@recovery_stopped && request_epoch == @recovery_control_epoch
+      end
+      return false unless token
+      Thread.current[:adapter_recovery_token] = token
+      Thread.current[:adapter_network_epoch] = network_epoch
+      Thread.current[:adapter_recovery_id] = SecureRandom.uuid
+      Thread.current[:adapter_recovery_deadline] = started + @options[:ordered_recovery_budget]
+      entered = true
+      @last_auto_recovery_at = Time.now
+      @last_recovery_generation = generation
+      city = recovery_city(relay_name)
+      @mutex.synchronize do
+        return false unless token == @recovery_control_epoch && !@recovery_stopped
+        @metrics[:auto_recovery_attempts] += 1
+        @state[:health][:last_attempt_at] = Time.now.iso8601
+        @recovery_retry_at = nil
+        @state[:recovery] = { phase: 'original', running: true, attempt: 0, original_relay: relay_name,
+                              city: city, budget_seconds: @options[:ordered_recovery_budget],
+                              _started_mono: started, started_at: Time.now.iso8601 }
+      end
+      log_event('recovery-round-started', relay: relay_name, reason: reason, policy: 'original-ss-city', budget_seconds: @options[:ordered_recovery_budget])
+      inlets = recovery_inlets(relay_name, mode, path)
+      original = original_recovery_inlet(path, relay_name, mode)
+      primary = original ? original[:candidate] : inlets.first
+      # nil is the legitimate direct-transport candidate; SS nil is unavailable.
+      has_primary = original || !inlets.empty?
+      plan = has_primary ? (original ? [0, 1, 5] : [0]).each_with_index.map { |delay, index| [original ? 'original' : 'current_relay', relay_name, primary, delay, index + 1, 0] } : []
+      unless current_only
+        inlets.reject { |inlet| recovery_inlet_key(inlet) == recovery_inlet_key(primary) }.first(2).each_with_index do |inlet, index|
+          plan << ['alternate_ss', relay_name, inlet, 0, index + 1, 0]
+        end
+        recovery_relay_candidates(relay_name, preference: preference).first(4).each_with_index do |candidate, index|
+          recovery_inlets(candidate, mode).first(2).each_with_index do |inlet, inlet_index|
+            plan << ['same_city', candidate, inlet, 0, inlet_index + 1, index + 1]
+          end
+        end
+      end
+      plan.each_with_index do |(phase, relay, inlet, delay, inlet_index, city_index), plan_index|
+        break unless recovery_budget_remaining? && network_attempt_current?
+        break unless @mutex.synchronize { @state[:generation] == generation }
+        next_step = %w[original current_relay].include?(phase) ? '原入口最多 3 次 → 同节点最多 2 个备用 SS → 最多 4 个同城节点' : phase == 'alternate_ss' ? '备用入口仍失败，再试同城节点；每节点最多 2 个入口' : '继续下一个同城候选；不跨城，也不转为直连回落'
+        fields = { target_relay: relay, inlet_attempt: inlet_index, city_attempt: city_index,
+                   next_step: next_step, _retry_mono: delay.positive? ? monotonic_now + delay : nil }
+        endpoint = inlet.is_a?(Hash) ? inlet[:inlet] : inlet
+        fields.merge!(endpoint: endpoint&.first, endpoint_port: endpoint&.[](1), transport: mode)
+        recovery_progress(delay.positive? ? 'retry_wait' : phase, **fields,
+                          message: delay.positive? ? "上次已清理，等待 #{delay} 秒后重试原入口" : "正在验证 #{relay} 的#{phase == 'original' ? '原入口' : phase == 'current_relay' ? '当前官方入口（原入口已不可用）' : phase == 'alternate_ss' ? '备用 SS' : '同城入口'}")
+        break unless recovery_wait(delay) && recovery_budget_remaining? && network_attempt_current?
+        @mutex.synchronize { @state[:recovery][:attempt] += 1 }
+        recovery_progress(phase, _retry_mono: nil, message: "正在建立并验证 #{relay} · 第 #{inlet_index} 次入口尝试")
+        Thread.current[:adapter_recovery_inlet] = { relay: relay, mode: mode, candidate: inlet }
+        evidence = {}
+        expected = @mutex.synchronize { @state.slice(:generation, :active_slot, :active_relay) }
+        activation_reason = reason == 'network-resume' ? (relay == relay_name ? 'network-resume' : 'network-resume-fallback') : 'ordered-recovery'
+        ok = activate(relay, reason: activation_reason, transport_preference: preference, expected_state: expected, attempt_evidence: evidence)
+        break unless network_attempt_current?
+        if ok
+          ready = @mutex.synchronize { @state[:service_readiness] == 'ready' }
+          recovery_progress('restored', message: ready ? '连接已恢复，IP、DNS、HTTPS 已验证' : '数据通道已恢复；DNS或部分网页仍异常，保留当前节点复检', next_step: '继续监测当前连接；不再尝试其余候选')
+          break
+        end
+        if evidence[:local_failure] || !evidence[:attempted] || !evidence[:relay_failed]
+          log_event('recovery-local-deferred', relay: relay, phase: evidence[:local_failure] || 'candidate-not-started', reason: 'ordered-local-indeterminate')
+          recovery_progress('local_wait', message: '本机组件或槽位未就绪，暂停换节点', next_step: '清理完成后有限重试；这不计为节点失效')
+          break
+        end
+        if plan[plan_index + 1]&.[](1) != relay
+          quarantine_relay(relay, 'ordered-inlets-failed', 300)
+        end
+      end
+      unless ok || !network_attempt_current? || @mutex.synchronize { @state.dig(:recovery, :phase) == 'local_wait' }
+        recovery_progress('exhausted', message: monotonic_now >= Thread.current[:adapter_recovery_deadline] ? '本轮恢复预算已用完' : '本轮允许的入口与同城候选均未恢复连接',
+                          next_step: '冷却后再试一轮；也可手动重试原节点或选择同城候选。Mac 尚无链式保底')
+      end
+      ok
+    rescue LocalProbeTimeout => error
+      recovery_progress('local_wait', message: '本机组件等待超时，暂不继续换节点', next_step: '清理完成后再试；不记为远端节点失效') if entered
+      log_event('recovery-local-deferred', relay: relay_name, phase: error.phase, reason: 'ordered-local-indeterminate')
+      false
+    ensure
+      if entered
+        valid = network_attempt_current?
+        @mutex.synchronize do
+          @metrics[:auto_recovery_failures] += 1 unless ok || !valid || @state.dig(:recovery, :phase) == 'local_wait'
+          state = @state[:recovery]
+          state[:running] = false
+          state[:_finished_mono] = monotonic_now
+          unless valid
+            state[:phase] = @recovery_stopped ? 'stopped' : (@state[:local_network][:paused] ? 'waiting_network' : 'interrupted')
+            state[:message] = @recovery_stopped ? '自动恢复已停止，当前通道保留' : '环境或操作已变化，旧恢复结果已作废'
+            state[:next_step] = @recovery_stopped ? '可手动重试' : '本机联网稳定后先验证原路径；手动操作优先'
+          end
+          unless ok || @recovery_stopped
+            delay = state[:phase] == 'local_wait' ? @options[:local_network_interval] : @options[:recovery_cooldown]
+            @recovery_retry_at = monotonic_now + delay
+            state[:_retry_mono] = @recovery_retry_at
+          end
+          @last_disconnected_retry_at = Time.now
+        end
+        log_event('recovery-round-finished', restored: ok && valid, duration_ms: ((monotonic_now - started) * 1000).round,
+                  outcome: @mutex.synchronize { @state[:recovery][:phase] })
+      end
+      previous.each { |key, value| Thread.current[key] = value }
+      @ordered_recovery_mutex.unlock
+    end
+  end
+
   def with_recovery_budget(reason, relay, city: nil)
     started = monotonic_now
     previous_id = Thread.current[:adapter_recovery_id]
@@ -3176,7 +3229,7 @@ class MullvadAdapter
       info = locations[id] || {}
       relays = ranked_city_relays(id, 'auto')
       primary = current[:active_relay] if id == selected
-      backups = relays.reject { |r| r['hostname'] == primary }.first(2).map { |r| city_node_evidence(r['hostname']) }
+      backups = relays.reject { |r| r['hostname'] == primary }.first(4).map { |r| city_node_evidence(r['hostname']) }
       { id: id, country: info['country'], city: info['city'],
         relay_count: relays.length, primary: primary && city_node_evidence(primary, active: !!current[:active_slot]),
         backups: backups, maintenance_interval_seconds: id == selected ? 30 : 180 }
@@ -3194,7 +3247,7 @@ class MullvadAdapter
     favorites.each do |city|
       next if Time.now < (@city_maintenance_due[city] || Time.at(0))
       @city_maintenance_due[city] = Time.now + (city == selected ? 30 : 180)
-      relays = ranked_city_relays(city, 'auto').reject { |r| r['hostname'] == current[:active_relay] }.first(2)
+      relays = ranked_city_relays(city, 'auto').reject { |r| r['hostname'] == current[:active_relay] }.first(4)
       relays.each do |relay|
         break if @stop_requested || local_network_paused?
         mode = transport_candidates('auto', relay).first
@@ -3803,26 +3856,9 @@ class MullvadAdapter
       update_operation(message: '多个节点 DNS 同时失败，已暂停无效切换')
       return false
     end
-    if current[:active_slot].nil?
-      ok = activate_startup_with_fallback(
-        current[:active_relay] || load_persisted_relay || @options[:default_relay],
-        current_transport_preference, reason: 'startup-retry'
-      )
-    else
-      ok = false
-      recovery_relay_candidates(current[:active_relay]).each do |candidate|
-        evidence = {}
-        ok = activate(candidate, reason: 'health-recovery', transport_preference: current_transport_preference,
-                      attempt_evidence: evidence)
-        break if ok
-        if evidence[:local_failure]
-          log_event('recovery-local-deferred', relay: candidate, phase: evidence[:local_failure], reason: 'manual-repair')
-          return false
-        end
-        quarantine_relay(candidate, 'repair-candidate-failed', 60)
-        break if inner_dns_breaker_open?
-      end
-    end
+    return false if current[:relay_liveness] == 'pass' # DNS/service degradation is not a dead tunnel.
+    relay = current[:active_relay] || load_persisted_relay || @options[:default_relay]
+    ok = run_ordered_recovery(relay, reason: 'manual-repair', manual: true)
     diagnose_network
     ok
   end
@@ -3903,6 +3939,8 @@ class MullvadAdapter
       end
       modes = recent.sort_by { |_, at| -at.to_f }.map(&:first) + modes
     end
+    pinned = Thread.current[:adapter_recovery_inlet]
+    modes = [pinned[:mode]] if pinned && pinned[:relay] == relay['hostname']
     supported = modes.uniq.select { |mode| transport_supported?(relay, mode) }
     raise "relay #{relay['hostname']} supports none of requested transports #{modes.join(',')}" if supported.empty?
     supported
@@ -4078,7 +4116,7 @@ class MullvadAdapter
     FileUtils.rm_f(tmp) if defined?(tmp) && File.exist?(tmp)
   end
 
-  def ss_endpoint_candidates(relay)
+  def ss_endpoint_candidates(relay, include_cooling: false)
     relay_name = relay['hostname'].to_s
     extra = Array(relay['shadowsocks_extra_addr_in']).select { |ip| ipv4?(ip) }
     history = @ss_endpoint_mutex.synchronize do
@@ -4097,6 +4135,7 @@ class MullvadAdapter
                   end
       candidates = all_ports.map { |port| [relay.fetch('ipv4_addr_in'), port, 'relay-ipv4-random-port'] }
       ranked = rank_ss_endpoint_candidates(candidates, stats, relay_name)
+      return ranked.first(desired) if include_cooling
       available = ranked.reject { |candidate| endpoint_cooling_down?(endpoint_stats_for(stats, candidate[0], candidate[1])) }
       available = [ranked.min_by { |candidate| endpoint_retry_at(endpoint_stats_for(stats, candidate[0], candidate[1])) }] if available.empty?
       return available.compact.first(desired)
@@ -4120,6 +4159,7 @@ class MullvadAdapter
         original_order.fetch(ip, 9_999)
       ]
     end
+    return ranked.map { |ip| [ip, EXTRA_SS_PORT, 'extra-ss-ipv4'] } if include_cooling
     available = ranked.reject do |ip|
       endpoint_cooling_down?(endpoint_stats_for(stats, ip, EXTRA_SS_PORT))
     end
@@ -4245,6 +4285,8 @@ class MullvadAdapter
   end
 
   def endpoint_candidates_for_transport(relay, mode)
+    pinned = Thread.current[:adapter_recovery_inlet]
+    return [pinned[:candidate]] if pinned && pinned[:relay] == relay['hostname'] && pinned[:mode] == mode
     original = Thread.current[:adapter_resume_path]
     if original && original[:relay] == relay['hostname'] && original[:transport_mode] == mode
       inlet = [original[:endpoint], original[:endpoint_port], original[:endpoint_kind]] if mode == 'ss' && original[:endpoint_port]
@@ -4277,6 +4319,8 @@ class MullvadAdapter
   end
 
   def record_ss_endpoint_failure(relay_name, mode, ss_candidate, error)
+    # Ordered attempts score only actual data-canary outcomes, not local launch errors.
+    return if Thread.current[:adapter_recovery_token]
     return if error.is_a?(LocalNetworkInterrupted) || error.is_a?(LocalProbeTimeout) || !network_attempt_current?
     return unless mode.to_s == 'ss' && ss_candidate
     return if protection_profile[:multihop] || ss_candidate.is_a?(Hash)
@@ -4326,6 +4370,9 @@ class MullvadAdapter
       record_relay_history(result)
     end
     log_event('probe-result', relay: relay_name, transport: mode, source: source,
+              endpoint: route_worker&.dig(:endpoint), endpoint_port: route_worker&.dig(:endpoint_port),
+              interface: route_worker&.dig(:interface), generation: @mutex.synchronize { @state[:generation] },
+              network_epoch: network_epoch, worker_instance: route_worker&.dig(:instance_token),
               entry_relay: result[:entry_relay], multihop: result[:multihop] || false, post_quantum: result[:post_quantum] || false,
               duration_ms: canary[:duration_ms], **classification,
               ip: canary.dig(:ip_data, :status), dns: canary.dig(:inner_dns, :status),
@@ -4573,7 +4620,7 @@ class MullvadAdapter
   end
 
   def failure_recovery_reason?(reason)
-    %w[health-recovery worker-crash-recovery network-resume network-resume-fallback].include?(reason.to_s)
+    %w[health-recovery ordered-recovery worker-crash-recovery network-resume network-resume-fallback].include?(reason.to_s)
   end
 
   def retire_failed_path(slot, reason)
@@ -4662,7 +4709,7 @@ class MullvadAdapter
       old_mode ||= 'ss' if old_slot
 
       if old_slot && old_relay == relay_name
-        if %w[reconnect ss-endpoint-recovery protection-change network-resume].include?(reason)
+        if %w[reconnect ss-endpoint-recovery protection-change network-resume ordered-recovery].include?(reason)
           return restart_same_relay(old_slot, relay, preference, reason: reason, old_preference: old_preference, attempt_evidence: attempt_evidence)
         end
         if old_liveness != 'pass' || old_readiness != 'ready'
@@ -4805,6 +4852,10 @@ class MullvadAdapter
   rescue LocalNetworkInterrupted
     log_event('activation-paused-local-network', relay: relay_name, reason: reason)
     false
+  rescue LocalProbeTimeout => error
+    attempt_evidence[:local_failure] = error.phase if attempt_evidence
+    log_event('activation-local-deferred', relay: relay_name, phase: error.phase)
+    false
   rescue StandardError => e
     @mutex.synchronize { @metrics[:failed_switches] += 1 }
     record_error("activate #{relay_name} failed: #{e.class}: #{e.message}")
@@ -4918,7 +4969,7 @@ class MullvadAdapter
 
     raise LocalNetworkInterrupted unless network_attempt_current?
     @mutex.synchronize { @metrics[:failed_switches] += 1 }
-    if %w[ss-endpoint-recovery network-resume].include?(reason)
+    if Thread.current[:adapter_recovery_token] || %w[ss-endpoint-recovery network-resume].include?(reason)
       if local_probe_error
         update_state(status: 'degraded', active_slot: nil, active_transport: nil, active_transport_mode: nil,
                      transport_preference: old_preference, relay_liveness: 'unknown', service_readiness: 'degraded',
@@ -5021,6 +5072,8 @@ class MullvadAdapter
     city = worker_info[:location] || Array(@metadata&.dig('wireguard', 'relays')).find { |r| r['hostname'] == relay_name }&.dig('location')
     @mutex.synchronize do
       epoch = Thread.current[:adapter_network_epoch]
+      token = Thread.current[:adapter_recovery_token]
+      raise LocalNetworkInterrupted if token && token != @recovery_control_epoch
       raise LocalNetworkInterrupted if @state[:local_network][:paused] || (epoch && epoch != @state[:local_network][:epoch])
       # This rename is the policy commit point. The network observer uses this
       # same mutex: an outage is ordered either before the commit (reject, old
@@ -5031,6 +5084,11 @@ class MullvadAdapter
         File.rename(pending_profile, File.join(@state_dir, 'protection.json'))
         @protection_profile = profile
         @protection_error = nil
+      end
+      unless token
+        @state[:recovery] = { phase: 'idle', running: false, attempt: 0, budget_seconds: @options[:ordered_recovery_budget],
+                              message: '当前连接已建立；异常确认后再按顺序恢复',
+                              next_step: '原入口重试 → 备用 SS → 最多 4 个同城节点；Mac 尚无链式保底' }
       end
       @last_network_path = worker_info.slice(:relay, :transport_mode, :endpoint, :endpoint_port, :endpoint_kind, :entry_relay)
       unless %w[network-resume network-resume-original network-resume-fallback health-recovery worker-crash-recovery startup startup-retry].include?(reason)
@@ -5195,6 +5253,8 @@ class MullvadAdapter
       @state[:workers][slot] = public_worker_state(info).merge(state: 'candidate')
       @state[:updated_at] = Time.now.iso8601
     end
+    log_event('worker-path-started', **info.slice(:slot, :relay, :transport_mode, :endpoint, :endpoint_port, :endpoint_kind, :interface, :instance_token),
+              network_epoch: network_epoch)
     info
   end
 
@@ -5868,11 +5928,16 @@ class MullvadAdapter
       worker = @workers[slot]
       return false unless worker
       return false if expected_token && worker[:instance_token] != expected_token
-      @workers.delete(slot)
       worker
     end
 
-    stop_pid(info[:pid])
+    begin
+      stop_pid(info[:pid])
+    rescue SystemCallError => error
+      log_event('worker-cleanup-deferred', slot: slot, relay: info[:relay], error_class: error.class.name)
+      raise LocalProbeUnavailable, 'worker-cleanup'
+    end
+    @mutex.synchronize { @workers.delete(slot) if @workers[slot]&.dig(:instance_token) == info[:instance_token] }
     FileUtils.rm_f(File.join(slot_dir(slot), 'config.json'))
     @mutex.synchronize do
       if @worker_state_tokens[slot] == info[:instance_token]
@@ -6178,6 +6243,11 @@ class MullvadAdapter
       sleep 0.1
     end
     Process.kill('KILL', pid) if process_alive?(pid)
+    reap_deadline = monotonic_now + 2
+    while process_alive?(pid)
+      raise LocalProbeTimeout, 'worker-stop' if monotonic_now >= reap_deadline
+      sleep 0.05
+    end
   rescue Errno::ESRCH, Errno::ECHILD
     nil
   end
