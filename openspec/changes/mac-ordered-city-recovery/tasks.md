@@ -8,3 +8,6 @@
 - [ ] Separate local candidate/install/egress acceptance, if performed under deployment authorization. Do not mark policy simulation as live failover acceptance.
 
 OpenSpec Markdown change only; no CLI validation or archive has been run.
+
+- [x] MAC-REC-06: Preserve the health owner through resume probe errors and unexpected iteration errors; allow explicit retry through the resume activation contract and clear pending only after verified commit; avoid false preserved outcomes. Four isolated regression cases, no production fault injection.
+- [ ] Separate installed acceptance for MAC-REC-06; source tests do not restart an existing dead monitor.

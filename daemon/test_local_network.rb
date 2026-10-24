@@ -97,6 +97,75 @@ class MullvadLocalNetworkTest < Minitest::Test
     assert_equal 'original-path-recovered', @adapter.send(:snapshot).dig(:local_network, :outcome)
   end
 
+  def test_resume_probe_timeout_is_deferred_and_the_next_check_can_finish_recovery
+    calls = 0
+    @adapter.define_singleton_method(:run_readiness_canary) do |_slot|
+      calls += 1
+      raise MullvadAdapter::LocalProbeTimeout, 'ip-data' if calls == 1
+      good_canary
+    end
+    resume
+    assert @adapter.send(:local_network_recovery_pending?)
+    assert_equal 'local-repair', @adapter.send(:snapshot).dig(:local_network, :recovery_stage)
+    assert_empty @adapter.events
+    refute @adapter.send(:relay_quarantined?, 'one')
+    @adapter.instance_variable_set(:@network_recovery_retry_at, nil)
+    @adapter.send(:check_active_health_once)
+    refute @adapter.send(:local_network_recovery_pending?)
+    assert_equal 'original-path-recovered', @adapter.send(:snapshot).dig(:local_network, :outcome)
+  end
+
+  def test_manual_retry_round_can_rebuild_the_original_while_resume_is_pending
+    observe('unavailable')
+    observe('available')
+    assert @adapter.send(:local_network_recovery_pending?)
+    assert @adapter.send(:run_ordered_recovery, 'one', reason: 'retry-round', manual: true)
+    assert_equal 'restored', @adapter.send(:snapshot).dig(:recovery, :phase)
+    refute @adapter.send(:local_network_recovery_pending?)
+    assert_equal ['one'], @adapter.events.select { |event| event.first == :start }.map { |event| event[2] }
+  end
+
+  def test_health_monitor_continues_after_an_unexpected_iteration_error
+    checks = 0
+    @adapter.define_singleton_method(:wait_for_health_check) { |_| sleep 0.005 }
+    @adapter.define_singleton_method(:check_active_health_once) do
+      checks += 1
+      raise IOError, 'fixture-sensitive-message' if checks == 1
+      @stop_requested = true
+      nil
+    end
+    monitor = @adapter.send(:start_active_health_monitor)
+    monitor.report_on_exception = false
+    assert monitor.join(1), 'one observation error must not terminate or wedge the health owner'
+    assert_equal 2, checks
+    @adapter.instance_variable_get(:@probe_event_writer)&.join(1)
+    records = File.readlines(File.join(@dir, 'logs', 'events.jsonl')).map { |line| JSON.parse(line) }
+    error = records.find { |entry| entry['event'] == 'health-monitor-error' }
+    assert_equal 'IOError', error.fetch('error_class')
+    refute_includes JSON.generate(records), 'fixture-sensitive-message'
+  ensure
+    @adapter.instance_variable_set(:@stop_requested, true)
+    monitor&.kill if monitor&.alive?
+    begin
+      monitor&.join(1)
+    rescue IOError
+      nil
+    end
+  end
+
+  def test_failed_manual_selection_during_resume_cannot_claim_the_old_path_was_restored
+    observe('unavailable')
+    observe('available')
+    @adapter.define_singleton_method(:activate) { |*_, **_| false }
+    request = Object.new
+    def request.write(_text); end
+    @adapter.send(:accepted_async, request, 'two', 'select')
+    Timeout.timeout(1) { sleep 0.001 while @adapter.send(:action_pending?) }
+    assert_equal 'failed', @adapter.send(:snapshot).dig(:operation, :state)
+    assert @adapter.send(:local_network_recovery_pending?)
+    assert_equal 'one', @adapter.send(:snapshot)[:active_relay]
+  end
+
   def test_original_endpoint_is_rebuilt_first_and_no_alternate_is_used_on_success
     probes = 0
     @adapter.define_singleton_method(:run_readiness_canary) do |slot|

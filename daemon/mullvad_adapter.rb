@@ -127,7 +127,7 @@ class MullvadAdapter
   TRANSPORT_PREFERENCES = (%w[auto] + TRANSPORT_MODES).freeze
   AUTO_TRANSPORT_ORDER = %w[ss ipv6 ipv4].freeze
   DEFAULT_TRANSPORT_PREFERENCE = 'ss'
-  BUILD_ID = '20261023-audit-reliability-1'
+  BUILD_ID = '20261024-resume-health-owner-1'
   SOURCE_SHA256 = Digest::SHA256.file(__FILE__).hexdigest
   STATUS_PUBLICATION_INTERVAL = 1.0
   STATUS_PUBLICATION_MAX_AGE = 3.0
@@ -1632,7 +1632,8 @@ class MullvadAdapter
                     'recovered'
                   elsif ok
                     'succeeded'
-                  elsif reason != 'speedtest' && current[:active_slot] && current[:relay_liveness] == 'pass'
+                  elsif reason != 'speedtest' && current[:active_slot] && current[:relay_liveness] == 'pass' &&
+                        !current.dig(:local_network, :paused) && !current.dig(:local_network, :recovery_pending)
                     'preserved'
                   else
                     'failed'
@@ -2675,6 +2676,16 @@ class MullvadAdapter
     ready = ok && @mutex.synchronize { @state[:service_readiness] == 'ready' }
     finish_local_network_recovery(epoch, restored: ready, outcome: ok ? (ready ? 'validated-rebuild' : 'original-rebuild-live-partial') : 'same-city-exhausted')
 
+  rescue LocalProbeTimeout => error
+    # Resume verification runs before the ordinary health-check rescue. Keep
+    # the owner alive and the original path reserved on a local observation
+    # failure; a later iteration must be able to finish the same epoch.
+    if epoch && network_epoch_current?(epoch)
+      defer_local_network_recovery(local_failure: error.phase)
+    end
+    log_probe_event('network-resume-probe-deferred', phase: error.phase, epoch: epoch,
+                    reason: 'local-observation-not-relay-failure')
+    nil
   ensure
     Thread.current[:adapter_resume_path] = previous_path if defined?(previous_path)
   end
@@ -2682,7 +2693,7 @@ class MullvadAdapter
   def defer_local_network_recovery(evidence)
     @network_recovery_retry_at = monotonic_now + @options[:local_network_interval]
     @mutex.synchronize { @state[:local_network][:recovery_stage] = 'local-repair' }
-    log_event('local-network-recovery-deferred', detail: '没有节点数据面失败证据，等待本机组件／槽位恢复', evidence: evidence)
+    log_probe_event('local-network-recovery-deferred', detail: '没有节点数据面失败证据，等待本机组件／槽位恢复', evidence: evidence)
     nil
   end
 
@@ -2744,14 +2755,27 @@ class MullvadAdapter
   end
 
   def start_active_health_monitor
-    Thread.new do
+    return @active_health_monitor if @active_health_monitor&.alive?
+    @active_health_monitor = Thread.new do
+      Thread.current.name = 'adapter-active-health'
       retry_wait = nil
+      log_probe_event('health-monitor-started')
       until @stop_requested
-        wait_for_health_check(retry_wait)
-        break if @stop_requested
-        result = action_pending? ? :retry : check_active_health_once
-        retry_wait = result == :retry ? 0.25 : nil
+        begin
+          wait_for_health_check(retry_wait)
+          break if @stop_requested
+          result = action_pending? ? :retry : check_active_health_once
+          retry_wait = result == :retry ? 0.25 : nil
+        rescue StandardError => error
+          # Protect the entire iteration, including network-resume work and
+          # wait/admission code outside check_active_health_once's inner rescue.
+          log_probe_event('health-monitor-error', error_class: error.class.name,
+                          phase: error.respond_to?(:phase) ? error.phase : nil)
+          retry_wait = [@options[:local_network_interval], 0.25].max
+        end
       end
+    ensure
+      log_probe_event('health-monitor-stopped', reason: @stop_requested ? 'shutdown' : 'unexpected-exit')
     end
   end
 
@@ -3220,11 +3244,16 @@ class MullvadAdapter
         Thread.current[:adapter_recovery_inlet] = { relay: relay, mode: mode, candidate: inlet }
         evidence = {}
         expected = @mutex.synchronize { @state.slice(:generation, :active_slot, :active_relay) }
-        activation_reason = reason == 'network-resume' ? (relay == relay_name ? 'network-resume' : 'network-resume-fallback') : 'ordered-recovery'
+        resuming = reason == 'network-resume' || (manual && local_network_recovery_pending?)
+        activation_reason = resuming ? (relay == relay_name ? 'network-resume' : 'network-resume-fallback') : 'ordered-recovery'
         ok = activate(relay, reason: activation_reason, transport_preference: preference, expected_state: expected, attempt_evidence: evidence)
         break unless network_attempt_current?
         if ok
           ready = @mutex.synchronize { @state[:service_readiness] == 'ready' }
+          if manual && resuming
+            finish_local_network_recovery(Thread.current[:adapter_network_epoch], restored: ready,
+                                          outcome: ready ? 'manual-validated-rebuild' : 'manual-rebuild-live-partial')
+          end
           recovery_progress('restored', message: ready ? '连接已恢复，IP、DNS、HTTPS 已验证' : '数据通道已恢复；DNS或部分网页仍异常，保留当前节点复检', next_step: '继续监测当前连接；不再尝试其余候选')
           break
         end

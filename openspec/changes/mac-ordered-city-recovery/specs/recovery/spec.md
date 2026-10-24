@@ -16,3 +16,9 @@ WHEN recovery progresses, THEN the home page shows the phase, actual target/inle
 WHEN a worker starts or a canary completes, THEN log an allowlist of relay, actual inlet/port/interface, instance token, network epoch and per-phase probe evidence under existing bounded rotation. Hardware active-interface set changes are recorded without treating an available-to-available notification as physical disconnection. No private identity, account, configuration or application traffic contents enter these new events.
 
 Deterministic tests prove policy/state behavior only. Installed egress, interruption timing and sustained stability are separate acceptance evidence; historical failures without per-attempt path/packet evidence remain unresolved.
+
+## MAC-REC-06 Resume-owner liveness and explicit retries
+
+WHEN original-path verification after attachment recovery raises a local probe timeout/unavailable result, THEN keep the network recovery pending, defer by the existing local interval, and keep the health owner running. No negative relay sample or extra worker may be created solely from that exception. A later successful original-path verification must finish the same network epoch. The complete monitor iteration, including wait/admission and resume work, catches ordinary errors, logs an allowlisted error class/phase and waits before retrying; monitor start/stop events expose owner lifecycle without signaling engines.
+
+WHEN an authenticated manual retry-current/retry-round runs while network recovery is pending, THEN it uses the authorized resume activation path rather than being rejected by the generic automatic-recovery guard. Existing physical-offline, token, epoch, generation, same-city and peer-ownership fences still apply. A verified successful manual rebuild finishes that epoch's resume state. A failed selection must not claim an old unverified/resume-pending path was restored merely because its earlier liveness value was pass.
