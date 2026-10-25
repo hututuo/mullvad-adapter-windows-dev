@@ -29,7 +29,9 @@ enum DiagnosticReportExporter {
 
     static func diagnosticLogURLs(home: URL) -> [URL] {
         let logs = home.appendingPathComponent("Library/Logs/MullvadLocalAdapter")
-        return ["events.jsonl.1", "events.jsonl", "ui-status.jsonl.1", "ui-status.jsonl", "daemon.err.log"]
+        return ["events.jsonl.1", "events.jsonl", "ui-status.jsonl.1", "ui-status.jsonl", "daemon.err.log",
+                "flight-recorder.jsonl.1", "flight-recorder.jsonl",
+                "flight-incident.previous.json", "flight-incident.json"]
             .map { logs.appendingPathComponent($0) }
             + [home.appendingPathComponent("Library/Logs/MullvadFailOpen/watchdog.log")]
     }

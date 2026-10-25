@@ -40,6 +40,36 @@ Actions手动运行`checks-and-candidate`：先Ruby/Swift/PQ组件检查，再as
 
 ## 本机状态读取与界面日志
 
+### 自动离线取证
+
+`scripts/diagnostics/offline_flight_recorder.rb` 是独立于适配器恢复线程的本机记录服务。
+经部署授权运行 `ruby scripts/install-flight-recorder.rb --install --backup-dir NEW_DIRECTORY`：
+仅安装用户级 `local.mullvad.adapter.flight-recorder` LaunchAgent，不重启适配器或Clash；
+登录后自行启动、异常退出由launchd重启。回退用同脚本 `--rollback BACKUP_DIRECTORY`，
+校验已安装文件与备份摘要，只移除/恢复该记录器，保留日志。它不是定时外网测速。
+
+服务读取缓存状态、本机listener PID，以及nettop的物理接口UDP累计字节；后者排除lo0，
+是该worker/接口的UDP总量，不是WG解密后流量，也不能凭收发字节判网站可用。
+本机状态接口不可用时继续观察先前已识别的进程，并明确标记状态来源过期。
+每个worker最多一条仅本机 `/logs?level=debug` 的流式GET，只保留固定握手/keepalive事件计数。
+不修改内核全局日志级别、不保存原始debug消息或配置；原始WG trace可能包含私钥，禁止直接落盘。
+参考现用内核对应的[Mihomo v1.19.32日志路由](https://github.com/MetaCubeX/mihomo/blob/v1.19.32/log/log.go)
+与[流式日志接口](https://github.com/MetaCubeX/mihomo/blob/v1.19.32/hub/route/server.go)。
+`Received handshake response` 已经过响应认证，但仍早于session key派生完成；需结合派生失败事件、
+实际收发和已有canary。发送握手日志是发送意图，不能取代外层发包证据。
+
+默认约2秒读取本机状态/计数，健康时每30秒落一条摘要、异常时每轮落盘；
+`flight-recorder.jsonl` 及 `.1` 合计不超过4,000,000字节。
+`flight-incident.json` 保存故障开始及之前少量样本，并更新最新状态/恢复时刻；
+上次故障保留为 `flight-incident.previous.json`，每份最多65,536字节。
+因此故障开始证据不会随着同一次长故障的滚动日志消失；仅保留最近两次故障快照。
+新版“复制诊断”同时读取这些文件，离线也可导出。安装记录器不等于已更新现用UI导出列表。
+
+日志流没有历史重放，接入前的握手、切换时短暂观察缺口及内核队列丢弃不可反推；
+记录coverage/since、未知计数和读取错误，禁止将unknown当作零收发。
+记录器不持有流量处理锁，磁盘或观测失败不能触发重建/换节点。
+可用 `--seconds 65 --log-dir PRIVATE_TRIAL_DIR` 做有界被动验证；禁止为测试主动断网或重建生产通道。
+
 后台流量观测使用不排队的互斥门：健康检查、本地入口验证、城市维护和独立Clash路径验证不会同时批量运行。入口默认30秒；首次健康失败后的快速复测保留。城市维护每5秒最多一个ICMP、只在主通道ready时执行；ICMP本地超时标unknown并继续轮转，不能据此判节点失效。自动恢复连续耗尽后轮间等待默认30/60/120/120秒，原入口→备用SS→同城节点的首轮预算不变，手动重试可立即触发。官方目录自动更新每轮只发一次，失败退避至最多5分钟；成功后恢复正常TTL。手动刷新和显式测速独立，不宣称任何频率保证不会被第三方限流。
 
 失败探测新增 `worker-failure-evidence`：重建前读取内核日志末16KiB，仅保存错误类别计数及关联worker/入口，不复制业务域名或消息正文。当前内核控制接口未提供WG握手时间及外层UDP计数，日志明确标unknown；不能用内层DNS/TCP超时倒推出SS端口被封。

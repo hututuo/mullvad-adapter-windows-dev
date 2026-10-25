@@ -14,3 +14,7 @@ OpenSpec Markdown change only; no CLI validation or archive has been run.
 
 - [x] MAC-REC-07: paced background observations and automatic catalogue requests, isolated candidate timeout, exhausted-round backoff, fresh-success state reconciliation, bounded failure summary and passive SS/WG decoder. Deterministic daemon suite: 313 tests / 2551 assertions. Protocol fixtures are synthetic, not live tunnel acceptance.
 - [ ] MAC-REC-07 installed acceptance and live passive packet acceptance; capture requires host permission. No historical missing packet evidence can be reconstructed by new instrumentation.
+
+- [x] MAC-REC-08: independent local recorder, strict WG event allowlist, physical-interface UDP counters, stale-status continuity, bounded first/latest incident snapshots and singleton loop. Eight isolated tests / 37 assertions; diagnostic exporter StatusReadTests 20 passed without live window tests.
+- [x] Separate recorder-only deployment/readback: natural handshake initiation and authenticated response plus physical UDP RX/TX observed; existing adapter/core PIDs unchanged. This is observation acceptance, not a new outage/recovery test or installation of MAC-REC-07 daemon changes.
+- [ ] Future natural outage evidence and actual login/reboot restart acceptance; no sleep, forced disconnection or reboot performed.

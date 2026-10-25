@@ -351,6 +351,8 @@ final class StatusReadTests: XCTestCase {
         let urls = DiagnosticReportExporter.diagnosticLogURLs(home: directory).map(\.lastPathComponent)
         XCTAssertTrue(urls.contains("ui-status.jsonl"))
         XCTAssertTrue(urls.contains("ui-status.jsonl.1"))
+        XCTAssertTrue(urls.contains("flight-recorder.jsonl"))
+        XCTAssertTrue(urls.contains("flight-recorder.jsonl.1"))
     }
 
     func testLoggerRefusesSymlinkWithoutWritingTarget() throws {

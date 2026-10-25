@@ -20,6 +20,7 @@ files = [
   'scripts/mac-launch-agent-policy.rb',
   'scripts/diagnostics/ss_wg_observer.rb',
   'scripts/diagnostics/observe_ss_wg.rb',
+  'scripts/diagnostics/offline_flight_recorder.rb',
   'mullvad-fail-open-watchdog', # test_watchdog.rb invokes it with a fake CLI, disarmed.
   'core/crates/probe/fixtures/dns-canary.json',
   'core/crates/catalogue/fixtures/relay-contract.json',
