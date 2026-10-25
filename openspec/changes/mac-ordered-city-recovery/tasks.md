@@ -11,3 +11,6 @@ OpenSpec Markdown change only; no CLI validation or archive has been run.
 
 - [x] MAC-REC-06: Preserve the health owner through resume probe errors and unexpected iteration errors; allow explicit retry through the resume activation contract and clear pending only after verified commit; avoid false preserved outcomes. Four isolated regression cases, no production fault injection.
 - [ ] Separate installed acceptance for MAC-REC-06; source tests do not restart an existing dead monitor.
+
+- [x] MAC-REC-07: paced background observations and automatic catalogue requests, isolated candidate timeout, exhausted-round backoff, fresh-success state reconciliation, bounded failure summary and passive SS/WG decoder. Deterministic daemon suite: 313 tests / 2551 assertions. Protocol fixtures are synthetic, not live tunnel acceptance.
+- [ ] MAC-REC-07 installed acceptance and live passive packet acceptance; capture requires host permission. No historical missing packet evidence can be reconstructed by new instrumentation.

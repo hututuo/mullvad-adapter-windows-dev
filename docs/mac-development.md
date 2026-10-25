@@ -40,6 +40,20 @@ Actions手动运行`checks-and-candidate`：先Ruby/Swift/PQ组件检查，再as
 
 ## 本机状态读取与界面日志
 
+后台流量观测使用不排队的互斥门：健康检查、本地入口验证、城市维护和独立Clash路径验证不会同时批量运行。入口默认30秒；首次健康失败后的快速复测保留。城市维护每5秒最多一个ICMP、只在主通道ready时执行；ICMP本地超时标unknown并继续轮转，不能据此判节点失效。自动恢复连续耗尽后轮间等待默认30/60/120/120秒，原入口→备用SS→同城节点的首轮预算不变，手动重试可立即触发。官方目录自动更新每轮只发一次，失败退避至最多5分钟；成功后恢复正常TTL。手动刷新和显式测速独立，不宣称任何频率保证不会被第三方限流。
+
+失败探测新增 `worker-failure-evidence`：重建前读取内核日志末16KiB，仅保存错误类别计数及关联worker/入口，不复制业务域名或消息正文。当前内核控制接口未提供WG握手时间及外层UDP计数，日志明确标unknown；不能用内层DNS/TCP超时倒推出SS端口被封。
+
+需要进一步取证时，使用[被动SS/WG工具](../scripts/diagnostics/observe_ss_wg.rb)：
+
+```sh
+ruby scripts/diagnostics/observe_ss_wg.rb --config "$ACTIVE_SLOT_CONFIG" --interface "$PHYSICAL_INTERFACE" --seconds 30
+```
+
+先从本机 `/status` 确认active_slot及对应生成配置，禁止硬编码开发者的槽位/网卡/SS地址。工具仅支持该配置中的aes-256-gcm、IPv4 UDP、Ethernet经典PCAP；本机tcpdump需要已有抓包权限，工具不提权、不更改BPF权限。权限失败不是零回包证据。抓包过滤精确SS地址端口、最长120秒，仅在内存中处理并输出数字计数；不保存PCAP、私钥、密码或流量正文，不主动发包，也不打断通道。若自然发生切换须重新确认路径，旧端点统计不能套到新通道。已有合法捕获可用 `--pcap FILE` 代替 `--interface` 离线分析。
+
+依据[SS AEAD协议](https://shadowsocks.org/doc/aead.html)验证SS封装，再按[WireGuard消息格式](https://www.wireguard.com/protocol/)区分握手发起/回应/cookie/加密数据计数。只解SS外层、不解WG业务内容。只有发包可定位到“此捕获窗口未见该入口回包”；收到可认证SS中的WG握手形状不等于客户端接受握手。没有自然重握手时零握手计数正常；仍须结合真实数据面和时间窗判断。
+
 就绪验证保留隧道IP、DNS、HTTPS检查；外层ICMP并行采样供界面参考，未及时完成时不阻塞就绪结论。完整测速仍保留ICMP检查。事件携带实际后台源码的SHA256，避免仅凭历史固定 `build` 标签混淆已安装版本。
 
 短命探测命令（lsof监听归属、配置验证、ping、curl）由父进程按单调时钟限制等待，双流并行读取、各保留最多64KiB，超时/取消只结束本次探测拥有的进程组。控制器等待把监听归属检查计入总预算，本机HTTP禁止隐式重试。readiness/full canary分别有24/34秒汇总预算及有界清理；本地执行超时独立记为不确定，不能作为节点/SS失效样本。日志记录 `local-command-timeout`、`health-local-deferred`、`recovery-local-deferred` 和数值阶段耗时，区分父进程等待与curl自报耗时。本地spawn/pipe系统错误用`local-command-unavailable`

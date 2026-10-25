@@ -27,6 +27,16 @@ class MullvadRuntimeDeadlineTest < Minitest::Test
     @adapter.instance_variable_get(:@probe_event_writer)&.join(1)
   end
 
+  # Capture ownership at spawn, not through a child-written file. Under load
+  # the deadline can correctly kill Ruby before its interpreter runs the script.
+  def run_tracked_child(script, timeout:, phase: 'fixture')
+    spawn = Process.method(:spawn)
+    Process.stub(:spawn, lambda { |*args, **options| @fixture_child_pid = spawn.call(*args, **options) }) do
+      @adapter.send(:capture_probe_command, RbConfig.ruby, '-e', script,
+                    timeout_seconds: timeout, phase: phase)
+    end
+  end
+
   def test_probe_timeout_and_owned_child_cleanup_do_not_wait_for_the_log_mutex
     path = File.join(@dir, 'blocked-log-child')
     mutex = @adapter.instance_variable_get(:@log_mutex)
@@ -34,9 +44,8 @@ class MullvadRuntimeDeadlineTest < Minitest::Test
     started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     runner = Thread.new do
       begin
-        @adapter.send(:capture_probe_command, RbConfig.ruby, '-e',
-                      "File.write(#{path.dump}, Process.pid); sleep 30",
-                      timeout_seconds: 0.2, phase: 'blocked-log')
+        run_tracked_child("File.write(#{path.dump}, Process.pid); sleep 30",
+                          timeout: 0.2, phase: 'blocked-log')
       rescue MullvadAdapter::LocalProbeTimeout => error
         error
       end
@@ -46,7 +55,7 @@ class MullvadRuntimeDeadlineTest < Minitest::Test
     assert_kind_of MullvadAdapter::LocalProbeTimeout, error
     assert_equal 'blocked-log', error.phase
     assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 0.8
-    pid = File.read(path).to_i
+    pid = @fixture_child_pid
     assert_raises(Errno::ESRCH) { Process.kill(0, pid) }
     assert_raises(Errno::ECHILD) { Process.waitpid(pid, Process::WNOHANG) }
     mutex.unlock
@@ -138,11 +147,11 @@ class MullvadRuntimeDeadlineTest < Minitest::Test
     path = File.join(@dir, 'child-pid')
     started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     error = assert_raises(MullvadAdapter::LocalProbeTimeout) do
-      run_child("File.write(#{path.dump}, Process.pid); trap('TERM') {}; sleep 30", timeout: 0.25)
+      run_tracked_child("File.write(#{path.dump}, Process.pid); trap('TERM') {}; sleep 30", timeout: 0.25)
     end
     assert_equal 'fixture', error.phase
     assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 1
-    pid = File.read(path).to_i
+    pid = @fixture_child_pid
     assert_raises(Errno::ESRCH) { Process.kill(0, pid) }
     assert_raises(Errno::ECHILD) { Process.waitpid(pid, Process::WNOHANG) }
     event = JSON.parse(persisted_probe_events.last)
@@ -170,11 +179,11 @@ class MullvadRuntimeDeadlineTest < Minitest::Test
     end
     Process.stub(:kill, denied_group) do
       error = assert_raises(MullvadAdapter::LocalProbeTimeout) do
-        run_child("File.write(#{path.dump}, Process.pid); sleep 30", timeout: 0.25)
+        run_tracked_child("File.write(#{path.dump}, Process.pid); sleep 30", timeout: 0.25)
       end
       assert_equal 'fixture', error.phase
     end
-    pid = File.read(path).to_i
+    pid = @fixture_child_pid
     assert_equal [['KILL', -pid], ['KILL', pid]], signals
     assert_raises(Errno::ESRCH) { kill.call(0, pid) }
     assert_raises(Errno::ECHILD) { Process.waitpid(pid, Process::WNOHANG) }

@@ -367,7 +367,10 @@ class MullvadCityRecoveryTest < Minitest::Test
     assert_equal ['one'], attempted
     assert_nil Thread.current[:adapter_recovery_deadline]
     assert_equal 'data_fail', @adapter.send(:snapshot)[:service_readiness]
-    assert_equal 'recovery-round-finished', event_log.last['event']
+    # Probe diagnostics are written asynchronously and may arrive after the
+    # synchronous round marker; their arrival order is not the round outcome.
+    rounds = event_log.select { |event| event['event'].start_with?('recovery-round-') }
+    assert_equal 'recovery-round-finished', rounds.last['event']
   end
 
   def test_health_round_retries_original_then_only_bounded_same_city_nodes

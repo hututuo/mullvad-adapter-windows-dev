@@ -158,7 +158,9 @@ class MullvadStatusPublicationTest < Minitest::Test
     3.times { tick = bounded_call { @adapter.send(:publish_status_tick, tick) } }
     assert_same stale, publication
     lock.unlock
-    assert @adapter.instance_variable_get(:@probe_event_writer)&.join(1)
+    writer = @adapter.instance_variable_get(:@probe_event_writer)
+    writer&.join(1)
+    refute writer&.alive?, 'queued diagnostic must finish; nil means it already drained'
     events = File.readlines(File.join(@dir, 'logs', 'events.jsonl')).map { |line| JSON.parse(line) }
     assert_equal 1, events.length
     assert_equal 'status-publication-delayed', events.first['event']

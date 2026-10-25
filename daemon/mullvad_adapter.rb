@@ -127,7 +127,7 @@ class MullvadAdapter
   TRANSPORT_PREFERENCES = (%w[auto] + TRANSPORT_MODES).freeze
   AUTO_TRANSPORT_ORDER = %w[ss ipv6 ipv4].freeze
   DEFAULT_TRANSPORT_PREFERENCE = 'ss'
-  BUILD_ID = '20261024-resume-health-owner-1'
+  BUILD_ID = '20261025-probe-pacing-evidence-1'
   SOURCE_SHA256 = Digest::SHA256.file(__FILE__).hexdigest
   STATUS_PUBLICATION_INTERVAL = 1.0
   STATUS_PUBLICATION_MAX_AGE = 3.0
@@ -167,7 +167,7 @@ class MullvadAdapter
     local_network_settle: 2,
     clash_socket: "/var/run/clash-verge-service/users/#{Process.uid}/verge-mihomo.sock",
     supervisor_interval: 5,
-    front_data_probe_interval: 10,
+    front_data_probe_interval: 30,
     recovery_quarantine: 900
   }.freeze
 
@@ -209,6 +209,8 @@ class MullvadAdapter
     @mutex = Mutex.new
     @switch_mutex = Mutex.new
     @ordered_recovery_mutex = Mutex.new
+    @background_probe_mutex = Mutex.new
+    @automatic_exhausted_rounds = 0
     @recovery_control_epoch = 0
     @recovery_stopped = false
     @speed_test_mutex = Mutex.new
@@ -2242,7 +2244,22 @@ class MullvadAdapter
     end
   end
 
+  # Background observers do not queue or pile up while another observation is
+  # in flight. The lifecycle lock and status publication remain independent.
+  def with_background_probe
+    acquired = @background_probe_mutex.try_lock
+    return :retry unless acquired
+    yield
+  ensure
+    @background_probe_mutex.unlock if acquired
+  end
+
   def supervise_front_data_path(active_slot, active_worker)
+    return if action_pending? || @ordered_recovery_mutex.locked?
+    with_background_probe { observe_front_data_path(active_slot, active_worker) }
+  end
+
+  def observe_front_data_path(active_slot, active_worker)
     return if local_network_paused? || local_network_recovery_pending?
     now = Time.now
     return if (now - @last_front_data_probe_at) < @options[:front_data_probe_interval].to_i
@@ -2423,22 +2440,13 @@ class MullvadAdapter
 
   def start_control_plane_monitor
     Thread.new do
-      last_full_refresh = Time.at(0)
       until @stop_requested
         begin
           if local_network_paused?
             sleep 1
             next
           end
-          now = Time.now
-          metadata_state = @mutex.synchronize { @state[:metadata].dup }
-          stale = @metadata_fetched_at.nil? || (now - @metadata_fetched_at) >= @options[:metadata_ttl]
-          if @metadata.nil? || metadata_state[:live] != true || stale || (now - last_full_refresh) >= @options[:metadata_ttl]
-            refresh_metadata(force: true)
-            last_full_refresh = Time.now
-          else
-            check_clash_global_path
-          end
+          observe_control_plane_once
 
           # Reconnection belongs to the runtime supervisor; metadata requests
           # must never delay recovery of a disconnected data path.
@@ -2450,6 +2458,25 @@ class MullvadAdapter
           sleep 1
         end
       end
+    end
+  end
+
+  def observe_control_plane_once
+    metadata_state = @mutex.synchronize { @state[:metadata].dup }
+    stale = @metadata_fetched_at.nil? || (Time.now - @metadata_fetched_at) >= @options[:metadata_ttl]
+    if @metadata.nil? || metadata_state[:live] != true || stale
+      return if monotonic_now < (@metadata_background_retry_at || 0)
+      begin
+        refresh_metadata(force: true, background: true)
+      ensure
+        live = @mutex.synchronize { @state.dig(:metadata, :live) == true }
+        @metadata_background_failures = live ? 0 : (@metadata_background_failures || 0) + 1
+        delay = live ? 0 : [30 * (2**[[@metadata_background_failures - 1, 0].max, 4].min), 300].min
+        @metadata_background_retry_at = monotonic_now + delay
+      end
+    else
+      return if action_pending? || @ordered_recovery_mutex.locked? || ordered_recovery_blocked?
+      with_background_probe { check_clash_global_path }
     end
   end
 
@@ -2541,6 +2568,7 @@ class MullvadAdapter
       if status == 'unavailable'
         if !was_paused || @local_network_settle_until.positive?
           local[:epoch] += 1
+          @automatic_exhausted_rounds = 0
           worker = @workers[@state[:active_slot]]
           @network_resume_path = (worker || @last_network_path || {}).slice(:relay, :transport_mode, :endpoint, :endpoint_port, :endpoint_kind, :entry_relay)
           @network_resume_path[:relay] ||= @state[:active_relay]
@@ -2615,6 +2643,15 @@ class MullvadAdapter
         wake_health_monitor('local-network-resume-pending') if !local_network_paused? && local_network_recovery_pending?
       end
     end
+  end
+
+  def reconcile_validated_local_recovery(classification, at)
+    return unless classification[:service_readiness] == 'ready'
+    @automatic_exhausted_rounds = 0
+    local = @state[:local_network]
+    return if local[:paused] || local[:recovery_pending]
+    return unless %w[failed degraded local-repair].include?(local[:recovery_stage])
+    local.merge!(recovery_stage: 'restored', outcome: 'subsequent-path-validated', recovery_finished_at: at)
   end
 
   def finish_local_network_recovery(epoch, restored:, outcome:)
@@ -2764,7 +2801,7 @@ class MullvadAdapter
         begin
           wait_for_health_check(retry_wait)
           break if @stop_requested
-          result = action_pending? ? :retry : check_active_health_once
+          result = with_background_probe { action_pending? ? :retry : check_active_health_once }
           retry_wait = result == :retry ? 0.25 : nil
         rescue StandardError => error
           # Protect the entire iteration, including network-resume work and
@@ -2822,6 +2859,7 @@ class MullvadAdapter
       expected_generation = generation
       expected_slot = slot
       @mutex.synchronize do
+        reconcile_validated_local_recovery(classification, now.iso8601)
         @metrics[:health_checks] += 1
         @state[:last_canary] = canary
         @state[:dns][:inner] = canary[:inner_dns]
@@ -3289,7 +3327,16 @@ class MullvadAdapter
             state[:next_step] = @recovery_stopped ? '可手动重试' : '本机联网稳定后先验证原路径；手动操作优先'
           end
           unless ok || @recovery_stopped || !valid
-            delay = state[:phase] == 'local_wait' ? @options[:local_network_interval] : @options[:recovery_cooldown]
+            if state[:phase] == 'exhausted'
+              @automatic_exhausted_rounds += 1 unless manual
+              base = [@options[:recovery_cooldown].to_f, 1].max
+              delay = [base * (2**[[@automatic_exhausted_rounds - 1, 0].max, 2].min), [base, 120].max].min
+              state[:exhausted_rounds] = @automatic_exhausted_rounds
+              state[:retry_delay_seconds] = delay
+              state[:next_step] = "多入口共同失败，#{delay.ceil} 秒后再试；手动重试仍可立即开始"
+            else
+              delay = state[:phase] == 'local_wait' ? @options[:local_network_interval] : @options[:recovery_cooldown]
+            end
             @recovery_retry_at = monotonic_now + delay
             state[:_retry_mono] = @recovery_retry_at
           end
@@ -3366,26 +3413,43 @@ class MullvadAdapter
   end
 
   def maintain_city_candidates_once
+    return if action_pending? || @ordered_recovery_mutex.locked? || ordered_recovery_blocked?
     return if local_network_paused? || local_network_recovery_pending?
-    epoch = network_epoch
-    favorites, selected = @city_mutex.synchronize { [@favorite_cities.dup, @selected_city] }
+    with_background_probe { maintain_one_city_candidate }
+  end
+
+  def maintain_one_city_candidate
     current = snapshot
-    @city_maintenance_due ||= {}
-    favorites.each do |city|
-      next if Time.now < (@city_maintenance_due[city] || Time.at(0))
-      @city_maintenance_due[city] = Time.now + (city == selected ? 30 : 180)
-      relays = ranked_city_relays(city, 'auto').reject { |r| r['hostname'] == current[:active_relay] }.first(4)
-      relays.each do |relay|
-        break if @stop_requested || local_network_paused?
-        mode = transport_candidates('auto', relay).first
-        endpoint = quick_ping_targets(relay).dig(mode, :target)
-        next unless endpoint
-        result = outer_ping_test(endpoint, 1_000)
-        return unless network_epoch_current?(epoch)
-        @city_mutex.synchronize { @city_probes[relay['hostname']] = result.merge(transport: mode, checked_at: Time.now.iso8601) }
-        log_event('city-candidate-outer-probe', relay: relay['hostname'], city: city, transport: mode, result: result)
-      end
+    return unless current[:active_slot] && current[:service_readiness] == 'ready'
+    epoch = network_epoch
+    now = monotonic_now
+    return if @city_probe_next_at && now < @city_probe_next_at
+    favorites, selected = @city_mutex.synchronize { [@favorite_cities.dup, @selected_city] }
+    @city_probe_due ||= {}
+    candidates = favorites.flat_map do |city|
+      ranked_city_relays(city, 'auto').reject { |r| r['hostname'] == current[:active_relay] }.first(4).map { |relay| [city, relay] }
     end
+    names = candidates.map { |_city, relay| relay['hostname'] }
+    @city_probe_due.select! { |name, _| names.include?(name) }
+    city, relay = candidates.select { |_city, r| now >= @city_probe_due.fetch(r['hostname'], 0) }
+                            .min_by { |_city, r| @city_probe_due.fetch(r['hostname'], 0) }
+    return unless relay
+    # At most one ICMP request every 5s across all favorite cities, including
+    # unknown/timeout observations. Never create a backup WireGuard tunnel.
+    @city_probe_next_at = now + 5
+    @city_probe_due[relay['hostname']] = now + (city == selected ? 30 : 180)
+    mode = transport_candidates('auto', relay).first
+    endpoint = quick_ping_targets(relay).dig(mode, :target)
+    return unless endpoint
+    begin
+      result = outer_ping_test(endpoint, 1_000)
+    rescue LocalProbeTimeout => error
+      result = { status: 'unknown', target: endpoint, local_failure: error.phase,
+                 detail: 'ICMP observation timed out; tunnel availability is not determined' }
+    end
+    return unless network_epoch_current?(epoch)
+    @city_mutex.synchronize { @city_probes[relay['hostname']] = result.merge(transport: mode, checked_at: Time.now.iso8601) }
+    log_probe_event('city-candidate-outer-probe', relay: relay['hostname'], city: city, transport: mode, result: result)
   end
 
   def start_city_maintenance
@@ -3781,7 +3845,7 @@ class MullvadAdapter
     false
   end
 
-  def refresh_metadata(force: false)
+  def refresh_metadata(force: false, background: false)
     @metadata_mutex.synchronize do
       if !force && @metadata && @metadata_fetched_at && (Time.now - @metadata_fetched_at) < @options[:metadata_ttl]
         return @metadata
@@ -3790,7 +3854,7 @@ class MullvadAdapter
       proxy_args = bootstrap_proxy_args
       parsed = nil
       last_error = nil
-      3.times do
+      (background ? 1 : 3).times do
         stdout, stderr, status = Open3.capture3('curl', '-q', '-fsS', '--noproxy', '', '--max-time', '8', *proxy_args, API_URL)
         unless status.success?
           last_error = stderr.to_s.strip[0, 160]
@@ -3815,7 +3879,7 @@ class MullvadAdapter
             set_metadata_state(live: false, cache: true, source: 'cache', error: last_error, fetched_at: @metadata_fetched_at)
             record_metadata_validation_warnings('cache')
             set_dns_status(:bootstrap, 'degraded', "live metadata fetch failed; using last valid cache: #{last_error}")
-            check_clash_global_path
+            check_clash_global_path unless background
             return @metadata
           rescue JSON::ParserError, RuntimeError => e
             last_error = "#{last_error}; cache invalid: #{e.message}"
@@ -3833,7 +3897,7 @@ class MullvadAdapter
       set_metadata_state(live: true, cache: true, source: route, error: nil, fetched_at: @metadata_fetched_at)
       record_metadata_validation_warnings(route)
       set_dns_status(:bootstrap, 'pass', "Mullvad API fetched via #{route}")
-      check_clash_global_path
+      check_clash_global_path unless background
       parsed
     end
   rescue JSON::ParserError => e
@@ -4469,6 +4533,32 @@ class MullvadAdapter
     end
   end
 
+  def worker_failure_log_summary(worker)
+    return { status: 'unavailable', reason: 'worker-not-registered' } unless worker
+    path = File.join(slot_dir(worker[:slot]), 'core.log')
+    stat = File.lstat(path)
+    return { status: 'unavailable', reason: 'not-regular-file' } unless stat.file? && !stat.symlink?
+    tail = File.open(path, File::RDONLY | File::NOFOLLOW) do |file|
+      file.seek([file.size - 16_384, 0].max)
+      file.read(16_384).to_s
+    end
+    text = tail.encode('UTF-8', invalid: :replace, undef: :replace)
+    categories = {
+      inner_tcp_timeout: /dial tcp .*context deadline exceeded/i,
+      inner_dns_failure: /dns resolve failed|all DNS requests failed/i,
+      network_unreachable: /network is unreachable|no route to host/i,
+      permission_denied: /operation not permitted|permission denied/i,
+      connection_refused: /connection refused/i,
+      ss_authentication_error: /(?:shadowsocks|ss).*(?:authentication failed|invalid tag|decrypt.*fail)/i
+    }
+    { status: 'captured', tail_bytes: tail.bytesize, file_bytes: stat.size,
+      categories: categories.transform_values { |pattern| text.lines.count { |line| pattern.match?(line) } },
+      handshake: 'not-exposed-by-engine-controller', udp_packets: 'not-measured',
+      interpretation: 'inner TCP failure does not establish SS reachability or WireGuard handshake failure' }
+  rescue StandardError => error
+    { status: 'unavailable', error_class: error.class.name }
+  end
+
   def cache_speed_test(relay_name, canary, source, transport_mode)
     return unless network_attempt_current?
     mode = transport_mode.to_s
@@ -4496,6 +4586,11 @@ class MullvadAdapter
     else
       @mutex.synchronize { @speed_tests["#{relay_name}|#{mode}"] = result }
       record_relay_history(result)
+    end
+    if classification[:relay_liveness] == 'fail'
+      log_probe_event('worker-failure-evidence', relay: relay_name, worker_instance: route_worker&.dig(:instance_token),
+                      endpoint: route_worker&.dig(:endpoint), endpoint_port: route_worker&.dig(:endpoint_port),
+                      interface: route_worker&.dig(:interface), evidence: worker_failure_log_summary(route_worker))
     end
     log_event('probe-result', relay: relay_name, transport: mode, source: source,
               endpoint: route_worker&.dig(:endpoint), endpoint_port: route_worker&.dig(:endpoint_port),
@@ -5222,6 +5317,7 @@ class MullvadAdapter
       unless %w[network-resume network-resume-original network-resume-fallback health-recovery worker-crash-recovery startup startup-retry].include?(reason)
         @state[:local_network][:recovery_pending] = false
       end
+      reconcile_validated_local_recovery(classification, switched_at)
       @metrics[:switches] += 1
       @state[:generation] += 1
       @state[:status] = classification[:service_readiness] == 'ready' ? 'ready' : classification[:service_readiness]
