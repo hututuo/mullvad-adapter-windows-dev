@@ -206,7 +206,9 @@ class OrderedRecoveryTest < Minitest::Test
   def test_legacy_inlet_kind_cannot_duplicate_the_original_in_alternates
     @adapter.instance_variable_get(:@workers)['a'][:endpoint_kind] = 'legacy-kind'
     refute run_round
-    assert_equal %w[192.0.2.3 192.0.2.4], @adapter.paths[3, 2].map { |path| path[1] }
+    alternatives = @adapter.paths[3, 3]
+    assert_equal 3, alternatives.uniq.length
+    refute alternatives.any? { |path| path[1] == '192.0.2.2' }
   end
 
   def test_stop_wins_over_earlier_action_admission_ticket

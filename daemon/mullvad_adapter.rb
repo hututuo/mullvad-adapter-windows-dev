@@ -2530,19 +2530,23 @@ class MullvadAdapter
     return base.merge(status: 'unknown', detail: '未取得完整的本机硬件接口状态') if names.empty? || names.any? { |name| !sections.key?(name) }
 
     ambiguous = false
+    families = []
     active = names.select do |name|
       section = sections.fetch(name)
       link = section[/^\s*status:\s*(\S+)/, 1]
       ambiguous = true unless %w[active inactive].include?(link)
       next false unless link == 'active' && section.lines.first.match?(/<[^>]*\bUP\b/)
-      section.scan(/^\s*inet6?\s+(\S+)/).flatten.any? do |address|
+      valid = section.scan(/^\s*inet6?\s+(\S+)/).flatten.filter_map do |address|
         ip = IPAddr.new(address.split('%').first) rescue nil
-        ip && !ip.loopback? && !ip.to_i.zero? &&
+        next unless ip && !ip.loopback? && !ip.to_i.zero? &&
           !(ip.ipv4? && IPAddr.new('169.254.0.0/16').include?(ip)) &&
           !(ip.ipv6? && IPAddr.new('fe80::/10').include?(ip))
+        ip
       end
+      families.concat(valid.map { |ip| ip.ipv4? ? 'ipv4' : 'ipv6' })
+      !valid.empty?
     end
-    return base.merge(status: 'available', active_interfaces: active, detail: '本机硬件链路已连接并取得地址；不代表互联网或节点已验证') unless active.empty?
+    return base.merge(status: 'available', active_interfaces: active, address_families: families.uniq, detail: '本机硬件链路已连接并取得地址；不代表互联网或节点已验证') unless active.empty?
     return base.merge(status: 'unknown', detail: '接口链路状态不明确；不据此判定断网') if ambiguous
     base.merge(status: 'unavailable', active_interfaces: [], detail: '本机没有已连接且取得可用地址的硬件网络接口')
   end
@@ -2569,7 +2573,7 @@ class MullvadAdapter
         interface_change = { previous: before, current: after, epoch: local[:epoch] }
       end
       was_paused = local[:paused]
-      local.merge!(observation.slice(:source, :interfaces, :active_interfaces, :detail))
+      local.merge!(observation.slice(:source, :interfaces, :active_interfaces, :address_families, :detail))
       local[:status], local[:checked_at] = status, Time.now.iso8601
       if status == 'unavailable'
         if !was_paused || @local_network_settle_until.positive?
@@ -3167,6 +3171,7 @@ class MullvadAdapter
   # Reuse catalogue-authorized inlet tuples and their history ranking. The
   # bounded ladder explicitly re-tests cooling inlets, but never invents one.
   def recovery_inlets(relay_name, mode, original = nil)
+    return [] unless local_transport_available?(mode)
     relay = find_relay(relay_name)
     entry_name = original&.dig(:entry_relay)
     if protection_profile[:multihop]
@@ -3510,7 +3515,7 @@ class MullvadAdapter
         end.max_by { |_, tested| tested }
       end
       relay = Array(@metadata&.dig('wireguard', 'relays')).find { |item| item['hostname'] == preferred_relay && item['active'] == true }
-      if recent && relay && relay['location'] == recovery_city(preferred_relay) && transport_supported?(relay, recent.first)
+      if recent && relay && relay['location'] == recovery_city(preferred_relay) && transport_supported?(relay, recent.first) && local_transport_available?(recent.first)
         mode = recent.first
         inlet = mode == 'ss' ? ss_endpoint_candidates(relay).first : nil
         previous_pin = Thread.current[:adapter_recovery_inlet]
@@ -4215,12 +4220,18 @@ class MullvadAdapter
     end
   end
 
+  def local_transport_available?(mode)
+    local = @mutex.synchronize { @state[:local_network].dup }
+    return true unless local[:status] == 'available' && local.key?(:address_families)
+    Array(local[:address_families]).include?(mode.to_s == 'ipv6' ? 'ipv6' : 'ipv4')
+  end
+
   def transport_candidates(preference, relay)
     normalized = normalize_transport_preference(preference)
     modes = normalized == 'auto' ? AUTO_TRANSPORT_ORDER : [normalized]
     pinned = Thread.current[:adapter_recovery_inlet]
     modes = [pinned[:mode]] if pinned && pinned[:relay] == relay['hostname']
-    supported = modes.uniq.select { |mode| transport_supported?(relay, mode) }
+    supported = modes.uniq.select { |mode| transport_supported?(relay, mode) && local_transport_available?(mode) }
     raise "relay #{relay['hostname']} supports none of requested transports #{modes.join(',')}" if supported.empty?
     supported
   end
@@ -4411,6 +4422,15 @@ class MullvadAdapter
     candidates.uniq { |ip, port, _| [ip, port] }
   end
 
+  def diversify_ss_candidates(candidates)
+    result = candidates.dup
+    # Within a tiny fallback window cover both officially supported SS paths,
+    # instead of spending all slots on dedicated addresses on one fixed port.
+    primary = result.index { |candidate| candidate[2] == 'relay-ipv4-ss-port' }
+    result.insert(1, result.delete_at(primary)) if primary && primary > 1
+    result
+  end
+
   def ss_endpoint_candidates(relay, include_cooling: false)
     name = relay['hostname'].to_s
     history = @ss_endpoint_mutex.synchronize do
@@ -4423,6 +4443,7 @@ class MullvadAdapter
       preferred = [endpoint_history_key(candidate[0], candidate[1]), candidate[0]].include?(last_good) && endpoint_stats_for(stats, candidate[0], candidate[1])[:consecutive_failures].to_i.zero?
       [preferred ? 0 : 1, index]
     end.map(&:first)
+    ranked = diversify_ss_candidates(ranked)
     return ranked if include_cooling
     available = ranked.reject { |candidate| endpoint_cooling_down?(endpoint_stats_for(stats, candidate[0], candidate[1])) }
     available = [ranked.min_by { |candidate| endpoint_retry_at(endpoint_stats_for(stats, candidate[0], candidate[1])) }] if available.empty?
@@ -4460,6 +4481,8 @@ class MullvadAdapter
         window[:seen].clear
         unseen = eligible
       end
+      primary_index = unseen.index { |inlet| (inlet.is_a?(Hash) ? inlet[:inlet] : inlet)&.[](2) == 'relay-ipv4-ss-port' }
+      unseen.insert(1, unseen.delete_at(primary_index)) if primary_index && primary_index > 1
       unseen
     end
   end

@@ -58,6 +58,15 @@ class SsCataloguePolicyTest < Minitest::Test
                  full_pool.map { |ip, port, _kind| [ip, port] }
   end
 
+  def test_two_candidate_window_covers_both_official_ss_path_forms
+    @relay['shadowsocks_extra_addr_in'] = (2..37).map { |last| "192.0.2.#{last}" }
+    first_two = @adapter.send(:ss_endpoint_candidates, @relay).first(2)
+    assert_equal %w[extra-ss-ipv4 relay-ipv4-ss-port], first_two.map(&:last)
+    pool = @adapter.send(:ss_endpoint_candidates, @relay, include_cooling: true)
+    window = @adapter.send(:rotating_ss_recovery_inlets, 'relay-one', pool).first(2)
+    assert_equal %w[extra-ss-ipv4 relay-ipv4-ss-port], window.map(&:last)
+  end
+
   def test_authorization_accepts_both_catalogue_paths_and_rejects_near_misses
     assert @adapter.send(:ss_candidate_authorized?, @relay, ['192.0.2.2', MullvadAdapter::EXTRA_SS_PORT])
     assert @adapter.send(:ss_candidate_authorized?, @relay, ['192.0.2.1', 20_487])

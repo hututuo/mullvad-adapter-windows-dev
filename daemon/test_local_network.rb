@@ -50,6 +50,25 @@ class MullvadLocalNetworkTest < Minitest::Test
     refute @adapter.send(:snapshot).dig(:local_network, :paused)
   end
 
+  def test_link_local_ipv6_does_not_advertise_an_internet_ipv6_source
+    hardware = "Hardware Port: Wi-Fi\nDevice: en0\n"
+    interfaces = "en0: flags=8863<UP,BROADCAST>\n\tinet 192.0.2.10 netmask 0xffffff00\n\tinet6 fe80::1%en0 prefixlen 64\n\tstatus: active\n"
+    observed = @adapter.send(:parse_local_network, hardware, interfaces)
+    assert_equal ['ipv4'], observed[:address_families]
+    @adapter.send(:apply_local_network_observation, observed)
+    relay = @adapter.send(:find_relay, 'one')
+    assert_equal %w[ss ipv4], @adapter.send(:transport_candidates, 'auto', relay)
+    assert_empty @adapter.send(:recovery_inlets, 'one', 'ipv6')
+    assert_raises(RuntimeError) { @adapter.send(:transport_candidates, 'ipv6', relay) }
+  end
+
+  def test_ipv6_only_attachment_does_not_start_an_ipv4_ss_carrier
+    @adapter.send(:apply_local_network_observation, status: 'available', active_interfaces: ['en0'], address_families: ['ipv6'])
+    assert_equal ['ipv6'], @adapter.send(:transport_candidates, 'auto', @adapter.send(:find_relay, 'one'))
+    assert_empty @adapter.send(:recovery_inlets, 'one', 'ss')
+    refute @adapter.send(:snapshot).dig(:local_network, :paused)
+  end
+
   def test_offline_pauses_all_automatic_relay_work_and_diagnostics
     observe('unavailable')
     @adapter.define_singleton_method(:run_readiness_canary) { |_| raise 'must not probe offline' }
