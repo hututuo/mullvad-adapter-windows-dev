@@ -386,7 +386,7 @@ class MullvadAdapterPolicyTest < Minitest::Test
                     'an untried inlet outranks a proven one that is currently failing'
   end
 
-  def test_last_good_ss_endpoint_still_ranks_first
+  def test_failed_legacy_last_good_does_not_outrank_a_healthy_endpoint
     adapter = build_adapter
     candidate_relay = {
       'hostname' => 'us-lax-wg-001',
@@ -402,7 +402,7 @@ class MullvadAdapterPolicyTest < Minitest::Test
     }
 
     order = adapter.send(:ss_endpoint_candidates, candidate_relay).map { |candidate| candidate[0] }
-    assert_equal '23.234.72.11', order.first
+    assert_equal '23.234.72.5', order.first
   end
 
   # 死隧道原本要白等 29 秒（controller 8 + ip 8 + dns 8 + https 12，

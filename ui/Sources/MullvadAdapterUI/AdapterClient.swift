@@ -162,6 +162,15 @@ struct AdapterClient: Sendable {
         try await startOperation("cities/select", payload: ["city": city, "transport": "auto"])
     }
 
+    func fetchCatalogueStatus() async throws -> MetadataStatus {
+        try await get("metadata", as: MetadataStatus.self)
+    }
+
+    func refreshCatalogue() async throws -> CatalogueRefreshReceipt {
+        let data = try await post("metadata/refresh", json: [:])
+        return try decode(data, path: "metadata/refresh")
+    }
+
     func fetchRelays() async throws -> [RelayInfo] {
         try await get("relays", as: [RelayInfo].self)
     }

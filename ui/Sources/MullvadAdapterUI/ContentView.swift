@@ -64,6 +64,15 @@ struct ContentView: View {
         }
     }
 
+    private var catalogueSummary: String {
+        guard let metadata = model.status?.metadata else { return "官方目录尚未读取" }
+        if metadata.refreshing == true { return "正在更新官方目录…" }
+        if metadata.error != nil { return "更新失败，保留已验证目录" }
+        guard let stamp = metadata.fetchedAt else { return "尚无成功更新时间" }
+        let time = ISO8601DateFormatter().date(from: stamp)?.formatted(date: .abbreviated, time: .shortened) ?? stamp
+        return "目录更新：\(time)"
+    }
+
     private var sidebar: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 7) {
@@ -87,6 +96,24 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
 
             Divider()
+
+            VStack(alignment: .leading, spacing: 5) {
+                Button(action: model.refreshOfficialCatalogue) {
+                    Label(model.isRefreshingCatalogue ? "正在更新目录…" : "更新官方目录", systemImage: "arrow.clockwise")
+                        .frame(maxWidth: .infinity, minHeight: 26)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.bordered)
+                .disabled(model.isRefreshingCatalogue || model.isPreview)
+                Text(model.catalogueMessage.map { "\($0)\n\(catalogueSummary)" } ?? catalogueSummary)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .frame(height: 30, alignment: .topLeading)
+                    .help(model.status?.metadata?.error ?? model.status?.metadata?.cacheError ?? catalogueSummary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
 
             List(selection: $selectedSection) {
                 Section("日常") {

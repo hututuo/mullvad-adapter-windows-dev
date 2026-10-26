@@ -23,6 +23,8 @@ final class AdapterViewModel: ObservableObject {
 
     @Published var isLoading = false
     @Published var isLoadingRelays = false
+    @Published var isRefreshingCatalogue = false
+    @Published var catalogueMessage: String?
     @Published var isActionRunning = false
     @Published var selectingRelayHostname: String?
     @Published var actionMessage: String?
@@ -423,6 +425,35 @@ final class AdapterViewModel: ObservableObject {
                 }
         } catch {
             relayErrorMessage = error.localizedDescription
+        }
+    }
+
+    func refreshOfficialCatalogue() {
+        guard !isPreview, !isRefreshingCatalogue else { return }
+        isRefreshingCatalogue = true
+        catalogueMessage = "正在请求官方目录…"
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.isRefreshingCatalogue = false }
+            do {
+                _ = try await self.client.refreshCatalogue()
+                var completed = false
+                for _ in 0..<40 {
+                    try await Task.sleep(nanoseconds: 500_000_000)
+                    let metadata = try await self.client.fetchCatalogueStatus()
+                    if metadata.refreshing != true {
+                        self.catalogueMessage = metadata.error != nil ? "更新失败，保留上次有效目录" : metadata.cacheError != nil ? "官方目录已更新；本地缓存保存失败" : "官方目录已更新"
+                        await self.refreshStatusBestEffort()
+                        await self.loadRelays(force: true)
+                        await self.loadCities()
+                        completed = true
+                        break
+                    }
+                }
+                if !completed { self.catalogueMessage = "更新仍在进行，可稍后查看目录状态" }
+            } catch {
+                self.catalogueMessage = "更新未完成：\(error.localizedDescription)"
+            }
         }
     }
 

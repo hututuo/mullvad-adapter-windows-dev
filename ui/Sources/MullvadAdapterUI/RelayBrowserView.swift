@@ -122,11 +122,13 @@ struct RelayBrowserView: View {
                 .help(pinnedRelayInfos.isEmpty ? "暂无置顶节点" : "快速定位到已置顶节点")
 
                 Button {
-                    model.reloadRelays()
+                    model.refreshOfficialCatalogue()
                 } label: {
-                    Label("刷新节点", systemImage: "arrow.clockwise")
+                    Label(model.isRefreshingCatalogue ? "正在更新目录" : "更新官方目录", systemImage: "arrow.clockwise")
+                        .frame(minHeight: 22)
+                        .contentShape(Rectangle())
                 }
-                .disabled(model.isLoadingRelays || model.isBusy || model.isSpeedTesting)
+                .disabled(model.isRefreshingCatalogue)
             }
 
             HStack(spacing: 8) {

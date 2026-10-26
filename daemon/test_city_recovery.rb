@@ -498,7 +498,7 @@ class MullvadCityRecoveryTest < Minitest::Test
     assert_equal 0, @adapter.send(:snapshot)[:health][:consecutive_wg_failures]
   end
 
-  def test_recent_ipv6_success_survives_newer_ss_failure_but_explicit_ss_stays_exact
+  def test_recent_ipv6_evidence_is_kept_but_auto_still_prefers_ss
     ready = @adapter.good_canary.merge(relay: 'two', transport_mode: 'ipv6', tested_at: (Time.now - 5).iso8601,
       relay_liveness: 'pass', service_readiness: 'ready')
     failed = { relay: 'two', transport_mode: 'ss', tested_at: Time.now.iso8601,
@@ -506,7 +506,7 @@ class MullvadCityRecoveryTest < Minitest::Test
     @adapter.send(:record_relay_history, ready)
     @adapter.send(:record_relay_history, failed)
     relay = @adapter.send(:find_relay, 'two')
-    assert_equal 'ipv6', @adapter.send(:transport_candidates, 'auto', relay).first
+    assert_equal %w[ss ipv6 ipv4], @adapter.send(:transport_candidates, 'auto', relay)
     assert_equal ['ss'], @adapter.send(:transport_candidates, 'ss', relay)
     assert_equal 'recent_ready', @adapter.send(:city_node_evidence, 'two')[:evidence]
     @adapter.send(:quarantine_relay, 'two', 'fixture')

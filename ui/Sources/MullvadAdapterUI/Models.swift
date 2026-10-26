@@ -221,6 +221,10 @@ struct MetadataStatus: Decodable {
     let error: String?
     let fetchedAt: String?
     let validationWarnings: [String]?
+    let refreshing: Bool?
+    let lastAttemptAt: String?
+    let cacheError: String?
+    let relayCount: Int?
 
     enum CodingKeys: String, CodingKey {
         case live
@@ -231,9 +235,13 @@ struct MetadataStatus: Decodable {
         case error
         case fetchedAt = "fetched_at"
         case validationWarnings = "validation_warnings"
+        case refreshing
+        case lastAttemptAt = "last_attempt_at"
+        case cacheError = "cache_error"
+        case relayCount = "relay_count"
     }
 
-    init(live: Bool?, cache: Bool?, source: String?, age: Double?, ageSeconds: Double?, error: String?, fetchedAt: String?, validationWarnings: [String]? = nil) {
+    init(live: Bool?, cache: Bool?, source: String?, age: Double?, ageSeconds: Double?, error: String?, fetchedAt: String?, validationWarnings: [String]? = nil, refreshing: Bool? = nil, lastAttemptAt: String? = nil, cacheError: String? = nil, relayCount: Int? = nil) {
         self.live = live
         self.cache = cache
         self.source = source
@@ -242,6 +250,10 @@ struct MetadataStatus: Decodable {
         self.error = error
         self.fetchedAt = fetchedAt
         self.validationWarnings = validationWarnings
+        self.refreshing = refreshing
+        self.lastAttemptAt = lastAttemptAt
+        self.cacheError = cacheError
+        self.relayCount = relayCount
     }
 
     var effectiveAge: Double? { ageSeconds ?? age }
@@ -922,4 +934,9 @@ struct RelaySpeedState {
     static func unsupported(_ message: String) -> RelaySpeedState {
         RelaySpeedState(phase: .unsupported, result: nil, updatedAt: Date(), message: message)
     }
+}
+
+struct CatalogueRefreshReceipt: Decodable {
+    let accepted: Bool
+    let refreshing: Bool
 }

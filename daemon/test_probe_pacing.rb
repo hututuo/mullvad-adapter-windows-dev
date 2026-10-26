@@ -147,7 +147,7 @@ class RecoveryPacingTest < Minitest::Test
       attempts = @adapter.paths.length
       refute @adapter.send(:run_ordered_recovery, 'one', reason: 'startup-retry')
       assert_equal attempts, @adapter.paths.length
-      assert_equal 13, attempts if index.zero?
+      assert_equal 24, attempts if index.zero?
     end
     @adapter.send(:interrupt_ordered_recovery, stopped: false)
     @adapter.succeed_at = @adapter.paths.length + 1

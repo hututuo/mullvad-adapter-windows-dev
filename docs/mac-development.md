@@ -1,5 +1,13 @@
 # Mac 维护与构建
 
+## 官方目录与 SS 恢复
+
+主窗侧栏和全部节点页的“更新官方目录”调用授权异步 `/metadata/refresh`，并读取 `/metadata` 显示真实进度；普通读取列表仍不触发 API。后台默认六小时更新、失败退避，失败保留上次数据。目录是公开服务器清单；设备身份用于 WireGuard 鉴权，私钥不发送给目录 API。缓存原子写入，API成功与缓存保存错误分开呈现。
+
+SS池包含目录的专用IPv4地址以及主IPv4＋官方SS端口段；20484是客户端的专用SS端口选择，不是API逐节点返回的端口。地址/端口组合去重，原入口短重试之外的备用入口跨轮轮转。自动模式按原SS短重试→最多3个不同备用SS→最多4个同城节点各2个SS→IPv6/IPv4保底；显式SS模式不自动用其他方式。近期90秒内验证可用的同城路径可在后台重启时先验证保留，避免为更新软件做长扫；健康连接不为优先级主动拆线。
+
+固定官方实现依据：[目录请求](https://github.com/mullvad/mullvadvpn-app/blob/2026.5/mullvad-api/src/relay_list.rs)，[专用SS地址与主地址端口可同时存在](https://github.com/mullvad/mullvadvpn-app/blob/2026.5/mullvad-relay-selector/src/relay_selector/endpoint_set.rs)。目录正确不等于SS可达、WG鉴权通过或所有业务网站都成功，验收仍逐层记录。
+
 ## HTTPS 部分目标失败与域名恢复
 
 隧道 IP/DNS/HTTPS 探针通过，只证明探针对应路径可用。应用可能把预先解析或缓存的 IP 交给代理；这类连接没有原域名，WireGuard 内层 DNS 无法纠正错误或过期的地址。worker 对公网纯 IP 的 TLS 443/8443 连接启用 Mihomo ClientHello 域名恢复，再交给原 WireGuard outbound 的隧道内 DNS；显式域名请求、私网目标、其他端口和非 TLS 数据保留原行为，规则仍是 `MATCH,OUT`，没有 DIRECT 兜底。该功能不解密 TLS 内容、不生成业务探针，不能恢复没有可见 SNI 的目标，也不证明历史故障一定由 DNS 污染造成。

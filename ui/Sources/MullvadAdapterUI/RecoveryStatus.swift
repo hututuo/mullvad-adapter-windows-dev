@@ -32,6 +32,7 @@ struct RecoveryStatus: Decodable {
         case "original", "current_relay", "retry_wait": return "1 · 重试原节点、原入口"
         case "alternate_ss": return "2 · 尝试原节点的备用 SS"
         case "same_city": return "3 · 尝试同城备用节点"
+        case "transport_fallback": return "4 · SS 已尝试，使用 IPv6/IPv4 保底"
         case "restored": return "连接已恢复"
         case "local_wait": return "等待本机组件就绪"
         case "waiting_network": return "等待本机网络"
@@ -49,7 +50,7 @@ struct RecoveryStatus: Decodable {
     }
 
     var timing: String {
-        guard phase != "idle" else { return "原入口 3 次 → 备用 SS 最多 2 个 → 同城最多 4 节点，每个最多 2 入口" }
+        guard phase != "idle" else { return "原入口 3 次 → 备用 SS 最多 3 个 → 同城最多 4 节点，每个最多 2 入口 → IPv6/IPv4 保底" }
         let used = "已尝试 \(attempt ?? 0) 次 · 用时 \(elapsedSeconds ?? 0) 秒 / \(budgetSeconds ?? 300) 秒预算"
         if let wait = retryInSeconds, wait > 0 {
             return "\(used) · \(wait) 秒后\(running ? "重试" : "再开一轮")"

@@ -22,3 +22,10 @@ OpenSpec Markdown change only; no CLI validation or archive has been run.
 
 - [x] MAC-REC-09: Recover missing public TLS names in the worker; preserve existing WG resolver/rules and explicit-domain/private/non-TLS paths. Add real-engine loopback fixtures and macOS IPv6 echo argument regression.
 - [ ] MAC-REC-09: Installed current-build observation of user-initiated requests; record separately from local fixtures and neutral endpoint verification. No sleep or physical network fault injection.
+
+## 2026-10-26 catalogue and SS-first recovery
+
+- [x] MAC-REC-10: Authorized/coalesced manual catalogue update and independent progress; atomic cache, in-memory fallback and address-family validation.
+- [x] MAC-REC-10: Combine official dedicated/main-address SS tuples, deduplicate and rotate fallback windows; SS city stages before native-family fallback, exact explicit modes, and bounded preservation on restart.
+- [x] Main-window/browser update controls, visible update/cache failures, and explicit native fallback progress. Ruby/Swift regression and release build are recorded separately from installed acceptance.
+- [ ] Live full exhaustion, manual physical network fault, long-duration stability and Windows parity of the new policy (not part of this local Mac update).

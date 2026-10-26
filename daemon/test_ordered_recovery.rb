@@ -4,12 +4,12 @@ require_relative 'test_reliability'
 # Real activation/cleanup/commit code; only process I/O and clock are simulated.
 class OrderedRecoveryAdapter < ReliabilityAdapter
   attr_accessor :succeed_at, :local_at, :interrupt_at, :attempt_cost
-  attr_reader :paths, :waits
+  attr_reader :paths, :waits, :path_modes
 
   def initialize(dir)
     super
     @clock = 100.0
-    @paths, @waits = [], []
+    @paths, @waits, @path_modes = [], [], []
     @attempt_cost = 0
     @metadata['wireguard']['relays'].each { |relay| relay['shadowsocks_extra_addr_in'] << '192.0.2.4' }
   end
@@ -27,6 +27,7 @@ class OrderedRecoveryAdapter < ReliabilityAdapter
     info[:endpoint_port] = ss_candidate&.[](1) || EXTRA_SS_PORT
     info[:endpoint_kind] = ss_candidate&.[](2) || 'extra-ss-ipv4'
     @paths << [relay['hostname'], info[:endpoint], info[:endpoint_port]]
+    @path_modes << transport_mode
     @state[:workers][slot] = public_worker_state(info).merge(state: 'candidate')
     info
   end
@@ -43,6 +44,7 @@ class OrderedRecoveryAdapter < ReliabilityAdapter
     worker = start_worker('a', find_relay('one'), ss_candidate: ['192.0.2.2', EXTRA_SS_PORT, 'extra-ss-ipv4'])
     commit_active('a', 'one', worker, good_canary, 'startup', old_slot: nil, transport_preference: 'auto')
     @paths.clear
+    @path_modes.clear
   end
 end
 
@@ -63,16 +65,20 @@ class OrderedRecoveryTest < Minitest::Test
     @adapter.send(:run_ordered_recovery, 'one', reason: 'health-recovery', **args)
   end
 
-  def test_exact_original_retries_precede_two_alternates_and_four_city_nodes
+  def test_original_then_three_unique_ss_alternates_and_four_city_nodes_before_native_fallback
     refute run_round
     assert_equal Array.new(3, ['one', '192.0.2.2', 20_484]), @adapter.paths.first(3)
-    assert_equal %w[192.0.2.3 192.0.2.4], @adapter.paths[3, 2].map { |path| path[1] }
-    assert_equal %w[five four three two], @adapter.paths.drop(5).map(&:first).uniq
-    assert_equal [2, 2, 2, 2], @adapter.paths.drop(5).group_by(&:first).values.map(&:length)
+    alternatives = @adapter.paths[3, 3]
+    assert_equal 3, alternatives.uniq.length
+    refute alternatives.any? { |path| path[1] == '192.0.2.2' }
+    assert_equal %w[five four three two], @adapter.paths[6, 8].map(&:first).uniq
+    assert_equal [2, 2, 2, 2], @adapter.paths[6, 8].group_by(&:first).values.map(&:length)
+    assert_equal ['ss'] * 14, @adapter.path_modes.first(14)
+    assert_equal %w[ipv6 ipv4] * 5, @adapter.path_modes.drop(14)
     assert_equal [0, 1, 5], @adapter.waits.first(3)
-    assert_equal 13, @adapter.paths.length
+    assert_equal 24, @adapter.paths.length
     assert_equal 'exhausted', @adapter.send(:snapshot).dig(:recovery, :phase)
-    assert_equal 13, @adapter.send(:snapshot).dig(:recovery, :attempt)
+    assert_equal 24, @adapter.send(:snapshot).dig(:recovery, :attempt)
     assert @adapter.instance_variable_get(:@workers).empty?
   end
 

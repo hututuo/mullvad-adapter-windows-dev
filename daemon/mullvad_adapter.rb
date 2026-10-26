@@ -127,7 +127,7 @@ class MullvadAdapter
   TRANSPORT_PREFERENCES = (%w[auto] + TRANSPORT_MODES).freeze
   AUTO_TRANSPORT_ORDER = %w[ss ipv6 ipv4].freeze
   DEFAULT_TRANSPORT_PREFERENCE = 'ss'
-  BUILD_ID = '20261026-https-destination-recovery-1'
+  BUILD_ID = '20261026-catalogue-ss-policy-1'
   SOURCE_SHA256 = Digest::SHA256.file(__FILE__).hexdigest
   STATUS_PUBLICATION_INTERVAL = 1.0
   STATUS_PUBLICATION_MAX_AGE = 3.0
@@ -218,6 +218,8 @@ class MullvadAdapter
     @history_mutex = Mutex.new
     @ss_endpoint_mutex = Mutex.new
     @metadata_mutex = Mutex.new
+    @metadata_refresh_job_mutex = Mutex.new
+    @ss_recovery_windows = {}
     @health_wait_mutex = Mutex.new
     @health_cv = ConditionVariable.new
     @health_wake_pending = false
@@ -1406,7 +1408,7 @@ class MullvadAdapter
       handle_account_http(sock, method, path, headers, body)
       return
     end
-    if @account_only_mode && method == 'POST'
+    if @account_only_mode && method == 'POST' && path != '/metadata/refresh'
       respond(sock, 409, { code: 'identity_not_configured', error: '隧道尚未初始化；当前仅开放账号与设备管理，未启动网络引擎' })
       return
     end
@@ -1445,6 +1447,10 @@ class MullvadAdapter
       end
     when ['GET', '/metrics']
       respond(sock, 200, @mutex.synchronize { @metrics.dup })
+    when ['GET', '/metadata']
+      respond(sock, 200, @mutex.synchronize { @state[:metadata].dup })
+    when ['POST', '/metadata/refresh']
+      respond(sock, 202, request_metadata_refresh)
     when ['GET', '/relays']
       params = URI.decode_www_form(query.to_s).to_h
       respond(sock, 200, safe_relays(params['city']))
@@ -3166,10 +3172,10 @@ class MullvadAdapter
     if protection_profile[:multihop]
       entry = entry_name ? find_relay(entry_name) : multihop_entries(relay, mode).first
       return [] unless entry && entry['hostname'] != relay_name
-      entries = mode == 'ss' ? ss_endpoint_candidates(entry, include_cooling: true).first(3) : [nil]
+      entries = mode == 'ss' ? ss_endpoint_candidates(entry, include_cooling: true) : [nil]
       return entries.map { |inlet| { entry: entry['hostname'], inlet: inlet } }
     end
-    mode == 'ss' ? ss_endpoint_candidates(relay, include_cooling: true).first(3) : [nil]
+    mode == 'ss' ? ss_endpoint_candidates(relay, include_cooling: true) : [nil]
   rescue RuntimeError, ArgumentError
     [] # A withdrawn relay/entry must not be resurrected from a saved path.
   end
@@ -3184,7 +3190,7 @@ class MullvadAdapter
       extra = Array(relay['shadowsocks_extra_addr_in'])
       authorized = extra.include?(ip) && port.to_i == EXTRA_SS_PORT
       ranges = validated_port_ranges(@metadata.dig('wireguard', 'shadowsocks_port_ranges'), 'shadowsocks port ranges')
-      authorized ||= extra.empty? && relay['ipv4_addr_in'] == ip && ranges.any? { |low, high| port.to_i.between?(low, high) }
+      authorized ||= relay['ipv4_addr_in'] == ip && ranges.any? { |low, high| port.to_i.between?(low, high) }
       return nil unless authorized
       inlet = [ip, port.to_i, path[:endpoint_kind]]
     end
@@ -3227,7 +3233,7 @@ class MullvadAdapter
       path = original_path
       path = @mutex.synchronize { (@workers[current[:active_slot]] || @last_network_path || {}).dup } if !path || path.empty?
       preference = current_transport_preference
-      mode = path[:transport_mode] || (preference == 'auto' ? 'ss' : preference)
+      mode = current_only ? (path[:transport_mode] || (preference == 'auto' ? 'ss' : preference)) : (preference == 'auto' ? 'ss' : preference)
       token = @mutex.synchronize do
         @recovery_control_epoch if !@recovery_stopped && request_epoch == @recovery_control_epoch
       end
@@ -3252,39 +3258,55 @@ class MullvadAdapter
       log_event('recovery-round-started', relay: relay_name, reason: reason, policy: 'original-ss-city', budget_seconds: @options[:ordered_recovery_budget])
       inlets = recovery_inlets(relay_name, mode, path)
       original = original_recovery_inlet(path, relay_name, mode)
-      primary = original ? original[:candidate] : inlets.first
-      # nil is the legitimate direct-transport candidate; SS nil is unavailable.
+      primary = original ? original[:candidate] : (mode == 'ss' ? rotating_ss_recovery_inlets(relay_name, inlets).first : inlets.first)
       has_primary = original || !inlets.empty?
-      plan = has_primary ? (original ? [0, 1, 5] : [0]).each_with_index.map { |delay, index| [original ? 'original' : 'current_relay', relay_name, primary, delay, index + 1, 0] } : []
+      plan = has_primary ? (original ? [0, 1, 5] : [0]).each_with_index.map { |delay, index| [original ? 'original' : 'current_relay', relay_name, primary, delay, index + 1, 0, mode] } : []
+      city_candidates = []
       unless current_only
-        inlets.reject { |inlet| recovery_inlet_key(inlet) == recovery_inlet_key(primary) }.first(2).each_with_index do |inlet, index|
-          plan << ['alternate_ss', relay_name, inlet, 0, index + 1, 0]
+        alternate_pool = mode == 'ss' ? rotating_ss_recovery_inlets(relay_name, inlets, excluding: [recovery_inlet_key(primary)]) : []
+        alternate_pool.first(3).each_with_index do |inlet, index|
+          plan << ['alternate_ss', relay_name, inlet, 0, index + 1, 0, mode]
         end
-        recovery_relay_candidates(relay_name, preference: preference).first(4).each_with_index do |candidate, index|
-          recovery_inlets(candidate, mode).first(2).each_with_index do |inlet, inlet_index|
-            plan << ['same_city', candidate, inlet, 0, inlet_index + 1, index + 1]
+        city_candidates = recovery_relay_candidates(relay_name, preference: preference).first(4)
+        city_candidates.each_with_index do |candidate, index|
+          pool = recovery_inlets(candidate, mode)
+          pool = rotating_ss_recovery_inlets(candidate, pool) if mode == 'ss'
+          pool.first(2).each_with_index do |inlet, inlet_index|
+            plan << ['same_city', candidate, inlet, 0, inlet_index + 1, index + 1, mode]
+          end
+        end
+        if preference == 'auto'
+          [relay_name, *city_candidates].uniq.each_with_index do |candidate, city_index|
+            %w[ipv6 ipv4].each do |fallback_mode|
+              fallback_relay = Array(@metadata&.dig('wireguard', 'relays')).find { |item| item['hostname'] == candidate && item['active'] == true }
+              next unless fallback_relay && transport_supported?(fallback_relay, fallback_mode)
+              pool = recovery_inlets(candidate, fallback_mode)
+              pool.first(1).each { |inlet| plan << ['transport_fallback', candidate, inlet, 0, 1, city_index, fallback_mode] }
+            end
           end
         end
       end
-      plan.each_with_index do |(phase, relay, inlet, delay, inlet_index, city_index), plan_index|
+      plan.each_with_index do |(phase, relay, inlet, delay, inlet_index, city_index, candidate_mode), plan_index|
         break unless recovery_budget_remaining? && network_attempt_current?
         break unless @mutex.synchronize { @state[:generation] == generation }
-        next_step = %w[original current_relay].include?(phase) ? '原入口最多 3 次 → 同节点最多 2 个备用 SS → 最多 4 个同城节点' : phase == 'alternate_ss' ? '备用入口仍失败，再试同城节点；每节点最多 2 个入口' : '继续下一个同城候选；不跨城，也不转为直连回落'
+        next_step = %w[original current_relay].include?(phase) ? '原入口最多 3 次 → 同节点最多 3 个备用 SS → 最多 4 个同城节点；最后才是 IPv6/IPv4' : phase == 'alternate_ss' ? '备用入口仍失败，再试同城节点；每节点最多 2 个入口' : '继续下一个同城候选；不跨城，也不转为直连回落'
+        next_step = 'SS 候选已失败；依次验证同城 IPv6/IPv4，仍无 DIRECT 回落' if phase == 'transport_fallback'
         fields = { target_relay: relay, inlet_attempt: inlet_index, city_attempt: city_index,
                    next_step: next_step, _retry_mono: delay.positive? ? monotonic_now + delay : nil }
         endpoint = inlet.is_a?(Hash) ? inlet[:inlet] : inlet
-        fields.merge!(endpoint: endpoint&.first, endpoint_port: endpoint&.[](1), transport: mode)
+        fields.merge!(endpoint: endpoint&.first, endpoint_port: endpoint&.[](1), transport: candidate_mode)
         recovery_progress(delay.positive? ? 'retry_wait' : phase, **fields,
-                          message: delay.positive? ? "上次已清理，等待 #{delay} 秒后重试原入口" : "正在验证 #{relay} 的#{phase == 'original' ? '原入口' : phase == 'current_relay' ? '当前官方入口（原入口已不可用）' : phase == 'alternate_ss' ? '备用 SS' : '同城入口'}")
+                          message: delay.positive? ? "上次已清理，等待 #{delay} 秒后重试原入口" : "正在验证 #{relay} 的#{phase == 'original' ? '原入口' : phase == 'current_relay' ? '当前官方入口（原入口已不可用）' : phase == 'alternate_ss' ? '备用 SS' : phase == 'transport_fallback' ? candidate_mode.upcase + ' 保底入口' : '同城入口'}")
         break unless recovery_wait(delay) && recovery_budget_remaining? && network_attempt_current?
         @mutex.synchronize { @state[:recovery][:attempt] += 1 }
         recovery_progress(phase, _retry_mono: nil, message: "正在建立并验证 #{relay} · 第 #{inlet_index} 次入口尝试")
-        Thread.current[:adapter_recovery_inlet] = { relay: relay, mode: mode, candidate: inlet }
+        Thread.current[:adapter_recovery_inlet] = { relay: relay, mode: candidate_mode, candidate: inlet }
         evidence = {}
         expected = @mutex.synchronize { @state.slice(:generation, :active_slot, :active_relay) }
         resuming = reason == 'network-resume' || (manual && local_network_recovery_pending?)
         activation_reason = resuming ? (relay == relay_name ? 'network-resume' : 'network-resume-fallback') : 'ordered-recovery'
         ok = activate(relay, reason: activation_reason, transport_preference: preference, expected_state: expected, attempt_evidence: evidence)
+        record_ss_recovery_attempt(relay, inlet) if candidate_mode == 'ss' && phase != 'original' && evidence[:attempted] && !evidence[:local_failure]
         break unless network_attempt_current?
         if ok
           ready = @mutex.synchronize { @state[:service_readiness] == 'ready' }
@@ -3475,6 +3497,34 @@ class MullvadAdapter
   end
 
   def activate_startup_with_fallback(preferred_relay, preference, reason:, expected_state: nil)
+    if normalize_transport_preference(preference) == 'auto'
+      return false if @mutex.synchronize { !@state[:active_slot].nil? }
+      @mutex.synchronize { @state[:transport_preference] = 'auto' }
+      # A service/UI update must not discard a route validated moments ago.
+      # This is one bounded startup verification, not background SS preemption.
+      recent = @history_mutex.synchronize do
+        TRANSPORT_MODES.filter_map do |mode|
+          history = @relay_history["#{preferred_relay}|#{mode}"]
+          tested = history && history[:last_tested_at] && (Time.parse(history[:last_tested_at]) rescue nil)
+          [mode, tested] if tested && Time.now - tested < 90 && history[:last_result] && classify_canary(history[:last_result])[:service_readiness] == 'ready'
+        end.max_by { |_, tested| tested }
+      end
+      relay = Array(@metadata&.dig('wireguard', 'relays')).find { |item| item['hostname'] == preferred_relay && item['active'] == true }
+      if recent && relay && relay['location'] == recovery_city(preferred_relay) && transport_supported?(relay, recent.first)
+        mode = recent.first
+        inlet = mode == 'ss' ? ss_endpoint_candidates(relay).first : nil
+        previous_pin = Thread.current[:adapter_recovery_inlet]
+        begin
+          Thread.current[:adapter_recovery_inlet] = { relay: preferred_relay, mode: mode, candidate: inlet }
+          evidence = {}
+          return true if activate(preferred_relay, reason: 'startup-preserve', transport_preference: 'auto', expected_state: expected_state, attempt_evidence: evidence)
+          return false if evidence[:local_failure] || !network_attempt_current?
+        ensure
+          Thread.current[:adapter_recovery_inlet] = previous_pin
+        end
+      end
+      return run_ordered_recovery(preferred_relay, reason: reason, expected_state: expected_state)
+    end
     with_recovery_budget(reason, preferred_relay) do
       normalized = normalize_transport_preference(preference)
       active_relays = Array(@metadata&.dig('wireguard', 'relays')).select { |relay| relay['active'] == true }
@@ -3752,8 +3802,8 @@ class MullvadAdapter
     ipv4 = relay['ipv4_addr_in'].to_s.strip
     ipv6 = relay['ipv6_addr_in'].to_s.strip
     raise "metadata relay #{hostname} has no IP entrance" if ipv4.empty? && ipv6.empty?
-    validate_ip_address(ipv4, "metadata relay #{hostname} ipv4_addr_in") unless ipv4.empty?
-    validate_ip_address(ipv6, "metadata relay #{hostname} ipv6_addr_in") unless ipv6.empty?
+    validate_ip_address(ipv4, "metadata relay #{hostname} ipv4_addr_in", family: :ipv4) unless ipv4.empty?
+    validate_ip_address(ipv6, "metadata relay #{hostname} ipv6_addr_in", family: :ipv6) unless ipv6.empty?
 
     extras = relay['shadowsocks_extra_addr_in']
     if extras && !extras.is_a?(Array)
@@ -3765,8 +3815,10 @@ class MullvadAdapter
     relay
   end
 
-  def validate_ip_address(value, label)
-    IPAddr.new(value.to_s)
+  def validate_ip_address(value, label, family: nil)
+    address = IPAddr.new(value.to_s)
+    raise "#{label} has the wrong address family" if family && !address.public_send("#{family}?")
+    address
   rescue IPAddr::InvalidAddressError
     raise "#{label} is not a valid IP address"
   end
@@ -3807,11 +3859,11 @@ class MullvadAdapter
 
   def set_metadata_state(live:, cache:, source:, error:, fetched_at:, warnings: nil)
     @mutex.synchronize do
-      @state[:metadata] = {
+      @state[:metadata] = @state[:metadata].slice(:last_attempt_at, :refreshing, :revision, :next_refresh_at, :relay_count, :cache_error).merge(
         live: live, cache: cache, source: source, age_seconds: nil, error: error,
         fetched_at: fetched_at&.iso8601,
         validation_warnings: Array(warnings || @last_metadata_validation_warnings).first(20)
-      }
+      )
       @state[:updated_at] = Time.now.iso8601
     end
   end
@@ -3845,12 +3897,55 @@ class MullvadAdapter
     false
   end
 
-  def refresh_metadata(force: false, background: false)
-    @metadata_mutex.synchronize do
+  # Coalesce explicit UI updates with the existing catalogue owner, independently
+  # of connection/recovery admission. No lifecycle operation is queued here.
+  def request_metadata_refresh
+    @metadata_refresh_job_mutex.synchronize do
+      if @metadata_refresh_thread&.alive? || @metadata_mutex.locked?
+        return { accepted: false, refreshing: true }
+      end
+      @mutex.synchronize { @state[:metadata][:refreshing] = true }
+      @metadata_refresh_thread = Thread.new do
+        refresh_metadata(force: true, background: true, nonblocking: true)
+      rescue StandardError => error
+        log_probe_event('metadata-refresh-error', error_class: error.class.name)
+      end
+      { accepted: true, refreshing: true }
+    end
+  end
+
+  def persist_metadata_cache(payload)
+    path = metadata_cache_path
+    temporary = "#{path}.pending-#{Process.pid}-#{SecureRandom.hex(6)}"
+    File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
+      file.write(JSON.generate(payload))
+      file.flush
+      file.fsync
+    end
+    File.rename(temporary, path)
+  ensure
+    FileUtils.rm_f(temporary) if temporary
+  end
+
+  def metadata_cache_valid?
+    warnings = @last_metadata_validation_warnings
+    File.file?(metadata_cache_path) && !!validate_metadata_payload(JSON.parse(File.read(metadata_cache_path)))
+  rescue JSON::ParserError, RuntimeError, SystemCallError
+    false
+  ensure
+    @last_metadata_validation_warnings = warnings
+  end
+
+  def refresh_metadata(force: false, background: false, nonblocking: false)
+    acquired = (background || nonblocking) ? @metadata_mutex.try_lock : @metadata_mutex.lock
+    return @metadata unless acquired
+    begin
       if !force && @metadata && @metadata_fetched_at && (Time.now - @metadata_fetched_at) < @options[:metadata_ttl]
         return @metadata
       end
-
+      @mutex.synchronize do
+        @state[:metadata].merge!(refreshing: true, last_attempt_at: Time.now.iso8601)
+      end
       proxy_args = bootstrap_proxy_args
       parsed = nil
       last_error = nil
@@ -3863,50 +3958,53 @@ class MullvadAdapter
         begin
           parsed = validate_metadata_payload(JSON.parse(stdout))
           break
-        rescue JSON::ParserError, RuntimeError => e
-          last_error = e.message
+        rescue JSON::ParserError, RuntimeError => error
+          last_error = error.message
         end
       end
-
       unless parsed
         @mutex.synchronize { @metrics[:metadata_refresh_failures] += 1 }
-        cache = metadata_cache_path
-        if File.file?(cache)
-          begin
-            cached = validate_metadata_payload(JSON.parse(File.read(cache)))
-            @metadata = cached
-            @metadata_fetched_at = File.mtime(cache)
-            set_metadata_state(live: false, cache: true, source: 'cache', error: last_error, fetched_at: @metadata_fetched_at)
-            record_metadata_validation_warnings('cache')
-            set_dns_status(:bootstrap, 'degraded', "live metadata fetch failed; using last valid cache: #{last_error}")
-            check_clash_global_path unless background
-            return @metadata
-          rescue JSON::ParserError, RuntimeError => e
-            last_error = "#{last_error}; cache invalid: #{e.message}"
-          end
+        # Never replace a newer valid in-memory catalogue with an older disk file.
+        if @metadata
+          set_metadata_state(live: false, cache: metadata_cache_valid?, source: 'memory', error: last_error, fetched_at: @metadata_fetched_at)
+          set_dns_status(:bootstrap, 'degraded', 'live metadata fetch failed; retaining last validated catalogue')
+          return @metadata
+        end
+        if load_cached_metadata
+          set_metadata_state(live: false, cache: true, source: 'cache', error: last_error, fetched_at: @metadata_fetched_at)
+          return @metadata
         end
         set_metadata_state(live: false, cache: false, source: 'none', error: last_error, fetched_at: nil)
         raise "metadata fetch failed: #{last_error}"
       end
-
+      cache_error = nil
+      begin
+        persist_metadata_cache(parsed)
+        cache_valid = true
+      rescue StandardError => error
+        cache_error = error.class.name
+        cache_valid = metadata_cache_valid?
+      end
       @metadata = parsed
       @metadata_fetched_at = Time.now
-      write_json_private(metadata_cache_path, parsed, secret: false)
       @mutex.synchronize { @metrics[:metadata_refreshes] += 1 }
       route = @options[:bootstrap_proxy].to_s.empty? ? 'system-https' : 'bootstrap-proxy'
-      set_metadata_state(live: true, cache: true, source: route, error: nil, fetched_at: @metadata_fetched_at)
+      set_metadata_state(live: true, cache: cache_valid, source: route, error: nil, fetched_at: @metadata_fetched_at)
+      summary = { cache_error: cache_error, relay_count: parsed.dig('wireguard', 'relays').length,
+                  revision: Digest::SHA256.hexdigest(JSON.generate(parsed)),
+                  next_refresh_at: (@metadata_fetched_at + @options[:metadata_ttl]).iso8601 }
+      @mutex.synchronize { @state[:metadata].merge!(summary) }
       record_metadata_validation_warnings(route)
       set_dns_status(:bootstrap, 'pass', "Mullvad API fetched via #{route}")
       check_clash_global_path unless background
       parsed
+    rescue StandardError => error
+      set_metadata_state(live: false, cache: metadata_cache_valid?, source: (@metadata ? 'memory' : 'none'), error: error.message, fetched_at: @metadata_fetched_at)
+      raise
+    ensure
+      @mutex.synchronize { @state[:metadata][:refreshing] = false }
+      @metadata_mutex.unlock
     end
-  rescue JSON::ParserError => e
-    @mutex.synchronize { @metrics[:metadata_refresh_failures] += 1 }
-    set_metadata_state(live: false, cache: File.file?(metadata_cache_path), source: 'none', error: e.message, fetched_at: @metadata_fetched_at)
-    raise "metadata JSON invalid: #{e.message}"
-  rescue StandardError => e
-    set_metadata_state(live: false, cache: File.file?(metadata_cache_path), source: (@metadata ? 'cache' : 'none'), error: e.message, fetched_at: @metadata_fetched_at)
-    raise
   end
 
 
@@ -4120,17 +4218,6 @@ class MullvadAdapter
   def transport_candidates(preference, relay)
     normalized = normalize_transport_preference(preference)
     modes = normalized == 'auto' ? AUTO_TRANSPORT_ORDER : [normalized]
-    if normalized == 'auto'
-      recent = @history_mutex.synchronize do
-        modes.filter_map do |mode|
-          entry = @relay_history["#{relay['hostname']}|#{mode}"]
-          result = entry && entry[:last_result]
-          at = entry && entry[:last_tested_at] && (Time.parse(entry[:last_tested_at]) rescue nil)
-          [mode, at] if at && Time.now - at < 600 && result && classify_canary(result)[:service_readiness] == 'ready'
-        end
-      end
-      modes = recent.sort_by { |_, at| -at.to_f }.map(&:first) + modes
-    end
     pinned = Thread.current[:adapter_recovery_inlet]
     modes = [pinned[:mode]] if pinned && pinned[:relay] == relay['hostname']
     supported = modes.uniq.select { |mode| transport_supported?(relay, mode) }
@@ -4308,57 +4395,80 @@ class MullvadAdapter
     FileUtils.rm_f(tmp) if defined?(tmp) && File.exist?(tmp)
   end
 
+  # Dedicated SS addresses and primary-address SS ports are simultaneous
+  # official paths, not mutually exclusive. Keep the pool separate from the
+  # small per-transaction selection window.
+  def ss_catalogue_candidates(relay)
+    extra = Array(relay['shadowsocks_extra_addr_in']).select { |ip| ipv4?(ip) }.uniq
+    candidates = extra.map { |ip| [ip, EXTRA_SS_PORT, 'extra-ss-ipv4'] }
+    raw_ranges = @metadata&.dig('wireguard', 'shadowsocks_port_ranges')
+    ranges = Array(raw_ranges).empty? ? [] : validated_port_ranges(raw_ranges, 'shadowsocks port ranges')
+    if ipv4?(relay['ipv4_addr_in']) && !ranges.empty?
+      total = ranges.sum { |low, high| high - low + 1 }
+      ports = total <= 512 ? ranges.flat_map { |low, high| (low..high).to_a }.uniq : deterministic_port_sample(ranges, relay['hostname'], 512)
+      candidates.concat(ports.map { |port| [relay['ipv4_addr_in'], port, 'relay-ipv4-ss-port'] })
+    end
+    candidates.uniq { |ip, port, _| [ip, port] }
+  end
+
   def ss_endpoint_candidates(relay, include_cooling: false)
-    relay_name = relay['hostname'].to_s
-    extra = Array(relay['shadowsocks_extra_addr_in']).select { |ip| ipv4?(ip) }
+    name = relay['hostname'].to_s
     history = @ss_endpoint_mutex.synchronize do
-      Marshal.load(Marshal.dump(@ss_endpoint_history[relay_name.to_sym] || @ss_endpoint_history[relay_name] || {}))
+      Marshal.load(Marshal.dump(@ss_endpoint_history[name.to_sym] || @ss_endpoint_history[name] || {}))
     end
     stats = history[:endpoints].is_a?(Hash) ? history[:endpoints] : {}
-
-    if extra.empty?
-      ranges = validated_port_ranges(@metadata.dig('wireguard', 'shadowsocks_port_ranges'), 'shadowsocks port ranges')
-      total_ports = ranges.sum { |low, high| high - low + 1 }
-      desired = [3, total_ports].min
-      all_ports = if total_ports <= 512
-                    ranges.flat_map { |low, high| (low..high).to_a }.uniq
-                  else
-                    deterministic_port_sample(ranges, relay_name, [desired * 8, 512].min)
-                  end
-      candidates = all_ports.map { |port| [relay.fetch('ipv4_addr_in'), port, 'relay-ipv4-random-port'] }
-      ranked = rank_ss_endpoint_candidates(candidates, stats, relay_name)
-      return ranked.first(desired) if include_cooling
-      available = ranked.reject { |candidate| endpoint_cooling_down?(endpoint_stats_for(stats, candidate[0], candidate[1])) }
-      available = [ranked.min_by { |candidate| endpoint_retry_at(endpoint_stats_for(stats, candidate[0], candidate[1])) }] if available.empty?
-      return available.compact.first(desired)
-    end
-
+    ranked = rank_ss_endpoint_candidates(ss_catalogue_candidates(relay), stats, name)
     last_good = history[:last_good].to_s
-    original_order = extra.each_with_index.to_h
+    ranked = ranked.each_with_index.sort_by do |candidate, index|
+      preferred = [endpoint_history_key(candidate[0], candidate[1]), candidate[0]].include?(last_good) && endpoint_stats_for(stats, candidate[0], candidate[1])[:consecutive_failures].to_i.zero?
+      [preferred ? 0 : 1, index]
+    end.map(&:first)
+    return ranked if include_cooling
+    available = ranked.reject { |candidate| endpoint_cooling_down?(endpoint_stats_for(stats, candidate[0], candidate[1])) }
+    available = [ranked.min_by { |candidate| endpoint_retry_at(endpoint_stats_for(stats, candidate[0], candidate[1])) }] if available.empty?
+    available.compact.first(6)
+  end
 
-    ranked = extra.sort_by do |ip|
-      endpoint_stats = endpoint_stats_for(stats, ip, EXTRA_SS_PORT)
-      successes = endpoint_stats[:successes].to_i
-      failures = endpoint_stats[:failures].to_i
-      samples = successes + failures
-      success_rate = samples.positive? ? successes.fdiv(samples) : 0.0
-      [
-        [endpoint_history_key(ip, EXTRA_SS_PORT), ip].include?(last_good) ? 0 : 1,
-        endpoint_trust_rank(successes, samples, endpoint_stats[:consecutive_failures].to_i),
-        endpoint_stats[:consecutive_failures].to_i,
-        -success_rate,
-        endpoint_stats[:last_ping_ms] || Float::INFINITY,
-        original_order.fetch(ip, 9_999)
-      ]
+  def ss_candidate_authorized?(relay, candidate)
+    if @metadata
+      current = Array(@metadata.dig('wireguard', 'relays')).find { |item| item['hostname'] == relay['hostname'] && item['active'] == true }
+      return false unless current && current['public_key'] == relay['public_key']
+      relay = current
     end
-    return ranked.map { |ip| [ip, EXTRA_SS_PORT, 'extra-ss-ipv4'] } if include_cooling
-    available = ranked.reject do |ip|
-      endpoint_cooling_down?(endpoint_stats_for(stats, ip, EXTRA_SS_PORT))
+    ip, port = candidate
+    return false unless ipv4?(ip) && port.is_a?(Integer) && port.between?(1, 65_535)
+    return true if Array(relay['shadowsocks_extra_addr_in']).include?(ip) && port == EXTRA_SS_PORT
+    relay['ipv4_addr_in'] == ip && validated_port_ranges(@metadata.dig('wireguard', 'shadowsocks_port_ranges'), 'shadowsocks port ranges').any? { |low, high| port.between?(low, high) }
+  rescue RuntimeError
+    false
+  end
+
+  # Original short retries deliberately repeat one exact path. Only the
+  # fallback queue rotates; planning never consumes an unstarted candidate.
+  def rotating_ss_recovery_inlets(relay_name, inlets, excluding: [])
+    pool = inlets.uniq { |inlet| recovery_inlet_key(inlet) }
+    keys = pool.map { |inlet| recovery_inlet_key(inlet) }
+    fingerprint = Digest::SHA256.hexdigest(JSON.generate(keys.sort_by { |key| key.map(&:to_s) }))
+    @ss_endpoint_mutex.synchronize do
+      window = @ss_recovery_windows[relay_name]
+      if !window || window[:fingerprint] != fingerprint
+        window = @ss_recovery_windows[relay_name] = { fingerprint: fingerprint, seen: [] }
+      end
+      eligible = pool.reject { |inlet| excluding.include?(recovery_inlet_key(inlet)) }
+      unseen = eligible.reject { |inlet| window[:seen].include?(recovery_inlet_key(inlet)) }
+      if unseen.empty? && !eligible.empty?
+        window[:seen].clear
+        unseen = eligible
+      end
+      unseen
     end
-    # If every inlet is cooling down, allow just one trial, never a complete
-    # sweep of known failures. A manual request can still detect a recovery.
-    available = [ranked.min_by { |ip| endpoint_retry_at(endpoint_stats_for(stats, ip, EXTRA_SS_PORT)) }] if available.empty?
-    available.map { |ip| [ip, EXTRA_SS_PORT, 'extra-ss-ipv4'] }
+  end
+
+  def record_ss_recovery_attempt(relay_name, inlet)
+    @ss_endpoint_mutex.synchronize do
+      window = @ss_recovery_windows[relay_name]
+      window[:seen] |= [recovery_inlet_key(inlet)] if window
+    end
   end
 
   def deterministic_port_sample(ranges, relay_name, count)
@@ -4399,6 +4509,7 @@ class MullvadAdapter
         endpoint_stats[:consecutive_failures].to_i,
         -success_rate,
         endpoint_stats[:last_ping_ms] || Float::INFINITY,
+        candidate[2] == 'extra-ss-ipv4' ? 0 : 1,
         stable_order,
         index
       ]
@@ -4494,7 +4605,7 @@ class MullvadAdapter
         inlets.map { |inlet| { entry: entry['hostname'], inlet: inlet } }
       end
     end
-    mode.to_s == 'ss' ? ss_endpoint_candidates(relay) : [nil]
+    mode.to_s == 'ss' ? ss_endpoint_candidates(relay).first(3) : [nil]
   end
 
   def record_ss_endpoint_canary(relay_name, mode, worker_info, canary)
@@ -5623,6 +5734,7 @@ class MullvadAdapter
     case mode
     when 'ss'
       endpoint, port, endpoint_kind = ss_candidate || ss_endpoint(relay)
+      raise LocalProbeUnavailable, 'catalogue-inlet-withdrawn' unless ss_candidate_authorized?(relay, [endpoint, port])
       outer_interface = physical_interface(endpoint)
       inlet_name = 'SS-INLET'
       proxies << {
