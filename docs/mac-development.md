@@ -141,7 +141,7 @@ state_busy/action_busy/capture_error，30秒内最多一条，不续新旧快照
 
 ## Ordered recovery and main-page controls
 
-The [Mac recovery contract](../openspec/changes/mac-ordered-city-recovery/specs/recovery/spec.md) defines the current ladder: original authorized inlet up to 3 starts (0/1/5-second cleanup-relative waits), at most 2 other SS inlets, then at most 4 eligible same-city nodes with 2 inlets each. The 300-second ordered-round admission budget is distinct from the existing cold-start/city-selection budget. DNS-only degradation preserves the live tunnel. Local offline/probe/cleanup problems pause or defer instead of scoring all nodes as dead.
+The [Mac recovery contract](../openspec/changes/mac-ordered-city-recovery/specs/recovery/spec.md) defines the current ladder: original authorized inlet up to 3 starts (0/1/5-second cleanup-relative waits), at most 3 other SS inlets, then at most 4 eligible same-city nodes with 2 inlets each. The 300-second ordered-round admission budget is distinct from the existing cold-start/city-selection budget. DNS-only degradation preserves the live tunnel. Local offline/probe/cleanup problems pause or defer instead of scoring all nodes as dead.
 
 Home exposes actual recovery progress and authenticated `POST /recovery` controls: `{"action":"retry-current"}`, `{"action":"retry-round"}`, `{"action":"stop"}`. Retry controls return the existing operation receipt; stop acknowledges cancellation and lets bounded cleanup finish. Use the existing owner capability; browser-origin mutations remain rejected. The status `recovery` object is optional for older UI/daemon compatibility. Its countdown is a fresh daemon observation; stale reads must not be shown as current progress. Mac has no chain fallback yet.
 
@@ -169,3 +169,5 @@ without treating every local timeout as a tunnel failure.
 物理接口观察另外记录已取得非链路本地地址的地址族。没有IPv6源地址时不会尝试IPv6候选；未知观测保持未知，不据此宣布节点失败。小型SS窗口交错覆盖专用地址和主地址SS端口，避免全部窗口仍只使用专用20484入口。
 
 SS网关地址与其内部转发的WG目标分开：SS server来自专用地址/主地址SS端口；SS封装内的WG目标使用远端服务约定的127.0.0.1:51820。这个地址由远端SS服务解释，不是本机直连回环；dialer-proxy始终保留SS-INLET，实际外层连接仍绑定物理接口、发送至官方SS地址。不要因为看到loopback就改成节点公网WG地址：真实串行A/B已出现公网目标无回包、远端loopback完成WG认证并传输HTTPS的差异。直接IPv4/IPv6模式仍使用API节点公网地址及允许的WG端口。配置形状测试不能替代真实握手验收。
+
+官方依据在调用侧的 [talpid-wireguard SS settings](https://github.com/mullvad/mullvadvpn-app/blob/2026.5/talpid-wireguard/src/obfuscation.rs#L137-L159)：这里把内部目标设为IPv4/IPv6远端loopback:51820，再交给SS封装器。只读relay selector或SS封装器而遗漏这层调用者，会把公网WG地址错误地当成SS内部目标。
