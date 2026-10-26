@@ -78,7 +78,7 @@ export function useChainBackup(data:Dashboard|null,observationCurrent=true) {
         failedSafely=done.backup_test_status==="failed"&&done.backup_test_restored===true;
         if(pinned||passed||!canContinueBackup(done,{
           boot,source:initial.source_sha,id:baseline+1,fingerprint:result.fingerprint,revision:result.revision??0,
-          relay:saved.connection?.relay??null,inlet:saved.connection?.inlet??null,
+          relay:saved.connection?.relay??null,inlet:saved.connection?.inlet??null,transport:saved.connection?.transport??null,
         }))break;
         excluded.push(result.source_fingerprint??result.fingerprint);
       }

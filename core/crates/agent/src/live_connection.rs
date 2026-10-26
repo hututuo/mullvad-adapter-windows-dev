@@ -1,11 +1,11 @@
 //! Product connection owner. Network/process I/O stays in the persistent resource.
 use crate::live_identity::TunnelIdentity;
+use crate::live_route::{self, Route};
 use adapter_control::owned_lifecycle::{OperationTicket, ResourceOwner};
 use adapter_domain::{Attachment, CandidateAttempt, Path};
 use adapter_engine_mihomo::{
     connection_tunnel::{self, Command, Reply, TunnelSpec},
     controller::Selected,
-    Transport,
 };
 use adapter_platform::windows_runtime::PrivateRuntime;
 use adapter_protocol::app::{ConnectionInfo, Dashboard};
@@ -58,6 +58,7 @@ pub(crate) struct Connections {
     manual_candidates: Option<(Instant, String, VecDeque<String>, bool)>,
     deferred: Option<String>,
     last_relay: Option<String>,
+    startup_route: Option<(String, Route)>,
     disconnecting: bool,
     next_attempt: Instant,
     logs: crate::live_diagnostics::LogClient,
@@ -102,6 +103,7 @@ impl Connections {
                 manual_candidates: None,
                 deferred: None,
                 last_relay: None,
+                startup_route: None,
                 disconnecting: false,
                 next_attempt: Instant::now(),
                 logs,
@@ -138,11 +140,13 @@ impl Connections {
         self.route_trial = None;
         self.forced_route = None;
         self.restore_target = None;
+        self.startup_route = None;
     }
     fn begin_route_trial(&mut self) {
         // Route trials have a temporary target and rollback path. Keep the
         // persistent city/relay intent used by ordinary recovery.
         self.plan.clear();
+        self.startup_route = None;
         self.active_failures.clear();
         self.route_trial = None;
         self.forced_route = None;
@@ -324,7 +328,7 @@ impl Connections {
             self.plan.short_retry(
                 &attempt.path.relay,
                 &attempt.path.inlet,
-                attempt.path.transport == "wireguard-over-shadowsocks-chain",
+                &attempt.path.transport,
             )
         } else {
             None
@@ -369,14 +373,23 @@ impl Connections {
         self.save_history();
         Some(advanced)
     }
-    fn enter_chain(&mut self, owner: &mut ResourceOwner, dashboard: &Dashboard) -> bool {
-        if self.route_trial.is_some()
-            || self.chain.is_none()
-            || dashboard.settings.tunnel_route != adapter_protocol::app::TunnelRoute::Auto
-            || !self.plan.enter_chain()
+    fn enter_next_phase(&mut self, owner: &mut ResourceOwner, dashboard: &Dashboard) -> bool {
+        if self.route_trial.is_none()
+            && dashboard.settings.tunnel_route != adapter_protocol::app::TunnelRoute::Chain
+            && self.plan.enter_native()
         {
-            return false;
+            self.refill_phase(owner);
+            let code = if self.plan.native_phase == Some(live_route::Family::V6) {
+                "native_ipv6_fallback_started"
+            } else {
+                "native_ipv4_fallback_started"
+            };
+            let _ = self.logs.event("connection", code);
+            return true;
         }
+        self.enter_chain(owner, dashboard)
+    }
+    fn refill_phase(&mut self, owner: &mut ResourceOwner) {
         if let Some((_, queue)) = &mut self.recovering {
             *queue = self.plan.relays.iter().cloned().collect();
         }
@@ -387,6 +400,16 @@ impl Connections {
         let now = owner.now();
         let _ = owner.state_mut().finish_original_phase(now);
         self.next_attempt = Instant::now();
+    }
+    fn enter_chain(&mut self, owner: &mut ResourceOwner, dashboard: &Dashboard) -> bool {
+        if self.route_trial.is_some()
+            || self.chain.is_none()
+            || dashboard.settings.tunnel_route != adapter_protocol::app::TunnelRoute::Auto
+            || !self.plan.enter_chain()
+        {
+            return false;
+        }
+        self.refill_phase(owner);
         let _ = self
             .logs
             .event("connection", "direct_routes_exhausted_chain_last");
@@ -426,6 +449,21 @@ impl Connections {
             dashboard.settings.selected_city.as_deref(),
             relay.as_deref(),
         );
+        if action == A::RetryCurrent {
+            if let Some(path) = &previous {
+                if let Some(relay) = catalogue
+                    .active_in_city(&path.city)
+                    .find(|r| r.hostname() == path.relay)
+                {
+                    if let Some(route) =
+                        Route::authorize(catalogue, relay, &path.transport, &path.inlet)
+                            .filter(|r| !r.is_ss())
+                    {
+                        self.startup_route = Some((path.relay.clone(), route));
+                    }
+                }
+            }
+        }
         if matches!(action, A::TestBackup | A::ChainFallback | A::ReturnDirect) {
             self.forced_route = Some(action != A::ReturnDirect);
             self.route_trial = Some(RouteTrial {
@@ -631,16 +669,26 @@ impl Connections {
             && dashboard.operation.is_none()
         {
             ("idle", "monitor")
+        } else if self.plan.native_phase == Some(live_route::Family::V6) {
+            ("native_ipv6", "native_ipv4")
+        } else if self.plan.native_phase == Some(live_route::Family::V4) {
+            ("native_ipv4", "chain_fallback")
         } else if self.plan.chain_phase {
             ("chain_fallback", "new_round")
         } else if target.is_some_and(|p| Some(p.relay.as_str()) != self.plan.original_relay()) {
-            ("same_city", "chain_fallback")
+            ("same_city", "native_ipv6")
         } else if self.plan.short_attempt() < 3 || self.plan.attempts <= 3 {
             ("original_inlet", "same_relay_inlets")
         } else {
             ("same_relay_inlets", "same_city")
         };
         dashboard.recovery = Some(adapter_protocol::app::RecoveryProgress {
+            transport: target.map(|p| p.transport.clone()).or_else(|| {
+                dashboard
+                    .connection
+                    .as_ref()
+                    .and_then(|c| c.transport.clone())
+            }),
             stage: stage.into(),
             relay: target
                 .map(|p| p.relay.clone())
@@ -683,21 +731,36 @@ impl Connections {
         }) else {
             return;
         };
-        let Some(endpoint) = value["inlet"]
+        let Some(kind) = value["transport"].as_str() else {
+            return;
+        };
+        let Some(route) = value["inlet"]
             .as_str()
-            .and_then(|v| v.parse::<std::net::SocketAddrV4>().ok())
+            .and_then(|inlet| Route::authorize(catalogue, relay, kind, inlet))
         else {
             return;
         };
-        let Some(inlet) =
-            catalogue.authorize_shadowsocks_inlet(relay, *endpoint.ip(), endpoint.port())
-        else {
+        self.last_relay = Some(relay.hostname().into());
+        self.startup_route = None;
+        if !route.is_ss() {
+            if dashboard.settings.tunnel_route != adapter_protocol::app::TunnelRoute::Chain {
+                self.startup_route = Some((relay.hostname().into(), route));
+            }
+            return;
+        }
+        let endpoint = route.endpoint();
+        let inlet = match endpoint.ip() {
+            std::net::IpAddr::V4(ip) => {
+                catalogue.authorize_shadowsocks_inlet(relay, ip, endpoint.port())
+            }
+            _ => None,
+        };
+        let Some(inlet) = inlet else {
             return;
         };
-        let chained = value["transport"] == "wireguard-over-shadowsocks-chain"
+        let chained = route.chained
             && dashboard.settings.tunnel_route == adapter_protocol::app::TunnelRoute::Chain
             && self.chain.is_some();
-        self.last_relay = Some(relay.hostname().into());
         self.inlet_trials.reconcile(
             relay.hostname(),
             relay.public_key(),
@@ -815,6 +878,53 @@ impl Connections {
         self.deferred = None;
         self.next_attempt = Instant::now();
     }
+    fn pick_route(
+        &mut self,
+        catalogue: &adapter_catalogue::Catalogue,
+        relay: &adapter_catalogue::Relay,
+        exact: Option<&Path>,
+        chained: bool,
+    ) -> Result<Route, &'static str> {
+        if let Some(path) = exact {
+            return Route::authorize(catalogue, relay, &path.transport, &path.inlet)
+                .ok_or("original_inlet_withdrawn");
+        }
+        if let Some(family) = self.plan.native_phase {
+            return Route::native(catalogue, relay, family).ok_or("native_path_unavailable");
+        }
+        if self.forced_route.is_none() && !chained {
+            if let Some((name, route)) = self.startup_route.as_ref() {
+                if name == relay.hostname() {
+                    if let Some(route) = Route::authorize(
+                        catalogue,
+                        relay,
+                        route.kind(),
+                        &route.endpoint().to_string(),
+                    ) {
+                        return Ok(route);
+                    }
+                    self.startup_route = None;
+                }
+            }
+        }
+        let mut allowed = catalogue.shadowsocks_inlets(relay);
+        if let Some(selected) = self
+            .inlet_trials
+            .selected_route(relay.hostname(), chained)
+            .and_then(|i| catalogue.authorize_shadowsocks_inlet(relay, i.address, i.port))
+        {
+            if !allowed.contains(&selected) {
+                allowed.push(selected);
+            }
+        }
+        self.inlet_trials
+            .reconcile(relay.hostname(), relay.public_key(), &allowed);
+        let inlet = self
+            .inlet_trials
+            .choose_route(relay.hostname(), &allowed, chained)
+            .ok_or("shadowsocks_inlets_exhausted")?;
+        Ok(Route::ss(inlet, chained))
+    }
     pub(crate) fn connect(
         &mut self,
         owner: &mut ResourceOwner,
@@ -927,70 +1037,50 @@ impl Connections {
                 || (self.chain_mode == adapter_protocol::app::TunnelRoute::Auto
                     && self.plan.chain_phase)
         };
+        let exact = self
+            .restore_target
+            .as_ref()
+            .filter(|p| p.relay == picked.hostname())
+            .or_else(|| original.then(|| owner.state().path.as_ref().unwrap()))
+            .cloned();
+        let mut route = match self.pick_route(catalogue, picked, exact.as_ref(), chained) {
+            Ok(route) => route,
+            Err(code @ ("shadowsocks_inlets_exhausted" | "native_path_unavailable")) => {
+                if !automatic && self.manual_candidates.is_none() {
+                    let alternatives = self.plan.relays.iter().skip(1).cloned().collect();
+                    self.seed_manual_candidates(city.clone(), alternatives, relay.is_some());
+                    dashboard.status = "connecting".into();
+                    return Ok("recovery_selection_queued".into());
+                }
+                return Err(code);
+            }
+            Err(code) => return Err(code),
+        };
+        let mut binding = route.binding(owner.observation().bindings());
+        // A saved native hint cannot strand startup after changing networks.
+        // Exact active rebuild/rollback remains exact; it never silently swaps.
+        if binding.is_none()
+            && exact.is_none()
+            && self.plan.native_phase.is_none()
+            && !route.is_ss()
+            && self.startup_route.is_some()
+        {
+            self.startup_route = None;
+            route = self.pick_route(catalogue, picked, None, chained)?;
+            binding = route.binding(owner.observation().bindings());
+        }
+        let binding = binding.ok_or(if self.plan.native_phase.is_some() && exact.is_none() {
+            "native_path_unavailable"
+        } else {
+            "physical_binding_unavailable"
+        })?;
+        let chained = route.chained;
         if chained && self.chain.is_none() {
             return Err("chain_not_configured");
         }
         if chained {
             self.chain_relays.insert(picked.hostname().into());
         }
-        let mut authorized_inlets = catalogue.shadowsocks_inlets(picked);
-        if let Some(selected) = self
-            .inlet_trials
-            .selected_route(picked.hostname(), chained)
-            .and_then(|i| catalogue.authorize_shadowsocks_inlet(picked, i.address, i.port))
-        {
-            if !authorized_inlets.contains(&selected) {
-                authorized_inlets.push(selected);
-            }
-        }
-        self.inlet_trials
-            .reconcile(picked.hostname(), picked.public_key(), &authorized_inlets);
-        let inlet = if let Some(target) = self
-            .restore_target
-            .as_ref()
-            .filter(|p| p.relay == picked.hostname())
-        {
-            let endpoint = target
-                .inlet
-                .parse::<std::net::SocketAddrV4>()
-                .map_err(|_| "original_inlet_withdrawn")?;
-            catalogue
-                .authorize_shadowsocks_inlet(picked, *endpoint.ip(), endpoint.port())
-                .ok_or("original_inlet_withdrawn")?
-        } else if original {
-            let saved = owner
-                .state()
-                .path
-                .as_ref()
-                .unwrap()
-                .inlet
-                .parse::<std::net::SocketAddrV4>()
-                .map_err(|_| "original_inlet_withdrawn")?;
-            catalogue
-                .authorize_shadowsocks_inlet(picked, *saved.ip(), saved.port())
-                .ok_or("original_inlet_withdrawn")?
-        } else {
-            let mut allowed = authorized_inlets;
-            if let Some(selected) = self
-                .inlet_trials
-                .selected_route(picked.hostname(), chained)
-                .and_then(|i| catalogue.authorize_shadowsocks_inlet(picked, i.address, i.port))
-            {
-                if !allowed.contains(&selected) {
-                    allowed.push(selected);
-                }
-            }
-            self.inlet_trials
-                .choose_route(picked.hostname(), &allowed, chained)
-                .ok_or("shadowsocks_inlets_exhausted")?
-        };
-        let binding = owner
-            .observation()
-            .bindings()
-            .iter()
-            .find(|b| b.ipv4)
-            .copied()
-            .ok_or("physical_binding_unavailable")?;
         self.next_instance = self
             .next_instance
             .checked_add(1)
@@ -1005,13 +1095,8 @@ impl Connections {
         let path = Path {
             relay: picked.hostname().into(),
             city: city.clone(),
-            transport: if chained {
-                "wireguard-over-shadowsocks-chain"
-            } else {
-                "wireguard-over-shadowsocks"
-            }
-            .into(),
-            inlet: format!("{}:{}", inlet.address, inlet.port),
+            transport: route.kind().into(),
+            inlet: route.endpoint().to_string(),
             entry_relay: None,
             slot: slot.into(),
             instance: self.next_instance,
@@ -1032,10 +1117,7 @@ impl Connections {
             ipv4: key.ipv4,
             ipv6: key.ipv6,
             relay_public_key: picked.public_key().into(),
-            transport: Transport::Shadowsocks {
-                endpoint: inlet.address,
-                port: inlet.port,
-            },
+            transport: route.transport,
             chain: if chained { self.chain.clone() } else { None },
             slot: if slot == "a" {
                 Selected::SlotA
@@ -1080,6 +1162,7 @@ impl Connections {
             self.seed_manual_candidates(attempt.path.city.clone(), alternatives, relay.is_some());
         }
         dashboard.connection = Some(ConnectionInfo {
+            transport: Some(route.kind().into()),
             ping: None,
             relay: attempt.path.relay.clone(),
             city: attempt.path.city.clone(),
@@ -1094,8 +1177,11 @@ impl Connections {
             probes: None,
         });
         self.local_probe_failures = 0;
-        self.plan
-            .attempted(&attempt.path.relay, &attempt.path.inlet, chained);
+        self.plan.attempted(
+            &attempt.path.relay,
+            &attempt.path.inlet,
+            &attempt.path.transport,
+        );
         self.pending = Some(Pending {
             ticket,
             attempt: Some(attempt),
@@ -1295,6 +1381,19 @@ impl Connections {
         if !automatic && self.manual_candidates.is_none() {
             return false;
         }
+        if matches!(path.transport.as_str(), live_route::V6 | live_route::V4) {
+            self.startup_route = None;
+            if self.plan.native_phase.is_none() && self.route_trial.is_none() {
+                if automatic {
+                    self.deferred = Some(path.relay.clone());
+                } else {
+                    self.retry_manual_candidate(path.relay.clone(), true);
+                }
+                self.next_attempt = Instant::now() + Duration::from_millis(250);
+                return true;
+            }
+            return false;
+        }
         let Some(catalogue) = catalogue else {
             return false;
         };
@@ -1453,6 +1552,14 @@ impl Connections {
             return D::StopCleanly;
         }
         match disposition {
+            D::SkipUnavailablePath => {
+                let now = owner.now();
+                let _ = owner.state_mut().retry_after_local_cleanup(attempt, now);
+                self.deferred = None;
+                self.local_retry.clear();
+                let _ = self.logs.event("connection", "native_path_unavailable");
+                D::SkipUnavailablePath
+            }
             D::RetrySameTarget if self.retry_failed_attempt_locally(owner, attempt, automatic) => {
                 D::RetrySameTarget
             }
@@ -1494,13 +1601,22 @@ impl Connections {
         code: &str,
         automatic: bool,
     ) -> crate::recovery_retry::AttemptFailureDisposition {
-        self.apply_attempt_failure_disposition(
-            owner,
-            dashboard,
-            attempt,
-            crate::recovery_retry::attempt_failure_disposition(code),
-            automatic,
-        )
+        let disposition = if code == "worker_route_unavailable"
+            && self.plan.native_phase.is_some()
+            && self.route_trial.is_none()
+            && matches!(
+                attempt.path.transport.as_str(),
+                live_route::V6 | live_route::V4
+            )
+            && !owner.state().paused
+            && owner.observation().binding_settled()
+            && self.retry_window_open(automatic)
+        {
+            crate::recovery_retry::AttemptFailureDisposition::SkipUnavailablePath
+        } else {
+            crate::recovery_retry::attempt_failure_disposition(code)
+        };
+        self.apply_attempt_failure_disposition(owner, dashboard, attempt, disposition, automatic)
     }
     fn recovery(
         &mut self,
@@ -1857,12 +1973,15 @@ impl Connections {
                     }
                     dashboard.active_relay = Some(path.relay.clone());
                     self.last_relay = dashboard.active_relay.clone();
-                    self.inlet_trials.succeeded(
-                        &path.relay,
-                        &path.inlet,
-                        path.transport == "wireguard-over-shadowsocks-chain",
-                    );
-                    self.save_history();
+                    if matches!(path.transport.as_str(), live_route::SS | live_route::CHAIN) {
+                        self.inlet_trials.succeeded(
+                            &path.relay,
+                            &path.inlet,
+                            path.transport == live_route::CHAIN,
+                        );
+                        self.save_history();
+                    }
+                    self.startup_route = None;
                     self.inlet_trials.clear();
                     self.chain_relays.clear();
                     self.active_failures.clear();
@@ -2116,7 +2235,7 @@ impl Connections {
                                 .manual_candidates
                                 .as_ref()
                                 .is_some_and(|(_, _, _, exact)| *exact)
-                            && !self.enter_chain(owner, dashboard)
+                            && !self.enter_next_phase(owner, dashboard)
                         {
                             self.manual_candidates = None;
                             self.schedule_retry(dashboard);
@@ -2193,7 +2312,7 @@ impl Connections {
                             dashboard.active_relay = None;
                         }
                         match disposition {
-                            D::RetrySameTarget | D::StopCleanly => {}
+                            D::RetrySameTarget | D::StopCleanly | D::SkipUnavailablePath => {}
                             D::RoundExpired => {
                                 dashboard.operation = None;
                                 dashboard.readiness = None;
@@ -2324,7 +2443,7 @@ impl Connections {
                             .manual_candidates
                             .as_ref()
                             .is_some_and(|(_, _, _, exact)| *exact)
-                        && !self.enter_chain(owner, dashboard)
+                        && !self.enter_next_phase(owner, dashboard)
                     {
                         self.manual_candidates = None;
                         self.schedule_retry(dashboard);
@@ -2423,7 +2542,12 @@ impl Connections {
                     if let Err(code) =
                         self.connect(owner, dashboard, identity, catalogue, Some(&relay), false)
                     {
-                        if !matches!(code, "relay_not_active" | "shadowsocks_inlets_exhausted") {
+                        if !matches!(
+                            code,
+                            "relay_not_active"
+                                | "shadowsocks_inlets_exhausted"
+                                | "native_path_unavailable"
+                        ) {
                             if let Some((_, _, queue, _)) = &mut self.manual_candidates {
                                 queue.push_front(relay.clone());
                             }
@@ -2434,14 +2558,14 @@ impl Connections {
                         }
                         dashboard.last_error = Some(code.into());
                     }
-                } else if !self.enter_chain(owner, dashboard) {
+                } else if !self.enter_next_phase(owner, dashboard) {
                     self.finish_recovery(owner, dashboard, "same_city_recovery_exhausted");
                 }
             }
             return;
         }
         if self.recovering.as_ref().is_some_and(|(_, q)| q.is_empty()) && self.deferred.is_none() {
-            self.enter_chain(owner, dashboard);
+            self.enter_next_phase(owner, dashboard);
         }
         if let Some((deadline, relays)) = &mut self.recovering {
             if Instant::now() >= *deadline {
@@ -2479,6 +2603,7 @@ impl Connections {
                         "relay_not_active"
                             | "recovery_budget_exhausted"
                             | "shadowsocks_inlets_exhausted"
+                            | "native_path_unavailable"
                     ) {
                         self.deferred = None;
                         self.local_retry.clear();
@@ -2703,3 +2828,7 @@ mod tests {
 #[cfg(test)]
 #[path = "live_trial_tests.rs"]
 mod trial_tests;
+
+#[cfg(test)]
+#[path = "live_native_tests.rs"]
+mod native_tests;

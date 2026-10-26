@@ -15,6 +15,8 @@ mod live_device;
 mod live_diagnostics;
 mod live_identity;
 mod live_quick;
+#[cfg(any(windows, feature = "windows-api-check", test))]
+mod live_route;
 mod live_runtime;
 mod live_status;
 #[cfg(any(windows, feature = "windows-api-check", test))]

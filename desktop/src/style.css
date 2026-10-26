@@ -811,7 +811,7 @@ footer {
 @media(max-width:880px){ .setup-steps > li { gap:12px; } }
 
 .recovery-panel { border-color:#a9c9bb; }
-.recovery-steps { display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;list-style:none;margin:8px 0 22px;padding:0; }
+.recovery-steps { display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;list-style:none;margin:8px 0 22px;padding:0; }
 .recovery-steps li { display:flex;gap:7px;align-items:center;color:#7a8d83;font-size:12px;min-height:40px;padding:8px;border-radius:8px;background:#f2f6f3; }
 .recovery-steps li span { flex:none;display:grid;place-items:center;width:22px;height:22px;border:1px solid #ccd9d1;border-radius:50%;font-size:11px; }
 .recovery-steps li.current { color:#0e5f50;background:#dff0e8;font-weight:650; }

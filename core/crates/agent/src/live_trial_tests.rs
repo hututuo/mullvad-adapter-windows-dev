@@ -125,7 +125,7 @@ fn fixture(kind: TrialKind) -> Fixture {
     connections.plan.start(vec![path.relay.clone()], chained);
     connections
         .plan
-        .attempted(&path.relay, &path.inlet, chained);
+        .attempted(&path.relay, &path.inlet, &path.transport);
     connections.inlet_trials.primary(&path.relay);
     connections.inlet_trials.prefer(&path.relay, inlet, chained);
     connections.forced_route = Some(chained);
@@ -349,6 +349,7 @@ fn fresh_negative_after_success_remains_loggable_without_old_probe_outcomes() {
     use adapter_protocol::app::{ProbeMeasurements, ProbeOutcome};
     let mut f = fixture(TrialKind::TestBackup);
     f.dashboard.connection = Some(ConnectionInfo {
+        transport: None,
         ping: None,
         chained: false,
         relay: f.path.relay.clone(),

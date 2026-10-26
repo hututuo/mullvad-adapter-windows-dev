@@ -23,6 +23,7 @@ import { ClashPage } from "./clash-page";
 import { SetupPage } from "./setup-page";
 import { ChainRoute, useChainBackup } from "./chain-route";
 import { RecoveryPanel } from "./recovery-panel";
+import { transportName } from "./recovery-view";
 import { canCreateDevice } from "./device-creation";
 import { ActivityPanel } from "./activity-panel";
 import { DesktopSettings } from "./desktop-settings";
@@ -905,7 +906,7 @@ function App() {
               <dl className="details">
                 {data?.connection && <>
                   <div><dt>最近连接目标</dt><dd>{data.connection.relay} · {data.connection.city}</dd></div>
-                  <div><dt>外层 SS 入口</dt><dd className="mono">{data.connection.inlet} · 网卡 {data.connection.interface_index}</dd></div>
+                  <div><dt>外层通道入口 · {transportName(data.connection.transport, !!data.connection.chained)}</dt><dd className="mono">{data.connection.inlet} · 网卡 {data.connection.interface_index}</dd></div>
                   <div><dt>最近一次测量</dt><dd>{([["IP",data.connection.ip,data.connection.probes?.ip],["DNS",data.connection.dns,data.connection.probes?.dns],["HTTPS",data.connection.https,data.connection.probes?.https]] as const).map(([name,result,outcome])=>`${name}：${probeText(result,outcome)}`).join(" · ")}</dd></div>
                 </>}
                 <div>

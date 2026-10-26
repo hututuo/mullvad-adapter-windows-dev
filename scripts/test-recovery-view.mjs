@@ -22,10 +22,17 @@ console.log('backup result: exact test id, in-progress, restored, rescue and can
 
 const {canContinueBackup}=await import('../desktop/src/backup-result.ts');
 const restored={...t,boot_id:'boot',source_sha:'sha',status:'connected',backup_test_status:'failed',backup_test_restored:true,chain_fingerprint:'fp',chain_revision:3,connection:{relay:'r',inlet:'i',chained:false}};
-const fence={boot:'boot',source:'sha',id:2,fingerprint:'fp',revision:3,relay:'r',inlet:'i'};
+const fence={boot:'boot',source:'sha',id:2,fingerprint:'fp',revision:3,relay:'r',inlet:'i',transport:null};
 assert.equal(canContinueBackup(restored,fence),true);
 for(const patch of [{boot_id:'new'},{source_sha:'new'},{backup_test_id:1},{backup_test_status:'passed'},{backup_test_status:'cancelled'},{backup_test_restored:false},{chain_fingerprint:'new'},{chain_revision:4},{operation:'connect'},{status:'retry_wait'},{physical_attachment:'unknown'},{settings:{...restored.settings,chain_selection:'pinned'}},{connection:{...restored.connection,chained:true}},{connection:{...restored.connection,inlet:'other'}},{connection:{...restored.connection,relay:'other'}}]) {
   assert.equal(canContinueBackup({...restored,...patch},fence),false,JSON.stringify(patch));
 }
 assert.equal(recoveryView({...d,status:'network_recovering',active_relay:'r',recovery:{...d.recovery,stage:'verifying_original'}},false).title,'正在复验原路径');
 console.log('backup continuation: exact candidate, restored path, boot, source, cancellation, network and manual-pin fences PASS');
+
+assert.equal(recoveryView({...d,recovery:{...d.recovery,stage:'native_ipv6',next:'native_ipv4',transport:'wireguard-ipv6'}},false).index,3);
+assert.match(recoveryView({...d,recovery:{...d.recovery,stage:'native_ipv4'}},false).title,/IPv4/);
+assert.equal(recoveryView({...d,recovery:{...d.recovery,stage:'chain_fallback'}},false).index,4);
+assert.match(recoveryView({...d,status:'connected',connection:{transport:'wireguard-ipv6'},recovery:{...d.recovery,stage:'connected'}},false).title,/IPv6/);
+assert.equal(canContinueBackup({...restored,connection:{...restored.connection,transport:'wireguard-ipv4'}},fence),false);
+console.log('native recovery: V6/V4 before chain, transport labels and exact backup protocol fence PASS');

@@ -47,7 +47,7 @@ export function probeText(value: boolean | null, outcome?: ProbeOutcome) {
   return value === null ? "未测" : value ? "通过" : "未通过";
 }
 export type RecoveryAction = "retry_current" | "retry_city" | "test_backup" | "chain_fallback" | "return_direct";
-export type RecoveryProgress = { stage:string; relay:string|null; inlet:string|null; attempt:number; elapsed_seconds:number; budget_seconds:number; wait_seconds:number; next:string; direct_return_in_seconds:number|null };
+export type RecoveryProgress = { transport?:string|null; stage:string; relay:string|null; inlet:string|null; attempt:number; elapsed_seconds:number; budget_seconds:number; wait_seconds:number; next:string; direct_return_in_seconds:number|null };
 export type Dashboard = {
   status_observation?: { age_ms:number; capture_ms:number; native_elapsed_ms:number } | null;
   sequence: number;
@@ -64,7 +64,7 @@ export type Dashboard = {
   device_name: string | null;
   public_key: string | null;
   active_relay: string | null;
-  connection?: { relay:string; city:string; inlet:string; interface_index:number; instance:number; phase:string; chained?:boolean; ping?:{rtt_ms:number;measured_at:number}|null; ip:boolean|null; dns:boolean|null; https:boolean|null; probes?: {ip:ProbeOutcome;dns:ProbeOutcome;https:ProbeOutcome} } | null;
+  connection?: { transport?:string|null; relay:string; city:string; inlet:string; interface_index:number; instance:number; phase:string; chained?:boolean; ping?:{rtt_ms:number;measured_at:number}|null; ip:boolean|null; dns:boolean|null; https:boolean|null; probes?: {ip:ProbeOutcome;dns:ProbeOutcome;https:ProbeOutcome} } | null;
   readiness: string | null;
   cities: City[];
   metadata_source: string;
@@ -168,6 +168,7 @@ export const statusText: Record<string, string> = {
   confirming_path: "正在复测原路径",
   degraded_dns: "连接可用，DNS 待恢复",
   degraded_service: "连接可用，服务待恢复",
+  native_path_unavailable: "当前没有可用的该地址族入口或物理网卡，继续下一候选",
   waiting_network: "等待本机网络恢复",
   network_recovering: "正在验证原连接",
   retry_wait: "等待自动重试",

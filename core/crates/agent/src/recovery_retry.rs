@@ -44,6 +44,8 @@ pub(crate) fn is_retryable_local_failure(code: &str) -> bool {
 pub(crate) enum AttemptFailureDisposition {
     /// The operation was drained and the same target may be retried locally.
     RetrySameTarget,
+    /// A native fallback has no route on this binding; skip without remote blame.
+    SkipUnavailablePath,
     /// Local retries reached the existing recovery deadline; schedule only the
     /// ordinary city cooldown, without extending that round.
     RoundExpired,

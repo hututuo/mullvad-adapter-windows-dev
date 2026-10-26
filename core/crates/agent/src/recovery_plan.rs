@@ -31,7 +31,9 @@ pub(crate) struct RoundPlan {
     pub(crate) started: Option<Instant>,
     pub(crate) chain_phase: bool,
     pub(crate) chain_entered: bool,
-    original: Option<(String, String, bool)>,
+    pub(crate) native_phase: Option<crate::live_route::Family>,
+    native_phases: u8,
+    original: Option<(String, String, String)>,
     original_failures: u8,
     pub(crate) attempts: u32,
 }
@@ -46,9 +48,9 @@ impl RoundPlan {
         self.chain_phase = chain_only;
         self.chain_entered = chain_only;
     }
-    pub(crate) fn attempted(&mut self, relay: &str, inlet: &str, chained: bool) {
+    pub(crate) fn attempted(&mut self, relay: &str, inlet: &str, transport: &str) {
         self.original
-            .get_or_insert_with(|| (relay.into(), inlet.into(), chained));
+            .get_or_insert_with(|| (relay.into(), inlet.into(), transport.into()));
         self.attempts = self.attempts.saturating_add(1);
     }
     pub(crate) fn original_relay(&self) -> Option<&str> {
@@ -60,12 +62,12 @@ impl RoundPlan {
         &mut self,
         relay: &str,
         inlet: &str,
-        chained: bool,
+        transport: &str,
     ) -> Option<Duration> {
         if self
             .original
             .as_ref()
-            .is_none_or(|p| p != &(relay.into(), inlet.into(), chained))
+            .is_none_or(|p| p != &(relay.into(), inlet.into(), transport.into()))
         {
             return None;
         }
@@ -79,10 +81,24 @@ impl RoundPlan {
     pub(crate) fn short_attempt(&self) -> u32 {
         u32::from(self.original_failures.saturating_add(1).min(3))
     }
-    pub(crate) fn enter_chain(&mut self) -> bool {
-        if self.chain_entered || self.relays.is_empty() {
+    /// A single bounded V6 pass, then V4 pass over this round's fixed city set.
+    pub(crate) fn enter_native(&mut self) -> bool {
+        if self.chain_entered || self.native_phases >= 2 || self.relays.is_empty() {
             return false;
         }
+        self.native_phase = Some(if self.native_phases == 0 {
+            crate::live_route::Family::V6
+        } else {
+            crate::live_route::Family::V4
+        });
+        self.native_phases += 1;
+        true
+    }
+    pub(crate) fn enter_chain(&mut self) -> bool {
+        if self.chain_entered || self.native_phases < 2 || self.relays.is_empty() {
+            return false;
+        }
+        self.native_phase = None;
         self.chain_entered = true;
         self.chain_phase = true;
         true
@@ -136,24 +152,27 @@ mod tests {
             ],
             false,
         );
-        p.attempted("a", "192.0.2.1:443", false);
+        p.attempted("a", "192.0.2.1:443", "ss");
         assert_eq!(p.relays.len(), 5);
-        assert_eq!(p.short_retry("b", "192.0.2.1:443", false), None);
-        assert_eq!(p.short_retry("a", "192.0.2.1:443", true), None);
+        assert_eq!(p.short_retry("b", "192.0.2.1:443", "ss"), None);
+        assert_eq!(p.short_retry("a", "192.0.2.1:443", "chain"), None);
         assert_eq!(
-            p.short_retry("a", "192.0.2.1:443", false),
+            p.short_retry("a", "192.0.2.1:443", "ss"),
             Some(Duration::from_secs(1))
         );
         assert_eq!(
-            p.short_retry("a", "192.0.2.1:443", false),
+            p.short_retry("a", "192.0.2.1:443", "ss"),
             Some(Duration::from_secs(5))
         );
         for _ in 0..5 {
-            assert_eq!(p.short_retry("a", "192.0.2.1:443", false), None);
+            assert_eq!(p.short_retry("a", "192.0.2.1:443", "ss"), None);
         }
+        assert!(!p.enter_chain());
+        assert!(p.enter_native());
+        assert!(p.enter_native());
         assert!(p.enter_chain());
         assert!(!p.enter_chain());
-        assert_eq!(p.short_retry("a", "192.0.2.1:443", true), None);
+        assert_eq!(p.short_retry("a", "192.0.2.1:443", "chain"), None);
     }
     #[test]
     fn current_instance_needs_two_negatives_and_success_clears_them() {
@@ -198,5 +217,43 @@ mod tests {
         assert_eq!(p.remaining(restored_late), Some(300));
         p.failed(restored_late);
         assert_eq!(p.remaining(restored_late), Some(900));
+    }
+    #[test]
+    fn native_phases_are_bounded_and_do_not_renew_the_round() {
+        let mut p = RoundPlan::default();
+        p.start(vec!["original".into(), "same-city".into()], false);
+        p.attempted("original", "192.0.2.1:51820", "wireguard-over-shadowsocks");
+        let started = p.started;
+        assert!(p.enter_native());
+        assert_eq!(p.native_phase, Some(crate::live_route::Family::V6));
+        assert!(!p.chain_phase);
+        assert!(p.enter_native());
+        assert_eq!(p.native_phase, Some(crate::live_route::Family::V4));
+        assert!(!p.enter_native());
+        assert_eq!(p.started, started);
+        assert_eq!(p.attempts, 1);
+        assert_eq!(p.relays, vec!["original", "same-city"]);
+        assert!(p.enter_chain());
+        assert!(p.native_phase.is_none());
+        assert!(!p.enter_native());
+        assert!(!p.enter_chain());
+        p.start(vec!["original".into()], true);
+        assert!(
+            !p.enter_native(),
+            "explicit chain policy remains chain-only"
+        );
+    }
+    #[test]
+    fn original_short_retry_includes_protocol_even_when_socket_matches() {
+        let mut p = RoundPlan::default();
+        p.start(vec!["original".into()], false);
+        p.attempted("original", "192.0.2.1:51820", crate::live_route::V4);
+        assert!(p
+            .short_retry("original", "192.0.2.1:51820", crate::live_route::SS)
+            .is_none());
+        assert_eq!(
+            p.short_retry("original", "192.0.2.1:51820", crate::live_route::V4),
+            Some(Duration::from_secs(1))
+        );
     }
 }

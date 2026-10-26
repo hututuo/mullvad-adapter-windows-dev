@@ -9,8 +9,8 @@ flowchart LR
   A[应用流量] --> C[外部 Clash: TUN/系统代理/规则/DNS]
   C -->|AI或普通组选择适配器| F[适配器固定本机 SOCKS front]
   F --> W[受控 Mihomo worker: WireGuard]
-  W --> S[本机 SS UDP carrier]
-  S -->|绑定物理网卡的 UDP| R[Mullvad SS 入口 / WG relay]
+  W --> S[本机绑定 UDP carrier]
+  S -->|绑定物理网卡的 UDP| R[Mullvad SS / 原生 WG 入口]
   R --> I[目标互联网服务]
   C -->|国内/LAN| D[DIRECT]
   C -->|用户选择旧节点| P[已有独立外网节点]
@@ -34,7 +34,7 @@ Windows 不是使用 Mac 的 Ruby/launchd；它用 Rust 后台和 Tauri/React �
 | 对称 NAT | 不等于必然失败。这是客户端向固定公网服务端主动发包，不是两台内网电脑 P2P 打洞；关键要看出站 UDP、目标回包、映射和丢包 |
 | Keepalive | 当前 25 秒，用于维持空闲 NAT 映射；不解决完全封禁 UDP、断 Wi-Fi、账号撤销和错误出口 |
 | TCP 控制连接 | carrier 的 SOCKS TCP 控制连接不等于 WireGuard 数据已经套了 TCP；只看到 TCP ESTABLISHED 不能证明 UDP 通 |
-| Direct IPv4/IPv6 | 配置生成器存在，产品自动恢复目前不选这些路径。不能把调试 CLI 能生成配置写成 UI 已支持 |
+| Direct IPv4/IPv6 | 产品恢复已接入 SS 之后、链式之前的原生 IPv6/IPv4 有界保底；从当前目录授权入口、按地址族绑定。实机出口和恢复需独立验收 |
 | UDP2TCP/QUIC/LWO | 没有在此产品基线接通；若网络禁 UDP，仅换 SS、加重试或批量 Ping 不能承诺修复 |
 | 多跳/PQ/DAITA | Windows 不支持的必需保护会显式拒绝，不会静默降低。Mac/helper 的实现不代表 Windows 已验收 |
 | MTU | 这是本地策略，不是官方目录数据。双栈 userspace WG 统一1280（此前 SS/chain 低于1280），满足IPv6最小MTU。固定内核保持原版本；配置/parser通过不等于复杂网络的大流量/PMTU验收 |
@@ -201,3 +201,5 @@ Mac PQ helper有其独立上游来源和许可，不代表此Windows包包含它
 已有私有Git历史不在本源码ZIP审查范围，不能直接把旧仓库改公开当成已脱敏。
 
 事件详情、登录自启和托盘／小状态窗说明见 [Windows 桌面状态](windows-desktop-status.md)。
+
+原生 IPv6/IPv4 保底见[恢复规格](../openspec/changes/windows-native-fallback/specs/recovery/spec.md)。主页显示实际协议，启动/原路径重建/备用测试回退按记录协议重新授权；固定链式及所有保护门禁保留。代码与 Windows 回归不替代实机 IPv6 可达、出口、恢复和安装验收。

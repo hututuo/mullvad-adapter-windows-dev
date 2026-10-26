@@ -71,7 +71,11 @@ fn snapshot(d: &Dashboard, now: u64) -> DesktopStatus {
                 if d.connection.as_ref().is_some_and(|c| c.chained) {
                     "已连接 · 链式保底"
                 } else {
-                    "已连接 · SS 直连"
+                    match d.connection.as_ref().and_then(|c| c.transport.as_deref()) {
+                        Some("wireguard-ipv6") => "已连接 · 原生 IPv6",
+                        Some("wireguard-ipv4") => "已连接 · 原生 IPv4",
+                        _ => "已连接 · SS 直连",
+                    }
                 },
                 "connected",
             ),
@@ -84,6 +88,8 @@ fn snapshot(d: &Dashboard, now: u64) -> DesktopStatus {
                 "original_inlet" => "正在重试原入口",
                 "same_relay_inlets" => "尝试同节点其他入口",
                 "same_city" => "尝试同城备用节点",
+                "native_ipv6" => "正在尝试原生 IPv6",
+                "native_ipv4" => "正在尝试原生 IPv4",
                 "chain_fallback" => "正在尝试链式保底",
                 "returning_direct" => "正在尝试恢复直连",
                 "verifying_original" | "confirming" => "正在复测原连接",

@@ -139,6 +139,9 @@ fn safe_event(value: &LogEvent) -> bool {
                 | "active_failure_confirmation"
                 | "active_front_repair_failed"
                 | "original_inlet_short_retry"
+                | "native_path_unavailable"
+                | "native_ipv6_fallback_started"
+                | "native_ipv4_fallback_started"
                 | "direct_routes_exhausted_chain_last"
                 | "route_trial_failed"
                 | "route_trial_failed_restore_previous"
@@ -560,6 +563,8 @@ enum ReportRecoveryStage {
     Idle,
     ChainFallback,
     SameCity,
+    NativeIpv6,
+    NativeIpv4,
     OriginalInlet,
     SameRelayInlets,
 }
@@ -578,6 +583,8 @@ impl ReportRecoveryStage {
             "verifying_original" => Self::VerifyingOriginal,
             "idle" => Self::Idle,
             "chain_fallback" => Self::ChainFallback,
+            "native_ipv6" => Self::NativeIpv6,
+            "native_ipv4" => Self::NativeIpv4,
             "same_city" => Self::SameCity,
             "original_inlet" => Self::OriginalInlet,
             "same_relay_inlets" => Self::SameRelayInlets,
@@ -612,7 +619,27 @@ struct ReportSettings {
 }
 
 #[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReportTransport {
+    Ss,
+    Chain,
+    NativeIpv6,
+    NativeIpv4,
+}
+impl ReportTransport {
+    fn from_dashboard(kind: Option<&str>) -> Option<Self> {
+        Some(match kind? {
+            "wireguard-over-shadowsocks" => Self::Ss,
+            "wireguard-over-shadowsocks-chain" => Self::Chain,
+            "wireguard-ipv6" => Self::NativeIpv6,
+            "wireguard-ipv4" => Self::NativeIpv4,
+            _ => return None,
+        })
+    }
+}
+#[derive(serde::Serialize)]
 struct ReportConnection {
+    transport: Option<ReportTransport>,
     phase: Option<ReportConnectionPhase>,
     ping: Option<adapter_protocol::app::PingMeasurement>,
     chained: bool,
@@ -624,6 +651,7 @@ struct ReportConnection {
 impl From<&adapter_protocol::app::ConnectionInfo> for ReportConnection {
     fn from(value: &adapter_protocol::app::ConnectionInfo) -> Self {
         Self {
+            transport: ReportTransport::from_dashboard(value.transport.as_deref()),
             phase: ReportConnectionPhase::from_dashboard(&value.phase),
             ping: value.ping,
             chained: value.chained,
@@ -644,6 +672,7 @@ impl From<&adapter_protocol::app::ConnectionInfo> for ReportConnection {
 
 #[derive(serde::Serialize)]
 struct ReportRecovery {
+    transport: Option<ReportTransport>,
     stage: Option<ReportRecoveryStage>,
     attempt: u32,
     elapsed_seconds: u64,
@@ -804,6 +833,7 @@ impl From<&Dashboard> for ReportStatus {
                 .map(ReportCatalogueChanges::from),
             retry_in_seconds: value.retry_in_seconds,
             recovery: value.recovery.as_ref().map(|progress| ReportRecovery {
+                transport: ReportTransport::from_dashboard(progress.transport.as_deref()),
                 stage: ReportRecoveryStage::from_dashboard(&progress.stage),
                 attempt: progress.attempt,
                 elapsed_seconds: progress.elapsed_seconds,
@@ -1473,6 +1503,7 @@ mod tests {
         dashboard.public_key = Some("dashboard-public-key-sentinel".into());
         dashboard.active_relay = Some("active-relay-path-sentinel".into());
         dashboard.connection = Some(ConnectionInfo {
+            transport: None,
             ping: Some(PingMeasurement {
                 rtt_ms: 42,
                 measured_at: 99,
@@ -1502,6 +1533,7 @@ mod tests {
         dashboard.chain_fingerprint = Some("chain-fingerprint-sentinel".into());
         dashboard.retry_in_seconds = Some(8);
         dashboard.recovery = Some(RecoveryProgress {
+            transport: None,
             stage: "waiting_network".into(),
             relay: Some("recovery-relay-path-sentinel".into()),
             inlet: Some("recovery-inlet-path-sentinel".into()),
@@ -1835,6 +1867,7 @@ mod tests {
         let root = temporary();
         let logs = Logs { root: root.clone() };
         let mut info = adapter_protocol::app::ConnectionInfo {
+            transport: None,
             ping: None,
             chained: false,
             relay: "xx-aaa-wg-001".into(),

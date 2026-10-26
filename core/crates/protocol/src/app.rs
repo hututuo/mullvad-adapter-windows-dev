@@ -262,6 +262,8 @@ impl AppCommand {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryProgress {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
     pub stage: String,
     pub relay: Option<String>,
     pub inlet: Option<String>,
@@ -382,6 +384,8 @@ pub struct PingMeasurement {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectionInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
     /// Existing outer ICMP maintenance evidence, never tunnel readiness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ping: Option<PingMeasurement>,
@@ -401,7 +405,31 @@ pub struct ConnectionInfo {
 }
 impl ConnectionInfo {
     pub fn valid(&self) -> bool {
-        self.ping
+        self.transport.as_deref().is_none_or(|kind| match kind {
+            "wireguard-ipv6" => {
+                !self.chained
+                    && self
+                        .inlet
+                        .parse::<std::net::SocketAddr>()
+                        .is_ok_and(|a| a.is_ipv6() && a.port() != 0)
+            }
+            "wireguard-ipv4" | "wireguard-over-shadowsocks" => {
+                !self.chained
+                    && self
+                        .inlet
+                        .parse::<std::net::SocketAddr>()
+                        .is_ok_and(|a| a.is_ipv4() && a.port() != 0)
+            }
+            "wireguard-over-shadowsocks-chain" => {
+                self.chained
+                    && self
+                        .inlet
+                        .parse::<std::net::SocketAddr>()
+                        .is_ok_and(|a| a.is_ipv4() && a.port() != 0)
+            }
+            _ => false,
+        }) && self
+            .ping
             .as_ref()
             .is_none_or(|p| p.rtt_ms <= 60_000 && p.measured_at <= 9_007_199_254_740_991)
             && self.relay.len() <= 128
@@ -711,5 +739,31 @@ mod tests {
                 Err("invalid_report_id")
             );
         }
+    }
+    #[test]
+    fn native_connection_identity_is_family_and_chain_aware() {
+        let mut info: ConnectionInfo = serde_json::from_value(serde_json::json!({
+            "relay":"xx-aaa-wg-1", "city":"xx-aaa", "inlet":"[2001:db8::1]:33431",
+            "transport":"wireguard-ipv6", "chained":false, "interface_index":1,
+            "instance":1, "phase":"connected", "ip":true, "dns":true, "https":true
+        }))
+        .unwrap();
+        assert!(info.valid());
+        info.chained = true;
+        assert!(!info.valid());
+        info.chained = false;
+        info.transport = Some("wireguard-over-shadowsocks".into());
+        assert!(!info.valid());
+        info.transport = Some("wireguard-ipv4".into());
+        assert!(!info.valid());
+        info.inlet = "192.0.2.1:51820".into();
+        assert!(info.valid());
+        info.transport = Some("unknown".into());
+        assert!(!info.valid());
+        info.transport = None;
+        assert!(
+            info.valid(),
+            "older snapshots without discriminator remain readable"
+        );
     }
 }
