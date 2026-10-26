@@ -166,7 +166,9 @@ application deadline. Scheduler stalls can exceed deadlines; missing queued even
 alone do not prove a request never arrived. These observations support diagnosis
 without treating every local timeout as a tunnel failure.
 
-物理接口观察另外记录已取得非链路本地地址的地址族。没有IPv6源地址时不会尝试IPv6候选；未知观测保持未知，不据此宣布节点失败。小型SS窗口交错覆盖专用地址和主地址SS端口，避免全部窗口仍只使用专用20484入口。
+物理接口观察另外记录已取得非链路本地地址的地址族。没有IPv6源地址时不会尝试IPv6候选；未知观测保持未知，不据此宣布节点失败。小型SS窗口交错覆盖专用地址和主地址SS端口，避免全部窗口仍只使用专用20484入口。备用SS已尝试元组保存在本机0600的ss-recovery-windows.json，跨轮与后台重启保留；相同目录更新不清空，部分增删保留未变入口的记录，节点公钥改变才作为新身份重开。原入口短重试有意重复；备用入口全部试完后才循环。文件I/O不占用状态/入口选择锁。
+
+“更新官方目录”只表示成功检查官方数据，不能默认写成内容已变。“查看更新内容”单列检查时使用节点的地址、公钥摘要、专用SS增删和共享端口范围，并列全局节点增删改数量。首次无旧目录时明确没有对照；没变化也不能排除服务端或网络路径波动。差异由后台目录线程预计算，状态读取不重复做差异计算，也不因此重连或批量测试网站。
 
 SS网关地址与其内部转发的WG目标分开：SS server来自专用地址/主地址SS端口；SS封装内的WG目标使用远端服务约定的127.0.0.1:51820。这个地址由远端SS服务解释，不是本机直连回环；dialer-proxy始终保留SS-INLET，实际外层连接仍绑定物理接口、发送至官方SS地址。不要因为看到loopback就改成节点公网WG地址：真实串行A/B已出现公网目标无回包、远端loopback完成WG认证并传输HTTPS的差异。直接IPv4/IPv6模式仍使用API节点公网地址及允许的WG端口。配置形状测试不能替代真实握手验收。
 

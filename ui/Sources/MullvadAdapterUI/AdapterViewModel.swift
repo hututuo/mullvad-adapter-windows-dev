@@ -442,7 +442,7 @@ final class AdapterViewModel: ObservableObject {
                     try await Task.sleep(nanoseconds: 500_000_000)
                     let metadata = try await self.client.fetchCatalogueStatus()
                     if metadata.refreshing != true {
-                        self.catalogueMessage = metadata.error != nil ? "更新失败，保留上次有效目录" : metadata.cacheError != nil ? "官方目录已更新；本地缓存保存失败" : "官方目录已更新"
+                        self.catalogueMessage = metadata.error != nil ? "更新失败，保留上次有效目录" : metadata.cacheError != nil ? "检查完成；本地缓存保存失败" : metadata.changeSummary?.summary ?? "官方目录已取得（后台未提供差异）"
                         await self.refreshStatusBestEffort()
                         await self.loadRelays(force: true)
                         await self.loadCities()

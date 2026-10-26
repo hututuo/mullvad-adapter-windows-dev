@@ -110,7 +110,7 @@ class SsCataloguePolicyTest < Minitest::Test
     assert_equal planned.drop(1), next_plan.first(2)
   end
 
-  def test_metadata_candidate_change_resets_the_rotation_window
+  def test_metadata_candidate_change_preserves_attempts_on_unchanged_inlets
     pool = @adapter.send(:ss_endpoint_candidates, @relay, include_cooling: true)
     seen = @adapter.send(:rotating_ss_recovery_inlets, 'relay-one', pool).first(3)
     seen.each { |inlet| @adapter.send(:record_ss_recovery_attempt, 'relay-one', inlet) }
@@ -122,8 +122,44 @@ class SsCataloguePolicyTest < Minitest::Test
 
     assert_equal 10, refreshed_pool.length
     seen.each do |inlet|
-      assert_includes refreshed_keys, @adapter.send(:recovery_inlet_key, inlet)
+      refute_includes refreshed_keys, @adapter.send(:recovery_inlet_key, inlet)
     end
+    assert_includes refreshed_keys, [nil, '192.0.2.4', MullvadAdapter::EXTRA_SS_PORT]
+  end
+
+  def test_rotation_survives_daemon_restart_and_same_catalogue_refresh
+    pool = @adapter.send(:ss_endpoint_candidates, @relay, include_cooling: true)
+    first = @adapter.send(:rotating_ss_recovery_inlets, 'relay-one', pool).first(3)
+    first.each { |inlet| @adapter.send(:record_ss_recovery_attempt, 'relay-one', inlet) }
+    assert_equal 0o600, File.stat(@adapter.send(:ss_recovery_windows_path)).mode & 0o777
+    second = MullvadAdapter.new(state_dir: @dir)
+    second.instance_variable_set(:@metadata, Marshal.load(Marshal.dump(@metadata)))
+    second.send(:load_ss_recovery_windows)
+    next_window = second.send(:rotating_ss_recovery_inlets, 'relay-one', pool).first(3)
+    assert_empty first.map { |item| @adapter.send(:recovery_inlet_key, item) } & next_window.map { |item| @adapter.send(:recovery_inlet_key, item) }
+    second.instance_variable_get(:@probe_event_writer)&.join(2)
+  end
+
+  def test_peer_key_change_reopens_the_inlets_as_a_new_peer
+    pool = @adapter.send(:ss_endpoint_candidates, @relay, include_cooling: true)
+    tried = @adapter.send(:rotating_ss_recovery_inlets, 'relay-one', pool).first
+    @adapter.send(:record_ss_recovery_attempt, 'relay-one', tried)
+    @relay['public_key'] = 'replacement-server-key'
+    assert_includes @adapter.send(:rotating_ss_recovery_inlets, 'relay-one', pool), tried
+  end
+
+  def test_reserved_last_unseen_primary_does_not_reopen_seen_alternatives_while_planning
+    pool = @adapter.send(:ss_endpoint_candidates, @relay, include_cooling: true)
+    @adapter.send(:rotating_ss_recovery_inlets, 'relay-one', pool)
+    pool.drop(1).each { |inlet| @adapter.send(:record_ss_recovery_attempt, 'relay-one', inlet) }
+    result = @adapter.send(:rotating_ss_recovery_inlets, 'relay-one', pool, excluding: [@adapter.send(:recovery_inlet_key, pool.first)], allow_cycle_restart: false)
+    assert_empty result
+  end
+
+  def test_invalid_persisted_rotation_does_not_block_startup_or_seed_candidates
+    File.write(@adapter.send(:ss_recovery_windows_path), '{broken')
+    @adapter.send(:load_ss_recovery_windows)
+    assert_empty @adapter.instance_variable_get(:@ss_recovery_windows)
   end
 
   def test_exhausted_window_reopens_only_after_every_eligible_tuple_was_attempted

@@ -3,6 +3,7 @@ import SwiftUI
 struct ContentView: View {
     @ObservedObject var model: AdapterViewModel
     @State private var selectedSection: AppSection? = .cities
+    @State private var showingCatalogueChanges = false
 
     private enum AppSection: String, CaseIterable, Identifiable, Hashable {
         case cities
@@ -56,6 +57,9 @@ struct ContentView: View {
         // grow the whole window beyond the visible screen.
         .navigationSplitViewStyle(.balanced)
         .frame(minWidth: 1040, idealWidth: 1280, minHeight: 720, idealHeight: 820)
+        .sheet(isPresented: $showingCatalogueChanges) {
+            CatalogueChangesView(metadata: model.status?.effectiveMetadata, activeRelay: model.status?.activeRelay)
+        }
         .task {
             model.startStatusPolling()
             async let snapshot: Void = model.loadSnapshot()
@@ -111,6 +115,15 @@ struct ContentView: View {
                     .lineLimit(2)
                     .frame(height: 30, alignment: .topLeading)
                     .help(model.status?.metadata?.error ?? model.status?.metadata?.cacheError ?? catalogueSummary)
+                Button {
+                    showingCatalogueChanges = true
+                } label: {
+                    Label("查看更新内容", systemImage: "list.bullet.rectangle")
+                        .frame(maxWidth: .infinity, minHeight: 22)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("catalogue-change-details")
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)

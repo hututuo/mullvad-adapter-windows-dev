@@ -78,10 +78,33 @@ final class CatalogueRefreshTests: XCTestCase {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTAssertFalse(model.isRefreshingCatalogue)
-        XCTAssertEqual(model.catalogueMessage, "官方目录已更新")
+        XCTAssertEqual(model.catalogueMessage, "官方目录已取得（后台未提供差异）")
         let requests = CatalogueFixtureProtocol.state.all
         XCTAssertEqual(requests.filter { $0.1 == "/metadata/refresh" }.count, 1)
         XCTAssertTrue(requests.contains { $0.1 == "/relays" })
         XCTAssertFalse(requests.contains { ["/reconnect", "/select", "/repair"].contains($0.1) })
+    }
+
+    func testUnchangedCatalogueExplicitlyReportsNoChangesAndCurrentRelay() throws {
+        let data = Data(#"{"live":true,"cache":true,"change_summary":{"checked_at":"2026-01-01T12:00:00Z","baseline_available":true,"catalogue_changed":false,"added_count":0,"removed_count":0,"changed_count":0,"shared_changes":[],"current_relay":{"relay":"relay-one","state":"unchanged","fields":[],"ss_before_count":6,"ss_after_count":6},"changed_relays":[],"truncated_count":0}}"#.utf8)
+        let metadata = try JSONDecoder().decode(MetadataStatus.self, from: data)
+        XCTAssertEqual(metadata.changeSummary?.summary, "检查完成，目录没有变化")
+        XCTAssertEqual(metadata.changeSummary?.currentRelay.stateTitle, "连接参数没有变化")
+        XCTAssertEqual(metadata.changeSummary?.currentRelay.ssAfterCount, 6)
+    }
+
+    func testFirstFetchDoesNotClaimAllNodesUpdated() throws {
+        let data = Data(#"{"checked_at":"2026-01-01T12:00:00Z","baseline_available":false,"catalogue_changed":null,"added_count":0,"removed_count":0,"changed_count":0,"shared_changes":[],"current_relay":{"relay":null,"state":"unselected","fields":[]},"changed_relays":[],"truncated_count":0}"#.utf8)
+        let report = try JSONDecoder().decode(CatalogueChanges.self, from: data)
+        XCTAssertEqual(report.summary, "已取得目录，首次记录暂无对照")
+        XCTAssertEqual(report.currentRelay.stateTitle, "检查时尚无选定节点")
+    }
+
+    func testDetailedChangeDecodesRemovedSSAndPublicKeyFingerprint() throws {
+        let data = Data(#"{"checked_at":"2026-01-01T12:00:00Z","baseline_available":true,"catalogue_changed":true,"added_count":1,"removed_count":2,"changed_count":3,"shared_changes":[],"current_relay":{"relay":"relay-one","state":"changed","fields":[{"key":"shadowsocks_extra_addr_in","label":"专用 SS 地址","before":"old","after":"new","added":["192.0.2.2"],"removed":["192.0.2.1"],"added_count":1,"removed_count":1}],"ss_before_count":6,"ss_after_count":6},"changed_relays":[],"truncated_count":0}"#.utf8)
+        let report = try JSONDecoder().decode(CatalogueChanges.self, from: data)
+        XCTAssertEqual(report.summary, "新增 1 · 移除 2 · 变更 3 个节点")
+        XCTAssertEqual(report.currentRelay.fields.first?.removed, ["192.0.2.1"])
+        XCTAssertEqual(report.currentRelay.stateTitle, "连接参数有变化")
     }
 }

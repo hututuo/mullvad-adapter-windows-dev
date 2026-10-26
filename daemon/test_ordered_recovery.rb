@@ -127,6 +127,17 @@ class OrderedRecoveryTest < Minitest::Test
     assert_operator @adapter.send(:snapshot).dig(:recovery, :elapsed_seconds), :>, 300
   end
 
+  def test_cancelled_alternate_is_not_consumed_by_the_persistent_rotation
+    @adapter.interrupt_at = lambda do |adapter, index|
+      adapter.send(:interrupt_ordered_recovery, stopped: true) if index == 4
+    end
+    refute run_round
+    assert_equal 4, @adapter.paths.length
+    window = @adapter.instance_variable_get(:@ss_recovery_windows)['one']
+    assert_empty window[:seen]
+    refute File.exist?(@adapter.send(:ss_recovery_windows_path))
+  end
+
   def test_stale_start_context_is_rejected_without_touching_live_worker
     refute run_round(expected_state: { generation: -1, active_slot: 'a', active_relay: 'one' })
     assert_empty @adapter.paths

@@ -225,6 +225,7 @@ struct MetadataStatus: Decodable {
     let lastAttemptAt: String?
     let cacheError: String?
     let relayCount: Int?
+    let changeSummary: CatalogueChanges?
 
     enum CodingKeys: String, CodingKey {
         case live
@@ -239,9 +240,10 @@ struct MetadataStatus: Decodable {
         case lastAttemptAt = "last_attempt_at"
         case cacheError = "cache_error"
         case relayCount = "relay_count"
+        case changeSummary = "change_summary"
     }
 
-    init(live: Bool?, cache: Bool?, source: String?, age: Double?, ageSeconds: Double?, error: String?, fetchedAt: String?, validationWarnings: [String]? = nil, refreshing: Bool? = nil, lastAttemptAt: String? = nil, cacheError: String? = nil, relayCount: Int? = nil) {
+    init(live: Bool?, cache: Bool?, source: String?, age: Double?, ageSeconds: Double?, error: String?, fetchedAt: String?, validationWarnings: [String]? = nil, refreshing: Bool? = nil, lastAttemptAt: String? = nil, cacheError: String? = nil, relayCount: Int? = nil, changeSummary: CatalogueChanges? = nil) {
         self.live = live
         self.cache = cache
         self.source = source
@@ -254,9 +256,73 @@ struct MetadataStatus: Decodable {
         self.lastAttemptAt = lastAttemptAt
         self.cacheError = cacheError
         self.relayCount = relayCount
+        self.changeSummary = changeSummary
     }
 
     var effectiveAge: Double? { ageSeconds ?? age }
+}
+
+struct CatalogueChanges: Decodable {
+    let checkedAt: String
+    let baselineAvailable: Bool
+    let catalogueChanged: Bool?
+    let addedCount: Int
+    let removedCount: Int
+    let changedCount: Int
+    let sharedChanges: [CatalogueFieldChange]
+    let currentRelay: CatalogueRelayChange
+    let changedRelays: [CatalogueRelayChange]
+    let truncatedCount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case checkedAt = "checked_at", baselineAvailable = "baseline_available", catalogueChanged = "catalogue_changed"
+        case addedCount = "added_count", removedCount = "removed_count", changedCount = "changed_count"
+        case sharedChanges = "shared_changes", currentRelay = "current_relay", changedRelays = "changed_relays", truncatedCount = "truncated_count"
+    }
+
+    var summary: String {
+        if !baselineAvailable { return "已取得目录，首次记录暂无对照" }
+        if catalogueChanged == false { return "检查完成，目录没有变化" }
+        return "新增 \(addedCount) · 移除 \(removedCount) · 变更 \(changedCount) 个节点"
+    }
+}
+
+struct CatalogueRelayChange: Decodable {
+    let relay: String?
+    let state: String
+    let fields: [CatalogueFieldChange]
+    let ssBeforeCount: Int?
+    let ssAfterCount: Int?
+    enum CodingKeys: String, CodingKey {
+        case relay, state, fields
+        case ssBeforeCount = "ss_before_count", ssAfterCount = "ss_after_count"
+    }
+    var stateTitle: String {
+        switch state {
+        case "unchanged": return "连接参数没有变化"
+        case "changed": return "连接参数有变化"
+        case "added": return "官方目录新增此节点"
+        case "removed": return "官方目录已移除此节点"
+        case "no_baseline": return "首次记录，没有旧目录可对照"
+        case "unselected": return "检查时尚无选定节点"
+        default: return "当前目录中没有此节点"
+        }
+    }
+}
+
+struct CatalogueFieldChange: Decodable {
+    let key: String
+    let label: String
+    let before: String
+    let after: String
+    let added: [String]?
+    let removed: [String]?
+    let addedCount: Int?
+    let removedCount: Int?
+    enum CodingKeys: String, CodingKey {
+        case key, label, before, after, added, removed
+        case addedCount = "added_count", removedCount = "removed_count"
+    }
 }
 
 struct HealthStatus: Decodable {

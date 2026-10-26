@@ -127,7 +127,7 @@ class MullvadAdapter
   TRANSPORT_PREFERENCES = (%w[auto] + TRANSPORT_MODES).freeze
   AUTO_TRANSPORT_ORDER = %w[ss ipv6 ipv4].freeze
   DEFAULT_TRANSPORT_PREFERENCE = 'ss'
-  BUILD_ID = '20261026-ss-loopback-target-1'
+  BUILD_ID = '20261026-catalogue-changes-rotation-1'
   SOURCE_SHA256 = Digest::SHA256.file(__FILE__).hexdigest
   STATUS_PUBLICATION_INTERVAL = 1.0
   STATUS_PUBLICATION_MAX_AGE = 3.0
@@ -217,6 +217,7 @@ class MullvadAdapter
     @action_gate_mutex = Mutex.new
     @history_mutex = Mutex.new
     @ss_endpoint_mutex = Mutex.new
+    @ss_recovery_persist_mutex = Mutex.new
     @metadata_mutex = Mutex.new
     @metadata_refresh_job_mutex = Mutex.new
     @ss_recovery_windows = {}
@@ -362,6 +363,7 @@ class MullvadAdapter
     prepare_state_dir
     load_relay_history
     load_ss_endpoint_history
+    load_ss_recovery_windows
     defaults_path = File.join(@state_dir, 'bootstrap-defaults.json')
     write_private_identity_once(defaults_path, JSON.generate(schema: 1, source: @bootstrap_defaults_source))
     load_template
@@ -3268,7 +3270,7 @@ class MullvadAdapter
       plan = has_primary ? (original ? [0, 1, 5] : [0]).each_with_index.map { |delay, index| [original ? 'original' : 'current_relay', relay_name, primary, delay, index + 1, 0, mode] } : []
       city_candidates = []
       unless current_only
-        alternate_pool = mode == 'ss' ? rotating_ss_recovery_inlets(relay_name, inlets, excluding: [recovery_inlet_key(primary)]) : []
+        alternate_pool = mode == 'ss' ? rotating_ss_recovery_inlets(relay_name, inlets, excluding: [recovery_inlet_key(primary)], allow_cycle_restart: !!original) : []
         alternate_pool.first(3).each_with_index do |inlet, index|
           plan << ['alternate_ss', relay_name, inlet, 0, index + 1, 0, mode]
         end
@@ -3311,7 +3313,10 @@ class MullvadAdapter
         resuming = reason == 'network-resume' || (manual && local_network_recovery_pending?)
         activation_reason = resuming ? (relay == relay_name ? 'network-resume' : 'network-resume-fallback') : 'ordered-recovery'
         ok = activate(relay, reason: activation_reason, transport_preference: preference, expected_state: expected, attempt_evidence: evidence)
-        record_ss_recovery_attempt(relay, inlet) if candidate_mode == 'ss' && phase != 'original' && evidence[:attempted] && !evidence[:local_failure]
+        if candidate_mode == 'ss' && phase != 'original' && evidence[:attempted] && !evidence[:local_failure] &&
+           (ok || evidence[:relay_failed]) && network_attempt_current?
+          record_ss_recovery_attempt(relay, inlet)
+        end
         break unless network_attempt_current?
         if ok
           ready = @mutex.synchronize { @state[:service_readiness] == 'ready' }
@@ -3864,7 +3869,7 @@ class MullvadAdapter
 
   def set_metadata_state(live:, cache:, source:, error:, fetched_at:, warnings: nil)
     @mutex.synchronize do
-      @state[:metadata] = @state[:metadata].slice(:last_attempt_at, :refreshing, :revision, :next_refresh_at, :relay_count, :cache_error).merge(
+      @state[:metadata] = @state[:metadata].slice(:last_attempt_at, :refreshing, :revision, :next_refresh_at, :relay_count, :cache_error, :change_summary).merge(
         live: live, cache: cache, source: source, age_seconds: nil, error: error,
         fetched_at: fetched_at&.iso8601,
         validation_warnings: Array(warnings || @last_metadata_validation_warnings).first(20)
@@ -3941,6 +3946,115 @@ class MullvadAdapter
     @last_metadata_validation_warnings = warnings
   end
 
+  # Compare validated public catalogues on the catalogue owner, never on the
+  # status reader or under the connection lock. Summaries contain public relay
+  # facts only, with fixed-size lists and public-key fingerprints.
+  def canonical_catalogue(value, key = nil)
+    case value
+    when Hash
+      value.keys.sort.to_h { |name| [name, canonical_catalogue(value[name], name)] }
+    when Array
+      result = value.map { |item| canonical_catalogue(item) }
+      if key == 'relays' || key.to_s.end_with?('port_ranges') || value.all? { |item| item.is_a?(String) }
+        result.uniq.sort_by { |item| JSON.generate(item) }
+      else
+        result
+      end
+    else value
+    end
+  end
+
+  def catalogue_field_change(key, label, before, after)
+    render = lambda do |value|
+      if key == 'public_key'
+        value.to_s.empty? ? '无' : "SHA256:#{Digest::SHA256.hexdigest(value.to_s)[0, 12]}"
+      elsif value.nil? then '无'
+      elsif value == true then '可用'
+      elsif value == false then '不可用'
+      elsif value.is_a?(String) then value[0, 512]
+      else JSON.generate(canonical_catalogue(value, key))[0, 512]
+      end
+    end
+    result = { key: key, label: label, before: render.call(before), after: render.call(after) }
+    if before.is_a?(Array) || after.is_a?(Array)
+      old = Array(before).map { |item| item.is_a?(String) ? item : JSON.generate(item) }.uniq.sort
+      fresh = Array(after).map { |item| item.is_a?(String) ? item : JSON.generate(item) }.uniq.sort
+      added, removed = fresh - old, old - fresh
+      result.merge!(added: added.first(12), removed: removed.first(12), added_count: added.length, removed_count: removed.length)
+    end
+    result
+  end
+
+  def catalogue_change_summary(previous, current, current_relay:, checked_at: Time.now.iso8601)
+    baseline = previous.is_a?(Hash)
+    prior = Array(previous&.dig('wireguard', 'relays')).to_h { |row| [row['hostname'], row] }
+    fresh = Array(current.dig('wireguard', 'relays')).to_h { |row| [row['hostname'], row] }
+    added, removed = baseline ? [fresh.keys - prior.keys, prior.keys - fresh.keys] : [[], []]
+    labels = { 'ipv4_addr_in' => 'IPv4 直连地址', 'ipv6_addr_in' => 'IPv6 直连地址', 'public_key' => '节点公钥',
+               'active' => '官方可用状态', 'location' => '城市', 'shadowsocks_extra_addr_in' => '专用 SS 地址' }
+    shared = []
+    if baseline
+      { 'shadowsocks_port_ranges' => '主地址 SS 端口范围', 'port_ranges' => 'WG 直连端口范围' }.each do |key, label|
+        a, b = previous.dig('wireguard', key), current.dig('wireguard', key)
+        shared << catalogue_field_change(key, label, a, b) if canonical_catalogue(a, key) != canonical_catalogue(b, key)
+      end
+      old_other, new_other = previous.reject { |key, _| key == 'wireguard' }, current.reject { |key, _| key == 'wireguard' }
+      old_other = old_other.merge('wireguard' => previous.fetch('wireguard', {}).reject { |key, _| %w[relays shadowsocks_port_ranges port_ranges].include?(key) })
+      new_other = new_other.merge('wireguard' => current.fetch('wireguard', {}).reject { |key, _| %w[relays shadowsocks_port_ranges port_ranges].include?(key) })
+      other_changed = (old_other.keys | new_other.keys).select { |key| canonical_catalogue(old_other[key], key) != canonical_catalogue(new_other[key], key) }
+      unless other_changed.empty?
+        shared << { key: 'other', label: "其他官方目录参数（#{other_changed.join('、')}）", before: '上次目录', after: '有变化' }
+      end
+    end
+    changes = {}
+    if baseline
+      (prior.keys & fresh.keys).each do |name|
+        a, b = prior[name], fresh[name]
+        next if canonical_catalogue(a) == canonical_catalogue(b)
+        fields = labels.filter_map do |key, label|
+          before, after = key == 'public_key' ? [a[key] || a['pubkey'], b[key] || b['pubkey']] : [a[key], b[key]]
+          catalogue_field_change(key, label, before, after) if canonical_catalogue(before, key) != canonical_catalogue(after, key)
+        end
+        other_keys = (a.keys | b.keys) - labels.keys - %w[hostname pubkey]
+        other_changed = other_keys.select { |key| canonical_catalogue(a[key], key) != canonical_catalogue(b[key], key) }
+        unless other_changed.empty?
+          fields << catalogue_field_change('other', "其他节点参数（#{other_changed.join('、')}）",
+                                           a.slice(*other_changed), b.slice(*other_changed))
+        end
+        changes[name] = { relay: name, state: 'changed', fields: fields }
+      end
+      added.each { |name| changes[name] = { relay: name, state: 'added', fields: [] } }
+      removed.each { |name| changes[name] = { relay: name, state: 'removed', fields: [] } }
+    end
+    focus = if current_relay.to_s.empty?
+              { relay: nil, state: 'unselected', fields: [] }
+            elsif !baseline
+              { relay: current_relay, state: 'no_baseline', fields: [] }
+            else
+              changes.fetch(current_relay, { relay: current_relay, state: fresh.key?(current_relay) ? 'unchanged' : 'unavailable', fields: [] }).dup
+            end
+    applicable_shared = shared.reject { |field| field[:key] == 'other' }
+    if baseline && fresh.key?(current_relay) && !applicable_shared.empty?
+      focus[:fields] = focus[:fields] + applicable_shared
+      focus[:state] = 'changed' if focus[:state] == 'unchanged'
+    end
+    pool_count = lambda do |payload, row|
+      next nil unless payload
+      next 0 unless row && row['active'] == true
+      extra = Array(row['shadowsocks_extra_addr_in']).map { |ip| [ip, EXTRA_SS_PORT] }
+      ranges = validated_port_ranges(payload.dig('wireguard', 'shadowsocks_port_ranges'), 'SS ranges')
+      extra_ports = ranges.flat_map { |low, high| (low..high).to_a }.uniq
+      (extra + extra_ports.map { |port| [row['ipv4_addr_in'], port] }).uniq.length
+    end
+    focus.merge!(ss_before_count: pool_count.call(previous, prior[current_relay]), ss_after_count: pool_count.call(current, fresh[current_relay]))
+    ordered = changes.keys.sort_by { |name| [name == current_relay ? 0 : 1, name] }
+    { checked_at: checked_at, baseline_available: baseline,
+      catalogue_changed: baseline ? canonical_catalogue(previous) != canonical_catalogue(current) : nil,
+      added_count: added.length, removed_count: removed.length, changed_count: changes.length - added.length - removed.length,
+      shared_changes: shared, current_relay: focus, changed_relays: ordered.first(20).map { |name| changes[name] },
+      truncated_count: [ordered.length - 20, 0].max }
+  end
+
   def refresh_metadata(force: false, background: false, nonblocking: false)
     acquired = (background || nonblocking) ? @metadata_mutex.try_lock : @metadata_mutex.lock
     return @metadata unless acquired
@@ -3990,6 +4104,8 @@ class MullvadAdapter
         cache_error = error.class.name
         cache_valid = metadata_cache_valid?
       end
+      focus = @mutex.synchronize { @state[:active_relay] || @state.dig(:recovery, :original_relay) }
+      change_summary = catalogue_change_summary(@metadata, parsed, current_relay: focus)
       @metadata = parsed
       @metadata_fetched_at = Time.now
       @mutex.synchronize { @metrics[:metadata_refreshes] += 1 }
@@ -3997,8 +4113,10 @@ class MullvadAdapter
       set_metadata_state(live: true, cache: cache_valid, source: route, error: nil, fetched_at: @metadata_fetched_at)
       summary = { cache_error: cache_error, relay_count: parsed.dig('wireguard', 'relays').length,
                   revision: Digest::SHA256.hexdigest(JSON.generate(parsed)),
-                  next_refresh_at: (@metadata_fetched_at + @options[:metadata_ttl]).iso8601 }
+                  next_refresh_at: (@metadata_fetched_at + @options[:metadata_ttl]).iso8601,
+                  change_summary: change_summary }
       @mutex.synchronize { @state[:metadata].merge!(summary) }
+      log_probe_event('metadata-change-summary', **change_summary)
       record_metadata_validation_warnings(route)
       set_dns_status(:bootstrap, 'pass', "Mullvad API fetched via #{route}")
       check_clash_global_path unless background
@@ -4466,18 +4584,25 @@ class MullvadAdapter
 
   # Original short retries deliberately repeat one exact path. Only the
   # fallback queue rotates; planning never consumes an unstarted candidate.
-  def rotating_ss_recovery_inlets(relay_name, inlets, excluding: [])
+  def rotating_ss_recovery_inlets(relay_name, inlets, excluding: [], allow_cycle_restart: true)
     pool = inlets.uniq { |inlet| recovery_inlet_key(inlet) }
     keys = pool.map { |inlet| recovery_inlet_key(inlet) }
     fingerprint = Digest::SHA256.hexdigest(JSON.generate(keys.sort_by { |key| key.map(&:to_s) }))
+    peer_names = [relay_name, *keys.map(&:first).compact].uniq
+    peers = Array(@metadata&.dig('wireguard', 'relays')).select { |relay| peer_names.include?(relay['hostname']) }
+    peer_fingerprint = Digest::SHA256.hexdigest(JSON.generate(peers.map { |relay| [relay['hostname'], relay['public_key'] || relay['pubkey']] }.sort))
     @ss_endpoint_mutex.synchronize do
       window = @ss_recovery_windows[relay_name]
-      if !window || window[:fingerprint] != fingerprint
-        window = @ss_recovery_windows[relay_name] = { fingerprint: fingerprint, seen: [] }
+      if !window || window[:peer_fingerprint] != peer_fingerprint
+        window = @ss_recovery_windows[relay_name] = { fingerprint: fingerprint, peer_fingerprint: peer_fingerprint, seen: [] }
+      elsif window[:fingerprint] != fingerprint
+        # An added/removed inlet does not erase attempts against unchanged ones.
+        window[:seen] &= keys
+        window[:fingerprint] = fingerprint
       end
       eligible = pool.reject { |inlet| excluding.include?(recovery_inlet_key(inlet)) }
       unseen = eligible.reject { |inlet| window[:seen].include?(recovery_inlet_key(inlet)) }
-      if unseen.empty? && !eligible.empty?
+      if unseen.empty? && !eligible.empty? && allow_cycle_restart
         window[:seen].clear
         unseen = eligible
       end
@@ -4488,10 +4613,52 @@ class MullvadAdapter
   end
 
   def record_ss_recovery_attempt(relay_name, inlet)
-    @ss_endpoint_mutex.synchronize do
+    changed = @ss_endpoint_mutex.synchronize do
       window = @ss_recovery_windows[relay_name]
       window[:seen] |= [recovery_inlet_key(inlet)] if window
     end
+    persist_ss_recovery_windows if changed
+  end
+
+  def ss_recovery_windows_path
+    File.join(@state_dir, 'ss-recovery-windows.json')
+  end
+
+  def load_ss_recovery_windows
+    return unless File.file?(ss_recovery_windows_path)
+    raise 'rotation file too large' if File.size(ss_recovery_windows_path) > 2 * 1024 * 1024
+    payload = JSON.parse(File.read(ss_recovery_windows_path))
+    raise 'invalid rotation data' unless payload.is_a?(Hash) && payload['version'] == 1 && payload['windows'].is_a?(Hash)
+    loaded = payload['windows'].first(256).filter_map do |name, window|
+      next unless name.is_a?(String) && name.bytesize <= 128 && window.is_a?(Hash)
+      next unless %w[fingerprint peer_fingerprint].all? { |key| window[key].is_a?(String) && window[key].match?(/\A[0-9a-f]{64}\z/) }
+      seen = Array(window['seen']).first(4096).select do |key|
+        key.is_a?(Array) && key.length == 3 && (key[0].nil? || (key[0].is_a?(String) && key[0].bytesize <= 128)) &&
+          ipv4?(key[1]) && key[2].is_a?(Integer) && key[2].between?(1, 65_535)
+      end
+      [name, { fingerprint: window['fingerprint'], peer_fingerprint: window['peer_fingerprint'], seen: seen.uniq }]
+    end.to_h
+    @ss_endpoint_mutex.synchronize { @ss_recovery_windows = loaded }
+  rescue StandardError => error
+    log_probe_event('ss-rotation-load-error', error_class: error.class.name)
+  end
+
+  def persist_ss_recovery_windows
+    @ss_recovery_persist_mutex.synchronize do
+      # File I/O is outside the endpoint lock; status and selection stay readable.
+      windows = @ss_endpoint_mutex.synchronize { Marshal.load(Marshal.dump(@ss_recovery_windows.to_a.last(256).to_h)) }
+      temporary = "#{ss_recovery_windows_path}.pending-#{Process.pid}-#{SecureRandom.hex(6)}"
+      File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
+        file.write(JSON.generate(version: 1, windows: windows))
+        file.flush
+        file.fsync
+      end
+      File.rename(temporary, ss_recovery_windows_path)
+    ensure
+      FileUtils.rm_f(temporary) if temporary
+    end
+  rescue StandardError => error
+    log_probe_event('ss-rotation-persist-error', error_class: error.class.name)
   end
 
   def deterministic_port_sample(ranges, relay_name, count)
