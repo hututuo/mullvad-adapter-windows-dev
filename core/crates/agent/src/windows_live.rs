@@ -1283,7 +1283,12 @@ pub fn serve(scope: &str) -> io::Result<()> {
         if catalogue_result.is_none() {
             catalogue_result = catalogue_results.try_recv().ok();
         }
-        if !connections.busy() && quick.is_none() {
+        // Connection workers own their authorized configuration. Publishing a
+        // new immutable catalogue only changes future attempts; waiting for an
+        // entire recovery round would leave those attempts on stale metadata.
+        // Drain quick-test receipts first so old-target observations cannot be
+        // attached to the newly published directory.
+        if quick.is_none() {
             if let Some(result) = catalogue_result.take() {
                 catalogue_refresh.finish(Instant::now(), result.is_ok());
                 dashboard.metadata_refreshing = false;
