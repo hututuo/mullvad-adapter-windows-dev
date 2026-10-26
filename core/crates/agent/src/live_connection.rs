@@ -2657,10 +2657,17 @@ mod tests {
         );
         assert!(c.deferred.is_none());
         c.begin_user_selection(Some("city"), None);
-        assert_eq!(
-            c.inlet_trials
-                .choose(&path.relay, &cat.shadowsocks_inlets(relay)),
-            Some(first)
+        let retry = c
+            .inlet_trials
+            .choose(&path.relay, &cat.shadowsocks_inlets(relay));
+        assert!(
+            retry.is_some(),
+            "a fresh round still admits an authorized alternative"
+        );
+        assert_ne!(
+            retry,
+            Some(first),
+            "a user retry resets the round budget, not persistent SS attempts"
         );
     }
 

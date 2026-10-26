@@ -31,8 +31,20 @@ fn catalogue() -> adapter_catalogue::Catalogue {
         "../../catalogue/fixtures/relay-contract.json"
     ))
     .unwrap();
-    adapter_catalogue::Catalogue::parse(&serde_json::to_vec(&fixture[0]["payload"]).unwrap())
+    let mut payload = fixture[0]["payload"].clone();
+    // The shared metadata-validation corpus intentionally has one relay per
+    // city. These orchestration tests require a distinct authorized same-city
+    // peer; construct it explicitly rather than assume a validation fixture.
+    let mut other = payload["wireguard"]["relays"][0].clone();
+    other["hostname"] = "same-city-backup".into();
+    other["public_key"] = "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=".into();
+    other["ipv4_addr_in"] = "192.0.2.12".into();
+    other["shadowsocks_extra_addr_in"] = serde_json::json!(["192.0.2.23"]);
+    payload["wireguard"]["relays"]
+        .as_array_mut()
         .unwrap()
+        .push(other);
+    adapter_catalogue::Catalogue::parse(&serde_json::to_vec(&payload).unwrap()).unwrap()
 }
 
 fn dashboard() -> Dashboard {
