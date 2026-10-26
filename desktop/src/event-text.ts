@@ -71,7 +71,7 @@ export const eventMessages: Record<string, string> = {
   independent_proxy_verified:"账号接口的独立代理已验证，不代表业务隧道已连通",
   healthy_tunnel_verified:"账号接口通过现有健康隧道访问成功",
   active_worker_missing:"当前隧道进程不存在，需要恢复", relay_not_active:"官方目录中的这个节点已不再可用",
-  original_inlet_withdrawn:"官方目录已撤回原 SS 入口", same_city_recovery_exhausted:"本轮同城候选未能恢复，等待下一轮或手动重试",
+  original_inlet_withdrawn:"官方目录已撤回原通道入口", same_city_recovery_exhausted:"本轮同城候选未能恢复，等待下一轮或手动重试",
   recovery_budget_exhausted:"本轮新尝试预算已用完，等待下一轮重试",
 };
 const cancelled = new Set(["cancelled","candidate_cancelled","worker_start_cancelled","connection_cancelled","active_probe_cancelled","maintenance_cancelled","maintenance_preempted","binding_changed","network_binding_changed","active_binding_changed","candidate_stale","candidate_evidence_stale","active_evidence_stale"]);
