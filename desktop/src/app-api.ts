@@ -168,6 +168,7 @@ export const statusText: Record<string, string> = {
   confirming_path: "正在复测原路径",
   degraded_dns: "连接可用，DNS 待恢复",
   degraded_service: "连接可用，服务待恢复",
+  original_native_family_unavailable: "本机已无原通道所需的地址族，将回原节点 SS 恢复",
   native_path_unavailable: "当前没有可用的该地址族入口或物理网卡，继续下一候选",
   waiting_network: "等待本机网络恢复",
   network_recovering: "正在验证原连接",

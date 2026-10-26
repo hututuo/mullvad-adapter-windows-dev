@@ -139,6 +139,7 @@ fn safe_event(value: &LogEvent) -> bool {
                 | "active_failure_confirmation"
                 | "active_front_repair_failed"
                 | "original_inlet_short_retry"
+                | "original_native_family_unavailable"
                 | "native_path_unavailable"
                 | "native_ipv6_fallback_started"
                 | "native_ipv4_fallback_started"

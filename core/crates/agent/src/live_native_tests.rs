@@ -505,3 +505,57 @@ fn native_negative_outside_native_phase_returns_to_same_relay_ss_without_recordi
         "only an actual SS inlet failure changes SS failure history"
     );
 }
+
+#[test]
+fn unavailable_native_original_leaves_original_wait_and_retries_its_ss_without_blame() {
+    use crate::recovery_retry::AttemptFailureDisposition as D;
+    use adapter_control::observer::ObservedOwner;
+    use adapter_domain::State;
+    use adapter_platform::physical_attachment::{Attachment as Physical, Observation};
+    let mut h = harness();
+    let cat = make_catalogue(Some(IPV4), Some(IPV6));
+    let relay = only_relay(&cat);
+    let original = native_path(relay, live_route::V6, "[2001:db8::10]:33431", 70);
+    let mut state = State::new("synthetic-native-original".into());
+    state.city = Some(original.city.clone());
+    state.path = Some(original.clone());
+    state.observe(adapter_domain::Attachment::Available, 0);
+    state.request_original_rebuild(0).unwrap();
+    let mut rebuilding = original.clone();
+    rebuilding.instance = 71;
+    let attempt = state.begin_original_rebuild(rebuilding, 1).unwrap();
+    let observation = ObservedOwner::new(state, || Observation {
+        attachment: Physical::Unknown,
+        bindings: vec![],
+    })
+    .unwrap();
+    let mut owner = ResourceOwner::new(observation);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    h.connections
+        .plan
+        .start(vec![relay.hostname().into()], false);
+    h.connections.recovering = Some((deadline, VecDeque::from(["same-city-backup".into()])));
+    let before = h.connections.inlet_trials.history_bytes().unwrap();
+    let mut dashboard = dashboard(Some("us-test"));
+    assert_eq!(
+        h.connections.apply_attempt_failure_disposition(
+            &mut owner,
+            &mut dashboard,
+            &attempt,
+            D::SkipUnavailablePath,
+            true
+        ),
+        D::SkipUnavailablePath
+    );
+    assert_eq!(owner.state().stage, adapter_domain::Stage::Fallback);
+    assert_eq!(h.connections.deferred.as_deref(), Some(relay.hostname()));
+    assert_eq!(h.connections.recovering.as_ref().unwrap().0, deadline);
+    assert_eq!(h.connections.inlet_trials.history_bytes().unwrap(), before);
+    assert_eq!(
+        h.connections
+            .pick_route(&cat, relay, None, false)
+            .unwrap()
+            .kind(),
+        live_route::SS
+    );
+}

@@ -1071,6 +1071,15 @@ impl Connections {
         }
         let binding = binding.ok_or(if self.plan.native_phase.is_some() && exact.is_none() {
             "native_path_unavailable"
+        } else if !route.is_ss()
+            && exact.is_some()
+            && owner
+                .observation()
+                .bindings()
+                .iter()
+                .any(|b| b.ipv4 || b.ipv6)
+        {
+            "original_native_family_unavailable"
         } else {
             "physical_binding_unavailable"
         })?;
@@ -1555,7 +1564,13 @@ impl Connections {
             D::SkipUnavailablePath => {
                 let now = owner.now();
                 let _ = owner.state_mut().retry_after_local_cleanup(attempt, now);
-                self.deferred = None;
+                if owner.state().stage == adapter_domain::Stage::RebuildOriginal {
+                    let _ = owner.state_mut().finish_original_phase(now);
+                    self.startup_route = None;
+                    self.deferred = Some(attempt.path.relay.clone());
+                } else {
+                    self.deferred = None;
+                }
                 self.local_retry.clear();
                 let _ = self.logs.event("connection", "native_path_unavailable");
                 D::SkipUnavailablePath
@@ -1602,7 +1617,8 @@ impl Connections {
         automatic: bool,
     ) -> crate::recovery_retry::AttemptFailureDisposition {
         let disposition = if code == "worker_route_unavailable"
-            && self.plan.native_phase.is_some()
+            && (self.plan.native_phase.is_some()
+                || owner.state().stage == adapter_domain::Stage::RebuildOriginal)
             && self.route_trial.is_none()
             && matches!(
                 attempt.path.transport.as_str(),
@@ -2542,6 +2558,16 @@ impl Connections {
                     if let Err(code) =
                         self.connect(owner, dashboard, identity, catalogue, Some(&relay), false)
                     {
+                        if self.route_trial.is_some()
+                            && matches!(
+                                code,
+                                "original_native_family_unavailable" | "original_inlet_withdrawn"
+                            )
+                        {
+                            self.trial_failed(owner, dashboard, true);
+                            dashboard.last_error = Some(code.into());
+                            return;
+                        }
                         if !matches!(
                             code,
                             "relay_not_active"
@@ -2589,7 +2615,17 @@ impl Connections {
                     self.defer_local_target(relay.clone());
                 }
                 Err(code) => {
-                    if matches!(code, "relay_not_active" | "original_inlet_withdrawn")
+                    if code == "original_native_family_unavailable"
+                        && owner.state().stage == adapter_domain::Stage::RebuildOriginal
+                    {
+                        let now = owner.now();
+                        let _ = owner.state_mut().finish_original_phase(now);
+                        self.startup_route = None;
+                        self.deferred = Some(relay.clone());
+                        self.local_retry.clear();
+                        self.next_attempt = Instant::now();
+                        let _ = self.logs.event("connection", code);
+                    } else if matches!(code, "relay_not_active" | "original_inlet_withdrawn")
                         && owner.state().stage == adapter_domain::Stage::RebuildOriginal
                     {
                         self.deferred = None;

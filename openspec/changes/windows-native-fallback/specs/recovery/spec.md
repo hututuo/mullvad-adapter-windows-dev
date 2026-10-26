@@ -19,7 +19,10 @@ explicitly. No native success or failure is an SS rotation entry.
 WHEN local native binding/route is unavailable, THEN skip without a remote
 negative after current ownership and cleanup are confirmed. Physical offline,
 network-change cancellation, stale evidence and unknown cleanup MUST retain
-existing guards. There is at most one identity peer; front has no DIRECT bypass.
+existing guards. An original native path whose physical family disappeared
+MUST leave the original waiting phase and continue its relay SS choices without
+a remote negative; trial rollback must preserve its verified rescue. There is
+at most one identity peer; front has no DIRECT bypass.
 
 ## WIN-NATIVE-04 Observable protocol
 WHEN native fallback is selected, THEN home, tray, endpoint details and safe

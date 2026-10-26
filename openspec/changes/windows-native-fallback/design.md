@@ -17,7 +17,11 @@ local probe failures and stale evidence retain existing retry/cleanup guards.
 
 Startup, exact original rebuild and trial rollback validate recorded transport.
 A saved native startup hint with no matching local family may revert to SS;
-an exact active rebuild/rollback cannot silently change protocol. Failure of a
+an exact active rebuild/rollback cannot silently change protocol. If another
+physical family is available but the original native family is absent, end that
+original wait explicitly and start its relay SS choices without a remote
+negative. A cleaned native original with no local route follows the same rule;
+a failed trial rollback uses its existing verified rescue path. Failure of a
 native original after its short retries enters its relay's SS choices before
 other SS relays. Successful native paths are persisted in existing selected-path
 storage, never mixed into SS rotation. Retry identity includes protocol even
