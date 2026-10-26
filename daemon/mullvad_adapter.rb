@@ -5772,8 +5772,8 @@ class MullvadAdapter
         'ip-version' => 'ipv4'
       }
       wg.merge!(
-        'server' => '127.0.0.1',
-        'port' => 51_820,
+        'server' => relay.fetch('ipv4_addr_in'),
+        'port' => ensure_wireguard_port_allowed!(DIRECT_IPV4_PORT),
         'dialer-proxy' => inlet_name,
         # A dual-stack userspace WG interface must satisfy IPv6's minimum MTU,
         # even when its outer SS transport uses IPv4.

@@ -107,6 +107,20 @@ class MullvadProtectionTest < Minitest::Test
     assert_equal template, Marshal.dump(@adapter.instance_variable_get(:@template))
   end
 
+  def test_shared_ss_gateway_forwards_to_selected_relay_not_gateway_loopback
+    @adapter.define_singleton_method(:physical_interface) { |_ip| 'en0' }
+    relay = @adapter.send(:find_relay, 'one')
+    config, = @adapter.send(:worker_tunnel_config, { mixed: 18000, controller: 18001 }, relay, 'ss', ['192.0.2.2', 20_484, 'extra-ss-ipv4'])
+    inlet = config['proxies'].find { |item| item['name'] == 'SS-INLET' }
+    wg = config['proxies'].find { |item| item['name'] == 'MULLVAD' }
+    assert_equal '192.0.2.2', inlet['server']
+    assert_equal relay['ipv4_addr_in'], wg['server']
+    refute_equal '127.0.0.1', wg['server']
+    assert_equal 51_820, wg['port']
+    assert_equal 'SS-INLET', wg['dialer-proxy']
+    assert_equal ['MATCH,OUT'], config['rules']
+  end
+
   def test_entries_exclude_all_live_entry_and_exit_peer_keys
     Thread.current[:adapter_protection_profile] = @profile
     @adapter.instance_variable_set(:@workers, { 'a' => { peer_keys: %w[public-three public-five] } })

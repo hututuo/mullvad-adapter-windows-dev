@@ -167,3 +167,5 @@ alone do not prove a request never arrived. These observations support diagnosis
 without treating every local timeout as a tunnel failure.
 
 物理接口观察另外记录已取得非链路本地地址的地址族。没有IPv6源地址时不会尝试IPv6候选；未知观测保持未知，不据此宣布节点失败。小型SS窗口交错覆盖专用地址和主地址SS端口，避免全部窗口仍只使用专用20484入口。
+
+SS网关地址与其内部转发的WG目标分开：SS server来自专用地址/主地址SS端口，WG server必须是该所选节点的官方IPv4入口和允许的WG端口；不能把SS网关远端的127.0.0.1误当所选节点。dialer-proxy始终保留SS-INLET，无直连绕过。
