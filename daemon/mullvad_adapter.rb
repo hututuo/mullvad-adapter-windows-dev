@@ -127,7 +127,7 @@ class MullvadAdapter
   TRANSPORT_PREFERENCES = (%w[auto] + TRANSPORT_MODES).freeze
   AUTO_TRANSPORT_ORDER = %w[ss ipv6 ipv4].freeze
   DEFAULT_TRANSPORT_PREFERENCE = 'ss'
-  BUILD_ID = '20261026-catalogue-ss-policy-1'
+  BUILD_ID = '20261026-ss-loopback-target-1'
   SOURCE_SHA256 = Digest::SHA256.file(__FILE__).hexdigest
   STATUS_PUBLICATION_INTERVAL = 1.0
   STATUS_PUBLICATION_MAX_AGE = 3.0
@@ -5772,8 +5772,12 @@ class MullvadAdapter
         'ip-version' => 'ipv4'
       }
       wg.merge!(
-        'server' => relay.fetch('ipv4_addr_in'),
-        'port' => ensure_wireguard_port_allowed!(DIRECT_IPV4_PORT),
+        # This is the destination INSIDE the SS UDP envelope, interpreted by
+        # the remote Mullvad SS service. It is not the local machine's loopback
+        # route: SS-INLET remains responsible for the physical remote endpoint.
+        # Using the relay's public WG address here can silently drop handshakes.
+        'server' => '127.0.0.1',
+        'port' => 51_820,
         'dialer-proxy' => inlet_name,
         # A dual-stack userspace WG interface must satisfy IPv6's minimum MTU,
         # even when its outer SS transport uses IPv4.
