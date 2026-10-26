@@ -1,5 +1,19 @@
 # Mac 维护与构建
 
+## HTTPS 部分目标失败与域名恢复
+
+隧道 IP/DNS/HTTPS 探针通过，只证明探针对应路径可用。应用可能把预先解析或缓存的 IP 交给代理；这类连接没有原域名，WireGuard 内层 DNS 无法纠正错误或过期的地址。worker 对公网纯 IP 的 TLS 443/8443 连接启用 Mihomo ClientHello 域名恢复，再交给原 WireGuard outbound 的隧道内 DNS；显式域名请求、私网目标、其他端口和非 TLS 数据保留原行为，规则仍是 `MATCH,OUT`，没有 DIRECT 兜底。该功能不解密 TLS 内容、不生成业务探针，不能恢复没有可见 SNI 的目标，也不证明历史故障一定由 DNS 污染造成。
+
+显式运行固定内核的本地集成检查：
+
+```sh
+ADAPTER_RUBY=/path/to/ruby python3 scripts/diagnostics/test_https_destination_recovery.py --core /path/to/mihomo -v
+```
+
+检查只使用临时 loopback SOCKS fixture 和合成 ClientHello，不读取真实身份，不启用 TUN、不查询外部 DNS、不建立 WireGuard 通道。覆盖旧 IP 的 IPv4/IPv6 恢复、关闭功能的基线、显式域名/私网/其他端口/非 TLS 保留。真实现场须另行核对失败连接是否携带可见 SNI、恢复后的实际请求以及持续日志；本地 fixture 通过不等于每个网站验收通过。
+
+macOS `ping6 -W` 是旧版 Node Information 请求选项，不能复用 IPv4 `ping -W <毫秒>`。IPv6 echo 使用 `-n -c 1 <地址>`，由既有子进程总时限约束；外层 echo 失败仍不能推翻已经通过的隧道数据证据。
+
 本仓库的Mac维护源码同步自`784f2fd9ef83d44aa4ad62441144f8ac1145bde3`（1.9.1/build13），不是Windows迁移时的旧参考。源码、候选和实际安装版本分别记录于[SOURCE_BASELINE.json](../SOURCE_BASELINE.json)。Windows的Rust/Tauri实现继续保留，不能以旧Mac分支整树覆盖它。
 
 ## 模块与边界

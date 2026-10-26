@@ -98,6 +98,11 @@ class MullvadProtectionTest < Minitest::Test
       wg = config['proxies'].find { |node| node['type'] == 'wireguard' }
       assert_equal '2001:db8::2', wg['ipv6']
       assert_operator wg.fetch('mtu'), :>=, 1280
+      assert_equal ['MATCH,OUT'], config['rules']
+      assert_equal @adapter.send(:https_destination_recovery_config), config['sniffer']
+      assert_equal true, wg['remote-dns-resolve']
+      assert_equal ['tcp://10.64.0.1'], wg['dns']
+      refute config['dns']['enable'], 'hostname recovery must not enable a system DNS listener'
     end
     assert_equal template, Marshal.dump(@adapter.instance_variable_get(:@template))
   end

@@ -127,7 +127,7 @@ class MullvadAdapter
   TRANSPORT_PREFERENCES = (%w[auto] + TRANSPORT_MODES).freeze
   AUTO_TRANSPORT_ORDER = %w[ss ipv6 ipv4].freeze
   DEFAULT_TRANSPORT_PREFERENCE = 'ss'
-  BUILD_ID = '20261025-probe-pacing-evidence-1'
+  BUILD_ID = '20261026-https-destination-recovery-1'
   SOURCE_SHA256 = Digest::SHA256.file(__FILE__).hexdigest
   STATUS_PUBLICATION_INTERVAL = 1.0
   STATUS_PUBLICATION_MAX_AGE = 3.0
@@ -5566,6 +5566,25 @@ class MullvadAdapter
     value
   end
 
+  # Recover only a missing HTTPS hostname from the client's TLS ClientHello.
+  # Pure-IP connections may carry stale/system-resolved destinations that the
+  # tunnel DNS never saw. A recovered hostname is resolved by the WG outbound's
+  # own in-tunnel resolver; no local/system DNS or DIRECT fallback is added.
+  # Preserve explicit domain requests and private/literal-only protocols.
+  def https_destination_recovery_config
+    {
+      'enable' => true,
+      'force-dns-mapping' => false,
+      'parse-pure-ip' => true,
+      'override-destination' => true,
+      'sniff' => { 'TLS' => { 'ports' => [443, 8443] } },
+      'skip-domain' => ['+.local', '+.lan', '+.localhost'],
+      'skip-dst-address' => %w[0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8
+                               169.254.0.0/16 172.16.0.0/12 192.168.0.0/16
+                               224.0.0.0/4 240.0.0.0/4 ::/128 ::1/128 fc00::/7 fe80::/10 ff00::/8]
+    }
+  end
+
   def worker_tunnel_config(spec, relay, mode, ss_candidate)
     exit_relay = relay
     profile = protection_profile
@@ -5684,6 +5703,7 @@ class MullvadAdapter
       'mode' => 'rule',
       'log-level' => 'warning',
       'ipv6' => mode == 'ipv6',
+      'sniffer' => https_destination_recovery_config,
       'tun' => { 'enable' => false },
       'dns' => { 'enable' => false },
       'proxies' => proxies,
@@ -5853,8 +5873,11 @@ class MullvadAdapter
   def outer_ping_test(endpoint, timeout_ms)
     address = IPAddr.new(endpoint.to_s)
     command = address.ipv6? ? '/sbin/ping6' : '/sbin/ping'
+    arguments = [command, '-n', '-c', '1']
+    arguments.concat(['-W', timeout_ms.to_i.to_s]) unless address.ipv6?
+    arguments << endpoint.to_s
     stdout, stderr, status = capture_probe_command(
-      command, '-n', '-c', '1', '-W', timeout_ms.to_i.to_s, endpoint.to_s,
+      *arguments,
       timeout_seconds: timeout_ms.to_f / 1000 + 1, phase: 'outer-ping'
     )
     match = stdout.match(/time[=<]([0-9.]+)\s*ms/)

@@ -18,3 +18,7 @@ OpenSpec Markdown change only; no CLI validation or archive has been run.
 - [x] MAC-REC-08: independent local recorder, strict WG event allowlist, physical-interface UDP counters, stale-status continuity, bounded first/latest incident snapshots and singleton loop. Eight isolated tests / 37 assertions; diagnostic exporter StatusReadTests 20 passed without live window tests.
 - [x] Separate recorder-only deployment/readback: natural handshake initiation and authenticated response plus physical UDP RX/TX observed; existing adapter/core PIDs unchanged. This is observation acceptance, not a new outage/recovery test or installation of MAC-REC-07 daemon changes.
 - [ ] Future natural outage evidence and actual login/reboot restart acceptance; no sleep, forced disconnection or reboot performed.
+# 2026-10-26 bounded HTTPS destination recovery
+
+- [x] MAC-REC-09: Recover missing public TLS names in the worker; preserve existing WG resolver/rules and explicit-domain/private/non-TLS paths. Add real-engine loopback fixtures and macOS IPv6 echo argument regression.
+- [ ] MAC-REC-09: Installed current-build observation of user-initiated requests; record separately from local fixtures and neutral endpoint verification. No sleep or physical network fault injection.
