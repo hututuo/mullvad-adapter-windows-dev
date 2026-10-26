@@ -131,7 +131,7 @@ struct Config<'a> {
     ipv6: bool,
     tun: Enabled,
     ntp: Enabled,
-    sniffer: Enabled,
+    sniffer: serde_json::Value,
     geo_auto_update: bool,
     profile: Profile,
     external_controller_cors: Cors,
@@ -246,7 +246,7 @@ fn config<'a>(
         ipv6,
         tun: Enabled { enable: false },
         ntp: Enabled { enable: false },
-        sniffer: Enabled { enable: false },
+        sniffer: serde_json::json!({"enable":false}),
         geo_auto_update: false,
         profile: Profile {
             store_selected: false,
@@ -267,6 +267,18 @@ fn config<'a>(
         }],
         rules: ["MATCH,OUT"],
     }
+}
+
+/// Recover visible TLS SNI only for a missing hostname on public-IP HTTPS.
+/// The WG outbound still performs the DNS lookup inside the same tunnel.
+/// No TLS decryption, system DNS listener or DIRECT alternative is introduced.
+fn https_destination_recovery_config() -> serde_json::Value {
+    serde_json::json!({
+        "enable":true,"force-dns-mapping":false,"parse-pure-ip":true,"override-destination":true,
+        "sniff":{"TLS":{"ports":[443,8443]}},"skip-domain":["+.local","+.lan","+.localhost"],
+        "skip-dst-address":["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16",
+            "172.16.0.0/12","192.168.0.0/16","224.0.0.0/4","240.0.0.0/4","::/128","::1/128","fc00::/7","fe80::/10","ff00::/8"]
+    })
 }
 struct BoundedWriter(Zeroizing<Vec<u8>>);
 impl io::Write for BoundedWriter {
@@ -519,7 +531,9 @@ fn worker_config_graph<'a>(
             wg.server = "127.0.0.1".into();
             wg.port = 51820;
             wg.dialer_proxy = Some("SS-INLET");
-            wg.mtu = Some(if chain.is_some() { 1240 } else { 1265 });
+            // The local userspace WG interface is dual-stack even when its
+            // physical SS carrier is IPv4. IPv6 requires a minimum MTU of 1280.
+            wg.mtu = Some(1280);
         }
     }
     if let Some(carrier) = carrier {
@@ -546,6 +560,7 @@ fn worker_config_graph<'a>(
     }
     proxies.push(wg);
     let mut output = config(&input.listener, v6, proxies, vec!["MULLVAD"]);
+    output.sniffer = https_destination_recovery_config();
     if diagnostic {
         output.log_level = "debug";
     }
@@ -579,6 +594,47 @@ pub fn front(listener: &Listener<'_>, slot_a: u16, slot_b: u16) -> io::Result<Se
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn https_hostname_recovery_is_worker_only_tls_scoped_and_keeps_inner_dns() {
+        let value = parsed(
+            worker(&input(Transport::Shadowsocks {
+                endpoint: "198.51.100.2".parse().unwrap(),
+                port: 443,
+            }))
+            .unwrap(),
+        );
+        let sniffer = &value["sniffer"];
+        assert_eq!(sniffer["enable"], true);
+        assert_eq!(sniffer["parse-pure-ip"], true);
+        assert_eq!(sniffer["override-destination"], true);
+        assert_eq!(sniffer["force-dns-mapping"], false);
+        assert_eq!(
+            sniffer["sniff"],
+            serde_json::json!({"TLS":{"ports":[443,8443]}})
+        );
+        for subnet in [
+            "10.0.0.0/8",
+            "127.0.0.0/8",
+            "192.168.0.0/16",
+            "fc00::/7",
+            "fe80::/10",
+        ] {
+            assert!(sniffer["skip-dst-address"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(subnet)));
+        }
+        let wg = value["proxies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["type"] == "wireguard")
+            .unwrap();
+        assert_eq!(wg["remote-dns-resolve"], true);
+        assert_eq!(wg["dns"], serde_json::json!(["tcp://10.64.0.1"]));
+        assert_eq!(value["dns"]["enable"], false);
+        assert_eq!(value["rules"], serde_json::json!(["MATCH,OUT"]));
+    }
     #[test]
     fn chain_has_one_final_wg_choice_and_an_owned_physical_carrier() {
         let input = WorkerInput {
@@ -756,7 +812,7 @@ mod tests {
         assert_eq!(value["allow-lan"], false);
         assert_eq!(value["external-controller"], "127.0.0.1:51002");
         assert_eq!(value["secret"], SECRET);
-        for key in ["tun", "dns", "ntp", "sniffer"] {
+        for key in ["tun", "dns", "ntp"] {
             assert_eq!(value[key]["enable"], false);
         }
         assert_eq!(value["profile"]["store-selected"], false);
@@ -805,7 +861,7 @@ mod tests {
         assert_eq!(wg["server"], "127.0.0.1");
         assert_eq!(wg["port"], 51820);
         assert_eq!(wg["dialer-proxy"], "SS-INLET");
-        assert_eq!(wg["mtu"], 1265);
+        assert_eq!(wg["mtu"], 1280);
         assert!(wg.get("interface-name").is_none());
         assert!(wg.get("ip-version").is_none());
     }

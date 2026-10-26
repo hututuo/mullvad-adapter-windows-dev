@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "test": "node ../scripts/test-device-creation.mjs && node ../scripts/test-recovery-view.mjs && node ../scripts/test-event-text.mjs && node ../scripts/test-status-read.mjs && node tests/status-presentation.mjs",
+    "test": "node ../scripts/test-device-creation.mjs && node ../scripts/test-recovery-view.mjs && node ../scripts/test-event-text.mjs && node ../scripts/test-status-read.mjs && node ../scripts/test-catalogue-change.mjs && node tests/status-presentation.mjs",
     "build": "npm test && tsc --noEmit && vite build",
     "tauri": "tauri"
   },

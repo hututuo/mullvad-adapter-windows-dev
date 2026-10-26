@@ -10,7 +10,7 @@ const stages: Record<string, [string, number]> = {
 };
 const next: Record<string,string> = {
   verify_original:"联网稳定后，先验证原路径", original_retry:"确认仍失败才重连原入口",
-  same_relay_inlets:"仍失败时，尝试原节点的 1–2 个备用入口", same_city:"再尝试最多四个同城备用节点",
+  same_relay_inlets:"仍失败时，尝试原节点最多 3 个未试过的备用 SS", same_city:"再尝试最多四个同城备用节点",
   chain_fallback:"直连均失败后，才尝试链式保底", new_round:"等待下一轮，也可以立即手动重试",
   return_direct:"后台会尝试回到直连，失败则恢复链式", monitor:"持续检查当前路径，短暂异常先复测",
   restore_chain_if_failed:"直连成功即保留；失败则恢复刚才的链式路线",

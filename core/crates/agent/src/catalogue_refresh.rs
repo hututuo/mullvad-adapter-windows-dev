@@ -6,11 +6,13 @@
 
 use std::time::{Duration, Instant};
 
-pub const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-const RETRY_DELAYS: [Duration; 3] = [
+pub const REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(30),
     Duration::from_secs(60),
-    Duration::from_secs(5 * 60),
-    Duration::from_secs(15 * 60),
+    Duration::from_secs(120),
+    Duration::from_secs(240),
+    Duration::from_secs(300),
 ];
 
 /// A missing/invalid timestamp cannot establish cache freshness. Keep using a
@@ -100,7 +102,7 @@ impl CatalogueRefresh {
     }
 
     /// Called for automatic and manual refreshes alike. Success begins a new
-    /// 24-hour interval and resets failure backoff. Duplicate completions are
+    /// six-hour interval and resets failure backoff. Duplicate completions are
     /// ignored once the reservation has been released.
     pub fn finish(&mut self, now: Instant, succeeded: bool) {
         if !self.in_flight {
@@ -146,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_refresh_waits_twenty_four_hours_from_completion() {
+    fn successful_refresh_waits_six_hours_from_completion() {
         let now = Instant::now();
         let completed = now + Duration::from_secs(7);
         let mut refresh = ready(now);
@@ -157,10 +159,10 @@ mod tests {
     }
 
     #[test]
-    fn failures_back_off_one_five_then_fifteen_minutes_with_a_cap() {
+    fn failures_use_the_shared_thirty_to_three_hundred_second_backoff() {
         let mut now = Instant::now();
         let mut refresh = ready(now);
-        for seconds in [60, 300, 900, 900, 900] {
+        for seconds in [30, 60, 120, 240, 300, 300] {
             assert!(refresh.try_start(now));
             refresh.finish(now, false);
             let deadline = now + Duration::from_secs(seconds);
@@ -202,8 +204,8 @@ mod tests {
             refresh.observe_network(true, true);
             assert!(!refresh.try_start(now + Duration::from_secs(seconds)));
         }
-        assert!(!refresh.try_start(recovered + Duration::from_secs(299)));
-        assert!(refresh.try_start(recovered + Duration::from_secs(300)));
+        assert!(!refresh.try_start(recovered + Duration::from_secs(59)));
+        assert!(refresh.try_start(recovered + Duration::from_secs(60)));
     }
 
     #[test]
@@ -227,7 +229,7 @@ mod tests {
         assert!(!refresh.try_start_manual());
         refresh.observe_network(true, true);
         assert!(!refresh.try_start(now + Duration::from_secs(1)));
-        assert!(refresh.try_start(now + Duration::from_secs(60)));
+        assert!(refresh.try_start(now + Duration::from_secs(30)));
     }
 
     #[test]
@@ -261,7 +263,7 @@ mod tests {
         assert!(refresh.try_start_manual());
         refresh.finish(completed, false);
         assert_eq!(refresh.failures, 1);
-        assert_eq!(refresh.next_attempt, completed + Duration::from_secs(60));
+        assert_eq!(refresh.next_attempt, completed + Duration::from_secs(30));
         refresh.observe_network(false, false);
         refresh.observe_network(true, true);
         assert!(refresh.try_start(completed));

@@ -3,6 +3,8 @@
 use adapter_control::MockControl;
 use adapter_protocol::{Hello, Response, API_MAJOR, API_MINOR};
 #[cfg(any(windows, feature = "windows-api-check", test))]
+mod catalogue_changes;
+#[cfg(any(windows, feature = "windows-api-check", test))]
 mod catalogue_refresh;
 mod chain_preparation;
 #[cfg(any(windows, feature = "windows-api-check", test))]

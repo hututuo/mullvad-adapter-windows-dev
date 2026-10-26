@@ -469,6 +469,10 @@ pub struct Dashboard {
     #[serde(default)]
     pub metadata_error: Option<String>,
     #[serde(default)]
+    pub metadata_cache_error: Option<String>,
+    #[serde(default)]
+    pub metadata_changes: Option<crate::catalogue_changes::CatalogueChanges>,
+    #[serde(default)]
     pub chain_node: Option<String>,
     #[serde(default)]
     pub chain_fingerprint: Option<String>,

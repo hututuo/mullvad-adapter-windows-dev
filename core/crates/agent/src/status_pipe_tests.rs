@@ -37,6 +37,8 @@ fn fixture_dashboard(boot: &str, source_sha: &str, build: &str, sequence: u64) -
         metadata_updated_at: None,
         metadata_refreshing: false,
         metadata_error: None,
+        metadata_cache_error: None,
+        metadata_changes: None,
         chain_node: None,
         chain_fingerprint: None,
         chain_revision: 0,

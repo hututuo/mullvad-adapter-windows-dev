@@ -27,9 +27,13 @@ struct LogEvent {
     connection: Option<adapter_protocol::app::ConnectionInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     quick_test: Option<adapter_protocol::app::QuickTestState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    catalogue_changes: Option<adapter_protocol::catalogue_changes::CatalogueChanges>,
 }
 fn safe_event(value: &LogEvent) -> bool {
-    value.connection.as_ref().is_none_or(|c| c.valid())
+    value.catalogue_changes.as_ref().is_none_or(|changes| {
+        value.stage == "api" && serde_json::to_vec(changes).is_ok_and(|b| b.len() <= 16 * 1024)
+    }) && value.connection.as_ref().is_none_or(|c| c.valid())
         && value
             .quick_test
             .as_ref()
@@ -63,6 +67,10 @@ fn safe_event(value: &LogEvent) -> bool {
                 | "metadata_missing"
                 | "metadata_refresh_started"
                 | "metadata_refresh_complete"
+                | "metadata_unchanged"
+                | "metadata_baseline_recorded"
+                | "metadata_connection_parameters_changed"
+                | "recovery_history_save_failed"
                 | "metadata_refresh_unavailable"
                 | "account_required"
                 | "identity_missing"
@@ -675,6 +683,54 @@ impl From<&adapter_protocol::app::QuickTestState> for ReportQuickTest {
 }
 
 #[derive(serde::Serialize)]
+struct ReportCatalogueChanges {
+    checked_at: u64,
+    baseline_available: bool,
+    catalogue_changed: Option<bool>,
+    added_count: usize,
+    removed_count: usize,
+    changed_count: usize,
+    current_state: Option<&'static str>,
+    changed_current_fields: Vec<&'static str>,
+}
+impl From<&adapter_protocol::catalogue_changes::CatalogueChanges> for ReportCatalogueChanges {
+    fn from(value: &adapter_protocol::catalogue_changes::CatalogueChanges) -> Self {
+        let states = [
+            "unchanged",
+            "changed",
+            "added",
+            "removed",
+            "unavailable",
+            "unselected",
+            "no_baseline",
+        ];
+        let fields = [
+            "ipv4_addr_in",
+            "ipv6_addr_in",
+            "public_key",
+            "active",
+            "location",
+            "shadowsocks_extra_addr_in",
+            "shadowsocks_port_ranges",
+            "port_ranges",
+            "other",
+        ];
+        Self {
+            checked_at: value.checked_at,
+            baseline_available: value.baseline_available,
+            catalogue_changed: value.catalogue_changed,
+            added_count: value.added_count.min(8192),
+            removed_count: value.removed_count.min(8192),
+            changed_count: value.changed_count.min(8192),
+            current_state: states.into_iter().find(|s| *s == value.current_relay.state),
+            changed_current_fields: fields
+                .into_iter()
+                .filter(|key| value.current_relay.fields.iter().any(|f| f.key == *key))
+                .collect(),
+        }
+    }
+}
+#[derive(serde::Serialize)]
 struct ReportStatus {
     status_observation: Option<adapter_protocol::app::StatusObservation>,
     sequence: u64,
@@ -690,6 +746,9 @@ struct ReportStatus {
     metadata_source: Option<ReportMetadataSource>,
     metadata_updated_at: Option<u64>,
     metadata_error: Option<String>,
+    metadata_cache_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata_changes: Option<ReportCatalogueChanges>,
     retry_in_seconds: Option<u64>,
     recovery: Option<ReportRecovery>,
     backup_verified: bool,
@@ -738,6 +797,11 @@ impl From<&Dashboard> for ReportStatus {
             metadata_source: ReportMetadataSource::from_dashboard(&value.metadata_source),
             metadata_updated_at: value.metadata_updated_at,
             metadata_error: safe_report_code(value.metadata_error.as_deref()),
+            metadata_cache_error: safe_report_code(value.metadata_cache_error.as_deref()),
+            metadata_changes: value
+                .metadata_changes
+                .as_ref()
+                .map(ReportCatalogueChanges::from),
             retry_in_seconds: value.retry_in_seconds,
             recovery: value.recovery.as_ref().map(|progress| ReportRecovery {
                 stage: ReportRecoveryStage::from_dashboard(&progress.stage),
@@ -777,6 +841,7 @@ fn safe_report_code(value: Option<&str>) -> Option<String> {
                 code: (*code).into(),
                 connection: None,
                 quick_test: None,
+                catalogue_changes: None,
             })
         })
         .map(str::to_owned)
@@ -804,7 +869,30 @@ impl Logs {
             code: code.into(),
             connection,
             quick_test,
+            catalogue_changes: None,
         };
+        self.append_event(row)
+    }
+    fn catalogue_event(
+        &self,
+        changes: adapter_protocol::catalogue_changes::CatalogueChanges,
+    ) -> io::Result<()> {
+        let code = match changes.catalogue_changed {
+            None => "metadata_baseline_recorded",
+            Some(false) => "metadata_unchanged",
+            Some(true) => "metadata_connection_parameters_changed",
+        };
+        self.append_event(LogEvent {
+            time: now_seconds(),
+            layer: "agent".into(),
+            stage: "api".into(),
+            code: code.into(),
+            connection: None,
+            quick_test: None,
+            catalogue_changes: Some(changes),
+        })
+    }
+    fn append_event(&self, row: LogEvent) -> io::Result<()> {
         if !safe_event(&row) {
             return Err(io::Error::other("log_event_rejected"));
         }
@@ -852,13 +940,16 @@ impl Logs {
                         .take(10 * 1024 * 1024 + 4096)
                         .read_to_string(&mut body)?;
                     for line in body.lines() {
-                        if let Ok(value) = serde_json::from_str::<LogEvent>(line) {
+                        if let Ok(mut value) = serde_json::from_str::<LogEvent>(line) {
                             if !safe_event(&value) {
                                 continue;
                             }
                             if history.len() >= 200 {
                                 history.pop_front();
                             }
+                            // Full public relay diffs stay in local logs. The
+                            // shared report exposes only the status allowlist.
+                            value.catalogue_changes = None;
                             history.push_back(value);
                         }
                     }
@@ -883,6 +974,7 @@ pub struct LogClient {
         String,
         Option<adapter_protocol::app::ConnectionInfo>,
         Option<adapter_protocol::app::QuickTestState>,
+        Option<adapter_protocol::catalogue_changes::CatalogueChanges>,
     )>,
     pub fault: Arc<AtomicBool>,
     pub dropped: Arc<AtomicU64>,
@@ -894,6 +986,7 @@ impl LogClient {
             String,
             Option<adapter_protocol::app::ConnectionInfo>,
             Option<adapter_protocol::app::QuickTestState>,
+            Option<adapter_protocol::catalogue_changes::CatalogueChanges>,
         )>(256);
         let fault = Arc::new(AtomicBool::new(false));
         let observed = fault.clone();
@@ -901,11 +994,13 @@ impl LogClient {
             .name("bounded-event-log".into())
             .spawn(move || {
                 let logs = Logs { root };
-                while let Ok((stage, code, connection, quick_test)) = receive.recv() {
-                    if logs
-                        .detailed_event(&stage, &code, connection, quick_test)
-                        .is_err()
-                    {
+                while let Ok((stage, code, connection, quick_test, catalogue)) = receive.recv() {
+                    let result = if let Some(changes) = catalogue {
+                        logs.catalogue_event(changes)
+                    } else {
+                        logs.detailed_event(&stage, &code, connection, quick_test)
+                    };
+                    if result.is_err() {
                         observed.store(true, Ordering::Release);
                     }
                 }
@@ -918,6 +1013,26 @@ impl LogClient {
     }
     pub fn event(&self, stage: &str, code: &str) -> io::Result<()> {
         self.send(stage, code, None, None)
+    }
+    pub fn catalogue(
+        &self,
+        changes: &adapter_protocol::catalogue_changes::CatalogueChanges,
+    ) -> io::Result<()> {
+        if self
+            .sender
+            .try_send((
+                "api".into(),
+                "metadata_refresh_complete".into(),
+                None,
+                None,
+                Some(changes.clone()),
+            ))
+            .is_err()
+        {
+            self.dropped.fetch_add(1, Ordering::AcqRel);
+            self.fault.store(true, Ordering::Release);
+        }
+        Ok(())
     }
     pub fn connection(
         &self,
@@ -942,7 +1057,7 @@ impl LogClient {
     ) -> io::Result<()> {
         if self
             .sender
-            .try_send((stage.into(), code.into(), connection, quick_test))
+            .try_send((stage.into(), code.into(), connection, quick_test, None))
             .is_err()
         {
             self.dropped.fetch_add(1, Ordering::AcqRel);
@@ -1264,6 +1379,7 @@ mod tests {
                 code: code.into(),
                 connection: None,
                 quick_test: None,
+                catalogue_changes: None,
             };
             assert!(
                 safe_event(&event),
@@ -1296,6 +1412,8 @@ mod tests {
             metadata_updated_at: None,
             metadata_refreshing: false,
             metadata_error: None,
+            metadata_cache_error: None,
+            metadata_changes: None,
             chain_node: None,
             chain_fingerprint: None,
             chain_revision: 0,
@@ -1541,6 +1659,65 @@ mod tests {
         ] {
             assert!(!text.contains(sentinel), "report exposed {sentinel}");
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn catalogue_details_are_traceable_locally_but_shared_report_keeps_only_safe_summary() {
+        use adapter_protocol::catalogue_changes::{
+            CatalogueChanges, CatalogueFieldChange, CatalogueRelayChange,
+        };
+        let root = temporary();
+        let logs = Logs { root: root.clone() };
+        let mut dashboard = snapshot();
+        let detail = CatalogueChanges {
+            checked_at: 42,
+            baseline_available: true,
+            catalogue_changed: Some(true),
+            added_count: 0,
+            removed_count: 0,
+            changed_count: 1,
+            shared_changes: vec![],
+            current_relay: CatalogueRelayChange {
+                relay: Some("private-relay-sentinel".into()),
+                state: "changed".into(),
+                fields: vec![CatalogueFieldChange {
+                    key: "ipv4_addr_in".into(),
+                    label: "private-label-sentinel".into(),
+                    before: "private-before-sentinel".into(),
+                    after: "private-after-sentinel".into(),
+                    added: None,
+                    removed: None,
+                    added_count: None,
+                    removed_count: None,
+                }],
+                ss_before_count: Some(6),
+                ss_after_count: Some(6),
+            },
+            changed_relays: vec![],
+            truncated_count: 0,
+        };
+        logs.catalogue_event(detail.clone()).unwrap();
+        assert!(std::fs::read_to_string(root.join("events.jsonl"))
+            .unwrap()
+            .contains("private-before-sentinel"));
+        dashboard.metadata_changes = Some(detail);
+        let report = logs
+            .report(&dashboard, "00000000-0000-0000-0000-000000000001")
+            .unwrap();
+        let bytes = std::fs::read_to_string(report).unwrap();
+        for sentinel in [
+            "private-relay-sentinel",
+            "private-before-sentinel",
+            "private-after-sentinel",
+            "private-label-sentinel",
+        ] {
+            assert!(!bytes.contains(sentinel));
+        }
+        let value: serde_json::Value = serde_json::from_str(&bytes).unwrap();
+        assert_eq!(
+            value["status"]["metadata_changes"]["changed_current_fields"],
+            serde_json::json!(["ipv4_addr_in"])
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

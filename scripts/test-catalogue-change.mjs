@@ -1,0 +1,11 @@
+import assert from 'node:assert/strict';
+import {catalogueSummary,catalogueRelayState} from '../desktop/src/catalogue-change.ts';
+assert.equal(catalogueSummary(undefined),'后台尚未提供目录对比');
+assert.equal(catalogueSummary({baseline_available:false,catalogue_changed:null}),'已取得目录，首次记录暂无对照');
+assert.equal(catalogueSummary({baseline_available:true,catalogue_changed:false}),'检查完成，目录没有变化');
+assert.equal(catalogueSummary({baseline_available:true,catalogue_changed:true,added_count:1,removed_count:2,changed_count:3}),'新增 1 · 移除 2 · 变更 3 个节点');
+assert.equal(catalogueRelayState('unchanged'),'连接参数没有变化');
+assert.equal(catalogueRelayState('removed'),'官方目录已移除此节点');
+assert.equal(catalogueRelayState('unselected'),'检查时尚无选定节点');
+assert.equal(catalogueRelayState('unknown-future-state'),'无法确认变化');
+console.log('catalogue comparison: actual changes, no baseline, old backend and current relay states PASS');

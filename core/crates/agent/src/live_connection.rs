@@ -74,7 +74,10 @@ pub(crate) struct Connections {
     route_trial: Option<RouteTrial>,
     forced_route: Option<bool>,
     restore_target: Option<Path>,
-    history_save: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    history_save: Option<(
+        std::sync::mpsc::SyncSender<()>,
+        Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    )>,
     chain_store: Option<adapter_platform::windows_store::PrivateStore>,
     verified_chain: Option<crate::verified_chain::VerifiedChain>,
 }
@@ -176,25 +179,48 @@ impl Connections {
         if let Ok(bytes) = store.load(RecordKind::RecoveryHistory) {
             self.inlet_trials.restore_history(bytes.expose());
         }
-        let (send, receive) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+        let (send, receive) = std::sync::mpsc::sync_channel::<()>(1);
+        let latest = Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+        let pending = latest.clone();
+        let logs = self.logs.clone();
         if std::thread::Builder::new()
             .name("inlet-history-save".into())
             .spawn(move || {
-                while let Ok(bytes) = receive.recv() {
-                    let _ = store
+                while receive.recv().is_ok() {
+                    let bytes = pending.lock().ok().and_then(|mut p| p.take());
+                    let Some(bytes) = bytes else {
+                        continue;
+                    };
+                    if store
                         .prepare(RecordKind::RecoveryHistory, &bytes)
-                        .and_then(|p| p.commit());
+                        .and_then(|p| p.commit())
+                        .is_err()
+                    {
+                        let _ = logs.event("connection", "recovery_history_save_failed");
+                    }
                 }
             })
             .is_ok()
         {
-            self.history_save = Some(send);
+            self.history_save = Some((send, latest));
         }
     }
     fn save_history(&self) {
-        if let (Some(send), Some(bytes)) = (&self.history_save, self.inlet_trials.history_bytes()) {
-            let _ = send.try_send(bytes);
+        let Some((send, pending)) = &self.history_save else {
+            return;
+        };
+        let Some(bytes) = self.inlet_trials.history_bytes() else {
+            let _ = self
+                .logs
+                .event("connection", "recovery_history_save_failed");
+            return;
+        };
+        // Coalesce to the newest full snapshot while disk I/O is in flight;
+        // a full notification queue must not discard the newest attempts.
+        if let Ok(mut latest) = pending.lock() {
+            *latest = Some(bytes);
         }
+        let _ = send.try_send(());
     }
     pub(crate) fn verified_at(&self, fingerprint: Option<&str>) -> Option<u64> {
         self.verified_chain
@@ -672,6 +698,11 @@ impl Connections {
             && dashboard.settings.tunnel_route == adapter_protocol::app::TunnelRoute::Chain
             && self.chain.is_some();
         self.last_relay = Some(relay.hostname().into());
+        self.inlet_trials.reconcile(
+            relay.hostname(),
+            relay.public_key(),
+            &catalogue.shadowsocks_inlets(relay),
+        );
         self.inlet_trials.prefer(relay.hostname(), inlet, chained);
         if chained {
             self.chain_relays.insert(relay.hostname().into());
@@ -902,6 +933,18 @@ impl Connections {
         if chained {
             self.chain_relays.insert(picked.hostname().into());
         }
+        let mut authorized_inlets = catalogue.shadowsocks_inlets(picked);
+        if let Some(selected) = self
+            .inlet_trials
+            .selected_route(picked.hostname(), chained)
+            .and_then(|i| catalogue.authorize_shadowsocks_inlet(picked, i.address, i.port))
+        {
+            if !authorized_inlets.contains(&selected) {
+                authorized_inlets.push(selected);
+            }
+        }
+        self.inlet_trials
+            .reconcile(picked.hostname(), picked.public_key(), &authorized_inlets);
         let inlet = if let Some(target) = self
             .restore_target
             .as_ref()
@@ -927,7 +970,7 @@ impl Connections {
                 .authorize_shadowsocks_inlet(picked, *saved.ip(), saved.port())
                 .ok_or("original_inlet_withdrawn")?
         } else {
-            let mut allowed = catalogue.shadowsocks_inlets(picked);
+            let mut allowed = authorized_inlets;
             if let Some(selected) = self
                 .inlet_trials
                 .selected_route(picked.hostname(), chained)

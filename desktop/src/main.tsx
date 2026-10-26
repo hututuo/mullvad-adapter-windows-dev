@@ -29,6 +29,8 @@ import { DesktopSettings } from "./desktop-settings";
 import { StatusWidget } from "./status-widget";
 import { StatusReadHealth } from "./status-read";
 import { StatusReadStrip } from "./status-read-strip";
+import { CatalogueDetails } from "./catalogue-details";
+import { catalogueSummary } from "./catalogue-change";
 type Page = "setup" | "cities" | "account" | "clash" | "relays" | "diagnostics";
 const pages: { id: Page; name: string; mark: string }[] = [
   { id: "setup", name: "使用引导", mark: "◇" },
@@ -72,6 +74,7 @@ function Modal({
   );
 }
 function App() {
+  const [showCatalogueDetails,setShowCatalogueDetails]=useState(false);
   const [page, setPage] = useState<Page>("cities"),
     [data, setData] = useState<Dashboard | null>(null),
     [message, setMessage] = useState("后台操作与连接进度显示在这里。"),
@@ -164,7 +167,7 @@ function App() {
           const catalogueResult = actionRequested.current.catalogue;
           actionRequested.current = null;
           const code = catalogueResult ? reply.dashboard.metadata_error : reply.dashboard.last_error;
-          setMessage(code ? errorText(code) : catalogueResult ? "官方目录已更新，现有连接保持运行。" : "操作已完成");
+          setMessage(code ? errorText(code) : catalogueResult ? `${catalogueSummary(reply.dashboard.metadata_changes)}${reply.dashboard.metadata_cache_error?"；本地缓存保存失败":""}，现有连接保持运行。` : "操作已完成");
           setError(!!code);
         }
       }
@@ -380,6 +383,12 @@ function App() {
             </button>
           ))}
         </nav>
+        <section className="sidebar-catalogue" aria-label="官方目录">
+          <button disabled={!data || !!data.metadata_refreshing} onClick={()=>void act({kind:"refresh_catalogue"})}>{data?.metadata_refreshing?"正在更新目录…":"更新官方目录"}</button>
+          <small>{data?.metadata_error?"获取失败，保留上次目录":catalogueSummary(data?.metadata_changes)}</small>
+          <small>{timeText(data?.metadata_updated_at??null)}</small>
+          <button className="quiet" onClick={()=>setShowCatalogueDetails(true)}>查看更新内容</button>
+        </section>
         <div className="sidebar-bottom">
           <span
             className={`status-dot ${statusView.fresh && data?.status === "connected" ? "green" : ""}`}
@@ -1026,6 +1035,7 @@ function App() {
         </footer>
       </main>
       {showActivity && <Modal wide labelledBy="event-log-title" onClose={()=>setShowActivity(false)}><ActivityPanel current={data} stale={!statusView.fresh} onClose={()=>setShowActivity(false)} onExport={()=>void act({kind:"export_report"})}/></Modal>}
+      {showCatalogueDetails && <Modal wide labelledBy="catalogue-title" onClose={()=>setShowCatalogueDetails(false)}><CatalogueDetails data={data} onClose={()=>setShowCatalogueDetails(false)}/></Modal>}
       {chooser && data && (
         <Modal labelledBy="city-title" onClose={() => setChooser(false)}>
           <div className="panel-heading">

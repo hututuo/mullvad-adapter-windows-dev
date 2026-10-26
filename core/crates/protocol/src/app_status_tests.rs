@@ -56,6 +56,8 @@ fn dashboard(sequence: u64, status: &str) -> Dashboard {
         metadata_updated_at: None,
         metadata_refreshing: false,
         metadata_error: None,
+        metadata_cache_error: None,
+        metadata_changes: None,
         chain_node: None,
         chain_fingerprint: None,
         chain_revision: 0,

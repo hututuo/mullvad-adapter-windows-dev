@@ -611,6 +611,25 @@ footer {
   color: #8ba095;
   font-weight: 400;
 }
+
+.sidebar-catalogue { margin:16px 14px;display:grid;gap:7px; }
+.sidebar-catalogue button { width:100%;min-height:36px;text-align:center; }
+.sidebar-catalogue small { color:var(--muted);font-size:11px;line-height:17px; }
+.sidebar-catalogue small:first-of-type { height:34px;overflow:hidden; }
+.catalogue-details { display:flex;flex-direction:column;height:min(640px,72vh);max-height:72vh; }
+.catalogue-details > .panel-heading { flex:none; }
+.catalogue-details-scroll { overflow:auto;min-height:0;padding-right:6px; }
+.catalogue-details-scroll > section { margin:18px 0; }
+.catalogue-details-scroll h3 { margin:0 0 10px;font-size:15px; }
+.catalogue-current { border:1px solid var(--line,#d2e0d8);background:var(--panel,#f6faf7);padding:18px;border-radius:12px; }
+.catalogue-fields { display:grid;gap:15px;margin-top:12px; }
+.catalogue-field { display:grid;gap:5px; }
+.catalogue-field code { white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px; }
+.catalogue-warning { margin:12px 0;padding:12px;border:1px solid #e1c783;background:#fff8e7;border-radius:9px; }
+.catalogue-relay { border-bottom:1px solid var(--line,#d2e0d8);padding:4px 0 10px; }
+.catalogue-relay-toggle { display:flex;align-items:center;gap:10px;width:100%;min-height:40px;background:transparent;color:inherit;border:0;text-align:left; }
+.catalogue-relay-toggle span:last-child { margin-left:auto;font-size:12px;color:var(--muted); }
+.catalogue-explanation { border-top:1px solid var(--line,#d2e0d8);padding-top:14px;font-size:12px;line-height:1.7;color:var(--muted); }
 .city-list {
   margin-top: 16px;
   max-height: 45vh;

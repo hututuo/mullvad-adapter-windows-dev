@@ -483,13 +483,25 @@ fn read_catalogue(bytes: &[u8]) -> Result<(adapter_catalogue::Catalogue, Vec<Cit
     Ok((catalogue, cities))
 }
 
-type CatalogueResult = Result<(adapter_catalogue::Catalogue, Vec<City>, u64), &'static str>;
+struct FetchedCatalogue {
+    catalogue: adapter_catalogue::Catalogue,
+    cities: Vec<City>,
+    fetched_at: u64,
+    changes: adapter_protocol::catalogue_changes::CatalogueChanges,
+    cache_error: Option<&'static str>,
+}
+type CatalogueResult = Result<FetchedCatalogue, &'static str>;
 struct CatalogueJob {
     proxy: u16,
     healthy_front: u16,
+    current_relay: Option<String>,
 }
 fn catalogue_job(dashboard: &Dashboard) -> CatalogueJob {
     CatalogueJob {
+        current_relay: dashboard
+            .active_relay
+            .clone()
+            .or_else(|| dashboard.recovery.as_ref().and_then(|r| r.relay.clone())),
         proxy: dashboard.settings.bootstrap_port.unwrap_or(0),
         healthy_front: if dashboard.front_ready
             && dashboard.readiness.as_deref() == Some("ready")
@@ -508,6 +520,101 @@ struct RelayCache {
     schema: u8,
     fetched_at: u64,
     relays: serde_json::Value,
+}
+fn finish_catalogue_fetch(
+    root: &std::path::Path,
+    previous: Option<&adapter_catalogue::Catalogue>,
+    bytes: &[u8],
+    current_relay: Option<&str>,
+    fetched_at: u64,
+) -> CatalogueResult {
+    let (catalogue, cities) = read_catalogue(bytes)?;
+    let changes =
+        crate::catalogue_changes::compare(previous, &catalogue, current_relay, fetched_at);
+    let cache = RelayCache {
+        schema: 1,
+        fetched_at,
+        relays: serde_json::from_slice(bytes).map_err(|_| "invalid_metadata")?,
+    };
+    let pending = root.join("relays-cache.pending");
+    let mut opened = false;
+    let persisted = (|| {
+        let mut file =
+            open_writer_file(&pending, false, false).map_err(|_| "metadata_cache_write_failed")?;
+        opened = true;
+        file.set_len(0).map_err(|_| "metadata_cache_write_failed")?;
+        serde_json::to_writer(&mut file, &cache).map_err(|_| "metadata_cache_write_failed")?;
+        file.sync_all().map_err(|_| "metadata_cache_write_failed")?;
+        drop(file);
+        std::fs::rename(&pending, root.join("relays-cache.json"))
+            .map_err(|_| "metadata_cache_write_failed")?;
+        Ok::<_, &'static str>(())
+    })();
+    if persisted.is_err() && opened {
+        let _ = std::fs::remove_file(&pending);
+    }
+    Ok(FetchedCatalogue {
+        catalogue,
+        cities,
+        fetched_at,
+        changes,
+        cache_error: persisted.err(),
+    })
+}
+#[cfg(test)]
+mod catalogue_cache_tests {
+    use super::*;
+    fn temporary() -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "adapter-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        root
+    }
+    fn payload() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({"wireguard":{"port_ranges":[[33431,51820]],"shadowsocks_port_ranges":[[51900,51901]],"relays":[{
+            "hostname":"relay-one","location":"us-sjc","active":true,"public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "ipv4_addr_in":"192.0.2.10","shadowsocks_extra_addr_in":["192.0.2.20"]}]}})).unwrap()
+    }
+    #[test]
+    fn valid_api_data_remains_usable_when_cache_write_fails_and_old_bytes_survive() {
+        let root = temporary();
+        std::fs::write(root.join("relays-cache.json"), b"previous-cache").unwrap();
+        std::fs::create_dir(root.join("relays-cache.pending")).unwrap();
+        let fetched =
+            finish_catalogue_fetch(&root, None, &payload(), Some("relay-one"), 42).unwrap();
+        assert_eq!(fetched.cache_error, Some("metadata_cache_write_failed"));
+        assert_eq!(fetched.catalogue.relays()[0].hostname(), "relay-one");
+        assert!(!fetched.changes.baseline_available);
+        assert_eq!(
+            std::fs::read(root.join("relays-cache.json")).unwrap(),
+            b"previous-cache"
+        );
+        assert!(
+            root.join("relays-cache.pending").is_dir(),
+            "do not delete an object we did not open"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn invalid_response_never_replaces_the_old_cache_or_pretends_to_change_the_catalogue() {
+        let root = temporary();
+        std::fs::write(root.join("relays-cache.json"), b"previous-cache").unwrap();
+        assert!(matches!(
+            finish_catalogue_fetch(&root, None, b"broken", None, 42),
+            Err("invalid_metadata")
+        ));
+        assert_eq!(
+            std::fs::read(root.join("relays-cache.json")).unwrap(),
+            b"previous-cache"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 fn load_catalogue_cache(
     root: &std::path::Path,
@@ -560,6 +667,9 @@ fn catalogue_worker(
     thread::Builder::new()
         .name("catalogue-background-io".into())
         .spawn(move || {
+            let mut previous = load_catalogue_cache(&root)
+                .ok()
+                .map(|(catalogue, _, _)| catalogue);
             while let Ok(job) = jobs.recv() {
                 let result = (|| {
                     let cache = store
@@ -592,24 +702,15 @@ fn catalogue_worker(
                         },
                     );
                     let bytes = access.client.fetch_relays().map_err(|e| e.code())?;
-                    let (parsed, cities) = read_catalogue(&bytes)?;
-                    let fetched_at = now_seconds();
-                    let cache = RelayCache {
-                        schema: 1,
-                        fetched_at,
-                        relays: serde_json::from_slice(&bytes).map_err(|_| "invalid_metadata")?,
-                    };
-                    let pending = root.join("relays-cache.pending");
-                    let mut file = open_writer_file(&pending, false, false)
-                        .map_err(|_| "metadata_cache_write_failed")?;
-                    file.set_len(0).map_err(|_| "metadata_cache_write_failed")?;
-                    serde_json::to_writer(&mut file, &cache)
-                        .map_err(|_| "metadata_cache_write_failed")?;
-                    file.sync_all().map_err(|_| "metadata_cache_write_failed")?;
-                    drop(file);
-                    std::fs::rename(pending, root.join("relays-cache.json"))
-                        .map_err(|_| "metadata_cache_write_failed")?;
-                    Ok((parsed, cities, fetched_at))
+                    let fetched = finish_catalogue_fetch(
+                        &root,
+                        previous.as_ref(),
+                        &bytes,
+                        job.current_relay.as_deref(),
+                        now_seconds(),
+                    )?;
+                    previous = Some(fetched.catalogue.clone());
+                    Ok(fetched)
                 })();
                 if done.send(result).is_err() {
                     break;
@@ -699,6 +800,8 @@ pub fn serve(scope: &str) -> io::Result<()> {
         metadata_updated_at: None,
         metadata_refreshing: false,
         metadata_error: None,
+        metadata_cache_error: None,
+        metadata_changes: None,
         chain_node: None,
         chain_fingerprint: None,
         chain_revision: 0,
@@ -1185,7 +1288,13 @@ pub fn serve(scope: &str) -> io::Result<()> {
                 catalogue_refresh.finish(Instant::now(), result.is_ok());
                 dashboard.metadata_refreshing = false;
                 match result {
-                    Ok((parsed, cities, updated_at)) => {
+                    Ok(FetchedCatalogue {
+                        catalogue: parsed,
+                        cities,
+                        fetched_at: updated_at,
+                        changes,
+                        cache_error,
+                    }) => {
                         // Keep a selected, healthy data plane untouched. The new
                         // catalogue authorizes the NEXT attempt, not a new peer.
                         pings.clear();
@@ -1195,7 +1304,13 @@ pub fn serve(scope: &str) -> io::Result<()> {
                         dashboard.metadata_source = "official_api".into();
                         dashboard.metadata_updated_at = Some(updated_at);
                         dashboard.metadata_error = None;
+                        dashboard.metadata_cache_error = cache_error.map(str::to_owned);
+                        logs.catalogue(&changes)?;
+                        dashboard.metadata_changes = Some(changes);
                         logs.event("api", "metadata_refresh_complete")?;
+                        if let Some(code) = cache_error {
+                            logs.event("api", code)?;
+                        }
                     }
                     Err(code) => {
                         dashboard.metadata_error = Some(code.into());

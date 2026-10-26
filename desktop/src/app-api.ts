@@ -17,6 +17,9 @@ export type City = {
   country: string;
   relay_count: number;
 };
+export type CatalogueFieldChange = {key:string;label:string;before:string;after:string;added?:string[];removed?:string[];added_count?:number;removed_count?:number};
+export type CatalogueRelayChange = {relay:string|null;state:string;fields:CatalogueFieldChange[];ss_before_count:number|null;ss_after_count:number|null};
+export type CatalogueChanges = {checked_at:number;baseline_available:boolean;catalogue_changed:boolean|null;added_count:number;removed_count:number;changed_count:number;shared_changes:CatalogueFieldChange[];current_relay:CatalogueRelayChange;changed_relays:CatalogueRelayChange[];truncated_count:number};
 export type Relay = {
   hostname: string;
   city: string;
@@ -68,6 +71,8 @@ export type Dashboard = {
   metadata_updated_at: number | null;
   metadata_refreshing?: boolean;
   metadata_error?: string | null;
+  metadata_cache_error?: string | null;
+  metadata_changes?: CatalogueChanges | null;
   chain_node?: string | null;
   chain_fingerprint?: string|null;
   chain_revision?: number;
@@ -263,6 +268,7 @@ const errors: Record<string, string> = {
   selected_city_missing: "先添加并选择一个常用城市。",
   metadata_cache_access_denied: "本机节点缓存无权读取，请导出诊断；没有自动改动旧文件权限。",
   metadata_cache_read_failed: "本机节点缓存读取失败，请更新目录或导出诊断。",
+  metadata_cache_write_failed: "官方目录已取得，但本机缓存保存失败；新数据仍在内存中生效。",
   invalid_metadata: "节点目录格式未通过校验，请更新目录。",
   metadata_missing: "节点目录尚未取得，请先更新目录。",
   physical_binding_unavailable: "本机物理出口尚未确认，请等待网络稳定后重试。",

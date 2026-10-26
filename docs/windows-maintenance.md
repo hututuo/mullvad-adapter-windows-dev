@@ -37,7 +37,7 @@ Windows 不是使用 Mac 的 Ruby/launchd；它用 Rust 后台和 Tauri/React �
 | Direct IPv4/IPv6 | 配置生成器存在，产品自动恢复目前不选这些路径。不能把调试 CLI 能生成配置写成 UI 已支持 |
 | UDP2TCP/QUIC/LWO | 没有在此产品基线接通；若网络禁 UDP，仅换 SS、加重试或批量 Ping 不能承诺修复 |
 | 多跳/PQ/DAITA | Windows 不支持的必需保护会显式拒绝，不会静默降低。Mac/helper 的实现不代表 Windows 已验收 |
-| MTU | 这是本地策略，不是官方目录数据。此基线 SS WG 为1265，其他生成路径1280；不要直接升级内核并假定兼容。某些新版内核会拒绝带IPv6地址且MTU<1280的配置，须先隔离测试生成配置和真实路径，不能为让parser通过就宣称大流量/PMTU通过 |
+| MTU | 这是本地策略，不是官方目录数据。双栈 userspace WG 统一1280（此前 SS/chain 低于1280），满足IPv6最小MTU。固定内核保持原版本；配置/parser通过不等于复杂网络的大流量/PMTU验收 |
 
 SS 改善部分特征识别或入口可达性，不是所有复杂网络的万能方案。官方客户端不稳不等于
 换成此软件一定稳定；要分清本机链路、UDP/SS、WG、DNS、HTTPS和Clash分流是哪一层失败。
@@ -107,6 +107,8 @@ Mullvad，核对实际出口；如果用户选择自己的节点，出口不同�
 开关窗口/夺焦点。先只读留证，修改一个变量并保留回滚。破坏性测试用隔离会话/专用机器。
 
 本机状态读取、状态年龄与误报分类、事件详情、自启和托盘见[桌面状态说明](windows-desktop-status.md)。状态读取走独立只读通道，不能把它与隧道远程健康检测混在一起。
+
+与 Mac 同步的目录明细、跨重启 SS 去重及纯 IP HTTPS 目标恢复见[本次规格](../openspec/changes/windows-catalogue-ss-parity/specs/recovery/spec.md)。后者只为公网纯 IP 请求读取可见 TLS ClientHello 域名（443/8443），仍由同一 WG 的内层 DNS 解析；不解密 TLS、不添加系统 DNS 或 DIRECT，也不主动访问网站。前端 front 不启用该恢复器，worker 才启用；私网、非 TLS、无 SNI/ECH 的覆盖边界保持明确。Windows 产品依然只有 SS/链式路径；不能将配置生成器中存在的原生 IPv4/IPv6、多跳或 PQ 写成已接入并通过实机验收。
 
 ## 给开发 Agent 的源码地图
 
