@@ -886,8 +886,25 @@ impl Connections {
         chained: bool,
     ) -> Result<Route, &'static str> {
         if let Some(path) = exact {
-            return Route::authorize(catalogue, relay, &path.transport, &path.inlet)
-                .ok_or("original_inlet_withdrawn");
+            let route = Route::authorize(catalogue, relay, &path.transport, &path.inlet)
+                .ok_or("original_inlet_withdrawn")?;
+            if route.is_ss() {
+                let mut allowed = catalogue.shadowsocks_inlets(relay);
+                if let std::net::SocketAddr::V4(endpoint) = route.endpoint() {
+                    if let Some(inlet) = catalogue.authorize_shadowsocks_inlet(
+                        relay,
+                        *endpoint.ip(),
+                        endpoint.port(),
+                    ) {
+                        if !allowed.contains(&inlet) {
+                            allowed.push(inlet);
+                        }
+                    }
+                }
+                self.inlet_trials
+                    .reconcile(relay.hostname(), relay.public_key(), &allowed);
+            }
+            return Ok(route);
         }
         if let Some(family) = self.plan.native_phase {
             return Route::native(catalogue, relay, family).ok_or("native_path_unavailable");
@@ -1562,9 +1579,12 @@ impl Connections {
         }
         match disposition {
             D::SkipUnavailablePath => {
+                // Cleanup moves an original attempt into Deferred. Capture its
+                // intent first, then end that phase only after cleanup returns.
+                let was_original = owner.state().stage == adapter_domain::Stage::RebuildOriginal;
                 let now = owner.now();
                 let _ = owner.state_mut().retry_after_local_cleanup(attempt, now);
-                if owner.state().stage == adapter_domain::Stage::RebuildOriginal {
+                if was_original {
                     let _ = owner.state_mut().finish_original_phase(now);
                     self.startup_route = None;
                     self.deferred = Some(attempt.path.relay.clone());

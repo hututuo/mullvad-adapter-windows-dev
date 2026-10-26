@@ -559,3 +559,102 @@ fn unavailable_native_original_leaves_original_wait_and_retries_its_ss_without_b
         live_route::SS
     );
 }
+
+#[test]
+fn exact_ss_restore_reconciles_peer_key_and_retains_authorized_custom_port() {
+    use sha2::{Digest, Sha256};
+
+    let catalogue_for_key = |public_key: &str| {
+        let payload = json!({
+            "wireguard": {
+                "port_ranges": [[33431, 33431], [51820, 51820]],
+                "shadowsocks_port_ranges": [[51900, 51901]],
+                "relays": [{
+                    "hostname": "us-test-wg-1",
+                    "location": "us-test",
+                    "active": true,
+                    "public_key": public_key,
+                    "ipv4_addr_in": IPV4,
+                    "ipv6_addr_in": IPV6,
+                    "shadowsocks_extra_addr_in": ["192.0.2.20"]
+                }]
+            }
+        });
+        Catalogue::parse(payload.to_string().as_bytes())
+            .expect("synthetic key-rotation catalogue is valid")
+    };
+
+    let old_catalogue = catalogue_for_key("AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=");
+    let current_catalogue = catalogue_for_key(PUBLIC_KEY);
+    let old_relay = only_relay(&old_catalogue);
+    let current_relay = only_relay(&current_catalogue);
+    let mut harness = harness();
+    let exact_endpoint = "192.0.2.20:20555";
+    let exact = native_path(current_relay, live_route::SS, exact_endpoint, 80);
+
+    let old_pool = old_catalogue.shadowsocks_inlets(old_relay);
+    harness.connections.inlet_trials.reconcile(
+        old_relay.hostname(),
+        old_relay.public_key(),
+        &old_pool,
+    );
+    harness
+        .connections
+        .inlet_trials
+        .succeeded(old_relay.hostname(), exact_endpoint, false);
+    let old_state: serde_json::Value =
+        serde_json::from_slice(&harness.connections.inlet_trials.history_bytes().unwrap()).unwrap();
+    assert_eq!(old_state["history"].as_array().unwrap().len(), 1);
+    assert_eq!(old_state["history"][0]["endpoint"], exact_endpoint);
+    let old_fingerprint = format!("{:x}", Sha256::digest(old_relay.public_key().as_bytes()));
+    assert_eq!(old_state["windows"][0]["peer_fingerprint"], old_fingerprint);
+
+    let picked = harness
+        .connections
+        .pick_route(&current_catalogue, current_relay, Some(&exact), false)
+        .expect("authorized exact dedicated SS port survives peer-key reconciliation");
+    assert_eq!(picked.kind(), live_route::SS);
+    assert_eq!(picked.endpoint().to_string(), exact_endpoint);
+
+    let after_rotation: serde_json::Value =
+        serde_json::from_slice(&harness.connections.inlet_trials.history_bytes().unwrap()).unwrap();
+    assert!(after_rotation["history"].as_array().unwrap().is_empty());
+    let current_fingerprint = format!(
+        "{:x}",
+        Sha256::digest(current_relay.public_key().as_bytes())
+    );
+    let windows = after_rotation["windows"].as_array().unwrap();
+    assert_eq!(windows.len(), 2);
+    assert!(windows
+        .iter()
+        .all(|window| window["peer_fingerprint"] == current_fingerprint));
+
+    // Exact authorization extends the current SS pool during reconciliation;
+    // otherwise this non-pool dedicated tuple's seen marker is pruned here.
+    harness
+        .connections
+        .inlet_trials
+        .succeeded(current_relay.hostname(), exact_endpoint, false);
+    assert_eq!(
+        harness
+            .connections
+            .pick_route(&current_catalogue, current_relay, Some(&exact), false)
+            .unwrap()
+            .endpoint()
+            .to_string(),
+        exact_endpoint
+    );
+    let retained: serde_json::Value =
+        serde_json::from_slice(&harness.connections.inlet_trials.history_bytes().unwrap()).unwrap();
+    let plain_window = retained["windows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|window| window["relay"] == current_relay.hostname() && window["chained"] == false)
+        .unwrap();
+    assert!(plain_window["seen"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|endpoint| endpoint == exact_endpoint));
+}
