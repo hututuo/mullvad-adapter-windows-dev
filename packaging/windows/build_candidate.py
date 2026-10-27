@@ -303,6 +303,15 @@ def build(
     output.mkdir(parents=True, exist_ok=False)
     env = os.environ.copy()
     env["ADAPTER_SOURCE_SHA"] = args.source_sha
+    # Upstream contains paths beyond legacy MAX_PATH. Keep the fix scoped to
+    # child Git/Cargo processes; never modify the build host's global config.
+    env["CARGO_NET_GIT_FETCH_WITH_CLI"] = "true"
+    git_config_count = int(env.get("GIT_CONFIG_COUNT", "0"))
+    if not 0 <= git_config_count <= 64:
+        raise ValueError("Invalid inherited Git config count")
+    env[f"GIT_CONFIG_KEY_{git_config_count}"] = "core.longpaths"
+    env[f"GIT_CONFIG_VALUE_{git_config_count}"] = "true"
+    env["GIT_CONFIG_COUNT"] = str(git_config_count + 1)
     # Ship no dependency on a separately installed Visual C++ redistributable.
     # Keep other caller build flags rather than replacing them.
     if env.get("RUSTFLAGS"):

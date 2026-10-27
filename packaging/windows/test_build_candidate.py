@@ -112,6 +112,11 @@ class BuildSourceProvenanceTests(unittest.TestCase):
         def run_command(command, **kwargs):
             commands.append(command)
             if command[0] == "cargo":
+                env = kwargs["env"]
+                self.assertEqual(env["CARGO_NET_GIT_FETCH_WITH_CLI"], "true")
+                slot = int(env["GIT_CONFIG_COUNT"]) - 1
+                self.assertEqual(env[f"GIT_CONFIG_KEY_{slot}"], "core.longpaths")
+                self.assertEqual(env[f"GIT_CONFIG_VALUE_{slot}"], "true")
                 artifact = Path(kwargs["env"]["CARGO_TARGET_DIR"]) / build_candidate.TARGET / "release/adapter-agent.exe"
                 artifact.parent.mkdir(parents=True, exist_ok=True)
                 artifact.write_bytes(b"mock agent")

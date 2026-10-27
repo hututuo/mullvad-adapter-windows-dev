@@ -16,6 +16,13 @@ permissions:
   contents: read
 jobs:
   quic-carrier-checks:
+    # The official repository includes long UI paths. Use Git CLI with scoped
+    # config so Windows Cargo/libgit2 cannot fail before compiling the helper.
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: core.longpaths
+      GIT_CONFIG_VALUE_0: 'true'
     strategy:
       fail-fast: false
       matrix:
