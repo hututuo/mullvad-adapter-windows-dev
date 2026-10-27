@@ -266,14 +266,12 @@ class BuildSourceProvenanceTests(unittest.TestCase):
                     mock.patch.object(build_candidate.sys, "platform", "win32"),
                     mock.patch.object(build_candidate.shutil, "which", return_value="npm.cmd"),
                     mock.patch.object(build_candidate, "stage_runtime", side_effect=fake_stage_runtime),
-                    mock.patch.object(build_candidate, "_validate_amd64_pe"),
+                    mock.patch.object(build_candidate, "require_upstream_long_paths"),                    mock.patch.object(build_candidate, "_validate_amd64_pe"),
                 ):
                     with self.assertRaisesRegex(ValueError, "during the candidate build"):
                         build_candidate.build(args, source_root=self.root, command_runner=run_command)
                 self.assertTrue(commands)
                 self.assertFalse((Path(args.output) / "candidate.json").exists())
-
-
 
 
 class UpstreamLongPathTests(unittest.TestCase):
