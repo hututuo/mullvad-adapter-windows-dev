@@ -184,7 +184,10 @@ fn bind_interface(socket: &std::net::UdpSocket, request: &Request) -> io::Result
 #[cfg(windows)]
 fn bind_interface(socket: &std::net::UdpSocket, request: &Request) -> io::Result<()> {
     use std::os::windows::io::AsRawSocket;
-    use windows_sys::Win32::Networking::WinSock::*;
+    use windows_sys::Win32::Networking::WinSock::{
+        IP_UNICAST_IF, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, SOCKET, SOCKET_ERROR,
+        WSAGetLastError, getsockopt, setsockopt,
+    };
     let (level, option, index) = if request.remote_endpoint.is_ipv4() {
         (IPPROTO_IP, IP_UNICAST_IF, request.interface_index.to_be())
     } else {
