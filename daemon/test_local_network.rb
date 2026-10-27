@@ -69,6 +69,76 @@ class MullvadLocalNetworkTest < Minitest::Test
     refute @adapter.send(:snapshot).dig(:local_network, :paused)
   end
 
+  def test_ipv6_transport_cannot_reuse_a_v4_only_default_interface
+    # Use the real resolver, not ReliabilityAdapter's engine fixture.
+    adapter = MullvadAdapter.new(state_dir: @dir)
+    adapter.define_singleton_method(:route_interface_for) { |_, _| 'en0' }
+    adapter.define_singleton_method(:network_interface_fallbacks) { ['en0'] }
+    adapter.define_singleton_method(:bounded_network_command) do |*|
+      "en0: flags=8863<UP,BROADCAST>\n\tinet 192.0.2.10 netmask 0xffffff00\n\tinet6 fe80::1%en0 prefixlen 64\n\tstatus: active\n"
+    end
+    error = assert_raises(MullvadAdapter::LocalProbeUnavailable) { adapter.send(:physical_interface, '2001:db8::1') }
+    assert_equal 'physical-ipv6-route-unavailable', error.phase
+    assert_equal 'en0', adapter.send(:physical_interface, '192.0.2.1')
+    adapter.define_singleton_method(:bounded_network_command) do |*|
+      "en0: flags=8863<UP,BROADCAST>\n\tinet6 2001:db8::2 prefixlen 64\n\tstatus: active\n"
+    end
+    assert_equal 'en0', adapter.send(:physical_interface, '2001:db8::1')
+  end
+
+  def test_tentative_ipv6_address_is_not_an_outer_transport_source
+    adapter = MullvadAdapter.new(state_dir: @dir)
+    adapter.define_singleton_method(:bounded_network_command) do |*|
+      "en0: flags=8863<UP,BROADCAST>\n\tinet6 2001:db8::2 prefixlen 64 tentative\n\tstatus: active\n"
+    end
+    refute adapter.send(:usable_transport_interface?, 'en0', :ipv6)
+  end
+
+  def test_ipv6_fallback_requires_a_scoped_ipv6_route_even_when_an_address_exists
+    adapter = MullvadAdapter.new(state_dir: @dir)
+    adapter.define_singleton_method(:route_interface_for) { |_, _| 'utun7' }
+    adapter.define_singleton_method(:network_interface_fallbacks) { ['en0'] }
+    adapter.define_singleton_method(:bounded_network_command) do |command, *|
+      raise IOError if command == '/sbin/route'
+      "en0: flags=8863<UP,BROADCAST>\n\tinet6 2001:db8::2 prefixlen 64\n\tstatus: active\n"
+    end
+    assert_raises(MullvadAdapter::LocalProbeUnavailable) { adapter.send(:physical_interface, '2001:db8::1') }
+    adapter.define_singleton_method(:bounded_network_command) do |command, *args|
+      if command == '/sbin/route'
+        raise 'must ask scoped IPv6 route' unless args == ['-n', 'get', '-inet6', '-ifscope', 'en0', '2001:db8::1']
+        "interface: en0\n"
+      else
+        "en0: flags=8863<UP,BROADCAST>\n\tinet6 2001:db8::2 prefixlen 64\n\tstatus: active\n"
+      end
+    end
+    assert_equal 'en0', adapter.send(:physical_interface, '2001:db8::1')
+  end
+
+  def test_manual_ipv6_selection_without_local_ipv6_has_a_clear_result_and_keeps_worker
+    @adapter.send(:apply_local_network_observation, status: 'available', active_interfaces: ['en0'], address_families: ['ipv4'])
+    response = +''
+    socket = Object.new
+    socket.define_singleton_method(:write) { |value| response << value }
+    @adapter.send(:accepted_async, socket, 'two', 'select', 'ipv6')
+    assert_includes response, '409'
+    assert_includes response, 'local_ipv6_unavailable'
+    assert_equal 'one', @adapter.send(:snapshot)[:active_relay]
+    refute @adapter.send(:action_pending?)
+    assert_empty @adapter.events
+  end
+
+  def test_inconclusive_data_observation_never_counts_as_a_tunnel_failure
+    @adapter.instance_variable_get(:@options)[:health_fail_threshold] = 1
+    @adapter.define_singleton_method(:run_readiness_canary) do |*|
+      { at: Time.now.iso8601, ip_data: { status: 'unknown', local_failure: 'local-socket' },
+        inner_dns: { status: 'fail' }, https_data: { status: 'skip' }, ping_data: { status: 'pass', delay_ms: 100 } }
+    end
+    @adapter.define_singleton_method(:run_ordered_recovery) { |*, **| flunk 'inconclusive observation must not initiate recovery' }
+    @adapter.send(:check_active_health_once)
+    assert_equal 0, @adapter.send(:snapshot).dig(:health, :consecutive_wg_failures)
+    assert_equal 'one', @adapter.send(:snapshot)[:active_relay]
+  end
+
   def test_offline_pauses_all_automatic_relay_work_and_diagnostics
     observe('unavailable')
     @adapter.define_singleton_method(:run_readiness_canary) { |_| raise 'must not probe offline' }

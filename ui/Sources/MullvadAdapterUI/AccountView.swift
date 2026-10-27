@@ -14,6 +14,7 @@ struct AccountView: View {
     @State private var confirmingDraftKey = false
     @State private var confirmingInstall = false
     @State private var confirmingAbandonInstall = false
+    @State private var switchingIdentity: SavedLocalIdentity?
 
     init(model: AdapterViewModel) {
         self.model = model
@@ -44,6 +45,7 @@ struct AccountView: View {
             ScrollView {
                 VStack(spacing: 16) {
                     connectionCard
+                    savedIdentitiesCard
                     identityCard
                     deviceCard
                     accountActions
@@ -54,6 +56,17 @@ struct AccountView: View {
         .task { await account.load() }
         .onDisappear { account.hideKey(); number = ""; voucher = "" }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in account.hideKey() }
+        .alert("切换本机隧道身份？", isPresented: Binding(get: { switchingIdentity != nil }, set: { if !$0 { switchingIdentity = nil } })) {
+            Button("取消", role: .cancel) { switchingIdentity = nil }
+            Button("切换并连接") {
+                if let identity = switchingIdentity {
+                    Task { await account.switchIdentity(identity); await model.refreshStatusOnly() }
+                }
+                switchingIdentity = nil
+            }
+        } message: {
+            Text("切换到账号尾号 \(switchingIdentity?.accountSuffix ?? "—") · \(switchingIdentity?.title ?? "")。会短暂中断当前通道，再用所选身份重连原节点；失败时可切回。不会创建或撤销官方设备。")
+        }
         .alert("撤销设备？", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } })) {
             Button("取消", role: .cancel) { removing = nil }
             Button("撤销", role: .destructive) {
@@ -97,6 +110,39 @@ struct AccountView: View {
             Button("取消", role: .cancel) {}
             Button("确认兑换") { let code = voucher; voucher = ""; Task { await account.voucher(code) } }
         } message: { Text("兑换码将使用到账号尾号 \(account.snapshot?.accountSuffix ?? "未知")。提交超时后先刷新有效期，避免重复兑换。") }
+    }
+
+    @ViewBuilder private var savedIdentitiesCard: some View {
+        if let identities = account.snapshot?.savedIdentities, !identities.isEmpty {
+            AppCard("保存的本机身份") {
+                Text("只启用一条身份。设备名称来自已保存的官方响应；当前登记情况需刷新官方状态核实。")
+                    .font(.caption).foregroundStyle(.secondary)
+                ForEach(identities) { identity in
+                    HStack(alignment: .top, spacing: 12) {
+                        Image(systemName: identity.current ? "checkmark.circle.fill" : "person.crop.circle")
+                            .foregroundStyle(identity.current ? Color.green : .secondary)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(identity.title).font(.headline)
+                            Text("账号尾号 \(identity.accountSuffix)\(identity.current ? " · 当前隧道身份" : "")")
+                            Text(identity.publicKey).font(.caption.monospaced()).textSelection(.enabled)
+                            if identity.nameSource == "not_verified" {
+                                Text("账号关联与设备名称待核实；密钥已保留。").font(.caption).foregroundStyle(.orange)
+                            }
+                            if identity.registrationStatus == "unmatched" {
+                                Text("最近的官方列表未找到此公钥；可能已撤销或账号不匹配。密钥仍保留供核对。")
+                                    .font(.caption).foregroundStyle(.orange)
+                            } else if identity.registrationStatus == "matched" {
+                                Text("最近刷新时官方登记匹配；不等于隧道已连通。").font(.caption).foregroundStyle(.secondary)
+                            }
+                        }.frame(maxWidth: .infinity, alignment: .leading)
+                        Button(identity.current ? "使用中" : "切换…") { switchingIdentity = identity }
+                            .buttonStyle(.bordered).contentShape(Rectangle())
+                            .disabled(identity.current || account.busy || model.isBusy || model.isPreview || account.snapshot?.identitySwitchSupported != true)
+                    }.padding(10).frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.secondary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+                }
+            }
+        }
     }
 
     private var connectionCard: some View {

@@ -31,6 +31,9 @@ struct AbandonedIdentityReceipt: Codable, Equatable {
 struct AbandonmentStatus: Decodable { let receipt: AbandonedIdentityReceipt? }
 
 struct AccountSnapshot: Decodable {
+    var savedIdentities: [SavedLocalIdentity]? = nil
+    var activeIdentityID: String? = nil
+    var identitySwitchSupported: Bool? = nil
     let signedIn: Bool
     let verified: Bool
     let accountSuffix: String?
@@ -58,12 +61,28 @@ struct AccountSnapshot: Decodable {
         return formatter.date(from: expiry)
     }
     enum CodingKeys: String, CodingKey {
+        case savedIdentities = "saved_identities", activeIdentityID = "active_identity_id", identitySwitchSupported = "identity_switch_supported"
         case signedIn = "signed_in", verified, accountSuffix = "account_suffix", expiry
         case checkedAt = "checked_at", publicKey = "public_key", deviceMatch = "device_match", devices
         case accountFingerprint = "account_fingerprint"
         case identityConfigured = "identity_configured", apiRoute = "api_route", apiRouteSource = "api_route_source", deviceSource = "device_source"
         case activatedDraftPublicKey = "activated_draft_public_key", activatedDraftDeviceID = "activated_draft_device_id"
         case identityAbandonmentSupported = "identity_abandonment_supported", pendingIdentityInstallation = "pending_identity_installation"
+    }
+}
+
+struct SavedLocalIdentity: Decodable, Identifiable, Equatable {
+    let id: String
+    let accountSuffix: String
+    let deviceName: String?
+    let nameSource: String?
+    let publicKey: String
+    let current: Bool
+    let registrationStatus: String?
+    var title: String { deviceName ?? "旧身份 · 设备名待核实" }
+    enum CodingKeys: String, CodingKey {
+        case id, current, accountSuffix = "account_suffix", deviceName = "device_name", nameSource = "name_source"
+        case publicKey = "public_key", registrationStatus = "registration_status"
     }
 }
 
@@ -219,6 +238,36 @@ final class AccountViewModel: ObservableObject {
     }
     func refresh() async {
         await perform(success: "已从 Mullvad 刷新账号与设备列表。") { try await self.client.account("refresh") }
+    }
+    func switchIdentity(_ identity: SavedLocalIdentity) async {
+        guard !busy, !identity.current, snapshot?.identitySwitchSupported == true else { return }
+        hideKey(); busy = true; hasError = false
+        defer { busy = false }
+        do {
+            let receipt = try await client.switchIdentity(identity.id, expectedActiveID: snapshot?.activeIdentityID)
+            message = "已收到切换请求，正在结束旧通道…"
+            let deadline = Date().addingTimeInterval(150)
+            while Date() < deadline {
+                try await Task.sleep(nanoseconds: 750_000_000)
+                let operation = try await client.fetchOperation(receipt.id)
+                message = operation.message ?? "正在切换身份并验证连接…"
+                if !operation.isRunning {
+                    try accept(try await client.account())
+                    hasError = operation.state != "succeeded"
+                    if hasError {
+                        message = snapshot?.activeIdentityID == identity.id
+                            ? "已切换到 \(identity.title)，但联网验证未通过。可在主页重试，或切回原身份。"
+                            : (operation.error ?? operation.message ?? "身份切换未完成，请刷新后核对。")
+                    }
+                    return
+                }
+            }
+            throw AdapterClientError.invalidResponse("切换尚未确认完成，请刷新状态核对；不会重复提交。")
+        } catch {
+            // Read back after an ambiguous response; never replay the switch.
+            if let fresh = try? await client.account() { try? accept(fresh) }
+            hasError = true; message = error.localizedDescription
+        }
     }
     func logout() async {
         hideKey()
