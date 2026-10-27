@@ -52,6 +52,13 @@ struct AdapterClient: Sendable {
         return try decode(try await data(for: request), path: "account")
     }
 
+    func switchIdentity(_ id: String, expectedActiveID: String?) async throws -> OperationReceipt {
+        var payload: [String: Any] = ["id": id, "confirm": true]
+        if let expectedActiveID { payload["expected_active_id"] = expectedActiveID }
+        let request = try accountRequest("identities/switch", payload: payload)
+        return try decode(try await data(for: request), path: "account/identities/switch")
+    }
+
     func createDevice(publicKey: String, accountFingerprint: String) async throws -> CreatedAccountDevice {
         let request = try accountRequest("devices/create", payload: ["public_key": publicKey, "confirm": true, "account_fingerprint": accountFingerprint])
         return try decode(try await data(for: request), path: "account/devices/create")

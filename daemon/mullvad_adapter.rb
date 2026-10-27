@@ -540,6 +540,10 @@ class MullvadAdapter
   end
 
   def load_template
+    if (saved = active_saved_identity)
+      @template = saved.fetch('template').dup
+      return
+    end
     if File.exist?(template_path) || File.symlink?(template_path)
       recover_private_identity_link(template_path)
       @template = JSON.parse(read_private_identity_file(template_path))
@@ -1111,6 +1115,181 @@ class MullvadAdapter
     end
   end
 
+  # One owner-readable document commits the account/key/address tuple together.
+  # Legacy files remain untouched as the rollback baseline. No keys or complete
+  # account numbers are exposed by the list endpoint, events or operation data.
+  def identity_profiles_path
+    File.join(@state_dir, 'identity-profiles.json')
+  end
+
+  def identity_profile_record(number:, template:, device: nil)
+    number = normalize_account(number)
+    raise AccountError.new('invalid_identity', '本机身份格式无效') unless template.is_a?(Hash)
+    key = template.fetch('private-key')
+    pubkey = template_public_key(key)
+    raise ArgumentError unless IPAddr.new(template.fetch('ip')).ipv4?
+    raise ArgumentError if template['ipv6'] && !IPAddr.new(template['ipv6']).ipv6?
+    fields = %w[ip ipv6 private-key pre-shared-key allowed-ips reserved udp mtu]
+    clean = template.select { |name, _| fields.include?(name) }
+    # Local identity imports never import routes, dialers or executable paths.
+    clean['allowed-ips'] = ['0.0.0.0/0', '::/0']
+    clean['udp'] = true
+    clean['mtu'] = 1280
+    name = device && device['name']
+    raise ArgumentError if name && (!name.is_a?(String) || name.empty? || name.bytesize > 256 || name.match?(/[[:cntrl:]]/))
+    if device
+      raise ArgumentError unless device['pubkey'] == pubkey &&
+        device['ipv4_address'] == clean['ip'] + '/32' &&
+        device['ipv6_address'] == clean['ipv6'].to_s + '/128'
+    end
+    { 'id' => Digest::SHA256.hexdigest(number + ':' + pubkey), 'account_number' => number,
+      'public_key' => pubkey, 'template' => clean, 'device_name' => name,
+      'device_id' => device && device['id'], 'name_source' => device ? 'saved_official_response' : 'not_verified' }
+  rescue KeyError, ArgumentError, IPAddr::InvalidAddressError
+    raise AccountError.new('invalid_identity', '账号、密钥或官方分配的隧道地址不匹配；未导入')
+  end
+
+  def identity_profiles_document
+    path = identity_profiles_path
+    return { 'schema' => 1, 'revision' => 0, 'active_id' => nil, 'profiles' => [] } unless File.exist?(path) || File.symlink?(path)
+    assert_private_directory!(@state_dir)
+    data = JSON.parse(read_private_identity_file(path))
+    raise ArgumentError unless data.is_a?(Hash) && data['schema'] == 1 && data['revision'].is_a?(Integer) &&
+      data['profiles'].is_a?(Array) && data['profiles'].length.between?(1, 8)
+    data['profiles'].each do |profile|
+      clean = identity_profile_record(number: profile['account_number'], template: profile['template'])
+      raise ArgumentError unless profile['id'] == clean['id'] && profile['public_key'] == clean['public_key'] && profile['template'] == clean['template'] &&
+        [nil, 'saved_official_response', 'official_api', 'not_verified'].include?(profile['name_source']) &&
+        (profile['device_name'].nil? || (profile['device_name'].is_a?(String) && profile['device_name'].bytesize.between?(1, 256) && !profile['device_name'].match?(/[[:cntrl:]]/)))
+    end
+    ids = data['profiles'].map { |profile| profile['id'] }
+    raise ArgumentError unless ids.uniq == ids && (data['active_id'].nil? || ids.include?(data['active_id']))
+    normalize_account(data['management_account_number']) if data['management_account_number']
+    data
+  rescue StandardError
+    raise AccountError.new('identity_store_invalid', '保存的身份记录损坏或权限不安全；未切换，原文件已保留')
+  end
+
+  def write_identity_profiles(data)
+    assert_private_directory!(@state_dir)
+    read_private_identity_file(identity_profiles_path) if File.exist?(identity_profiles_path) || File.symlink?(identity_profiles_path)
+    data = Marshal.load(Marshal.dump(data))
+    data['revision'] += 1
+    bytes = JSON.generate(data)
+    raise AccountError.new('identity_store_full', '本机身份记录已满') if bytes.bytesize > 16_384
+    atomic_account_file(identity_profiles_path, bytes)
+    begin
+      sync_identity_directory(identity_profiles_path)
+    rescue SystemCallError
+      # The atomic rename already committed. Adopt that same tuple in memory
+      # instead of leaving the old key active against a newly selected file.
+      # Keep the crash-durability limitation visible without logging secrets.
+      log_event('identity-directory-sync-unconfirmed', detail: 'identity file committed; directory fsync not confirmed')
+    end
+    data
+  end
+
+  def active_saved_identity
+    data = identity_profiles_document
+    data['profiles'].find { |profile| profile['id'] == data['active_id'] }
+  end
+
+  def remember_verified_identity_name
+    return unless @account_number && @account_data && @template
+    data = identity_profiles_document
+    key = template_public_key
+    profile = data['profiles'].find { |item| item['account_number'] == @account_number && item['public_key'] == key }
+    return unless profile
+    device = @account_data[:devices].find { |item| item['pubkey'] == key }
+    profile['registration_checked_at'] = @account_data[:checked_at]
+    profile['registration_status'] = device ? 'matched' : 'unmatched'
+    if device
+      profile['device_name'], profile['device_id'], profile['name_source'] = device['name'], device['id'], 'official_api'
+    end
+    write_identity_profiles(data)
+  end
+
+  def persist_saved_management_login(number)
+    data = identity_profiles_document
+    return unless data['active_id']
+    data['management_account_number'] = number
+    write_identity_profiles(data)
+  end
+
+  def saved_identity_snapshot
+    data = identity_profiles_document
+    pubkey = @template && template_public_key
+    active = data['profiles'].find { |profile| profile['id'] == data['active_id'] } ||
+      data['profiles'].find { |profile| profile['public_key'] == pubkey }
+    { identity_switch_supported: true, active_identity_id: active && active['id'],
+      saved_identities: data['profiles'].map do |profile|
+        { id: profile['id'], account_suffix: profile['account_number'][-4, 4],
+          device_name: profile['device_name'], name_source: profile['name_source'], public_key: profile['public_key'],
+          current: profile['id'] == active&.fetch('id'), registration_status: profile['registration_status'] || 'not_refreshed' }
+      end }
+  end
+
+  def validate_identity_selection!(selection)
+    target = identity_profiles_document['profiles'].find { |profile| profile['id'] == selection['id'] }
+    raise AccountError.new('identity_not_found', '此本机身份不存在；请刷新列表') unless target
+    unless saved_identity_snapshot[:active_identity_id] == selection['expected_active_id']
+      raise AccountError.new('identity_changed', '当前身份已变化；请刷新后再切换')
+    end
+    target
+  end
+
+  def switch_saved_identity(selection, relay, preference)
+    # Account actions never wait behind a long tunnel check. This operation owns
+    # the common admission gate; the switch lock serializes cleanup and commit.
+    # The HTTP handler still owns this mutex until its accepted reply is sent.
+    # A short bounded handover avoids racing that reply and failing every fast
+    # operation, without queuing indefinitely behind a later API request.
+    handover_deadline = monotonic_now + 2
+    until @account_mutex.try_lock
+      raise AccountError.new('account_busy', '账号操作尚未结束，请稍后再切换') if monotonic_now >= handover_deadline
+      sleep 0.01
+    end
+    begin
+      target = validate_identity_selection!(selection)
+      return true if active_saved_identity&.fetch('id') == target['id'] && @template == target['template']
+      update_operation(stage: 'identity-switch', message: '正在结束旧通道，随后切换本机身份')
+      @switch_mutex.synchronize do
+        raise LocalNetworkInterrupted unless network_attempt_current?
+        data = identity_profiles_document
+        target = validate_identity_selection!(selection)
+        # Old probe observations and delayed callbacks cannot commit across the
+        # boundary. No replacement starts until every old worker is stopped.
+        @mutex.synchronize { @state[:generation] += 1 }
+        @workers.keys.each { |slot| stop_worker(slot) }
+        raise AccountError.new('identity_cleanup_pending', '旧通道尚未退出；未更换密钥') unless @workers.empty?
+        update_state(active_slot: nil, relay_liveness: 'unknown', service_readiness: 'identity_switching',
+                     active_transport: nil, active_transport_mode: nil, last_canary: nil, last_error: nil)
+        data['active_id'] = target['id']
+        data['management_account_number'] = target['account_number']
+        write_identity_profiles(data) # The sole durable commit point.
+        @template = target['template'].dup
+        @account_number = target['account_number']
+        @account_data = @account_token = nil
+        @last_network_path = @network_resume_path = nil
+        @health_fail_streak = @dns_fail_streak = @automatic_exhausted_rounds = 0
+        @mutex.synchronize do
+          @inner_dns_observations.clear
+          @state[:dns][:inner_breaker] = { status: 'closed', observed_relays: [], detail: '本机身份已切换，等待新通道验证' }
+          @state[:health][:consecutive_wg_failures] = @state[:health][:consecutive_dns_failures] = 0
+        end
+        log_event('local-identity-switched', detail: 'saved local identity committed; tunnel not yet verified')
+      end
+    ensure
+      @account_mutex.unlock
+    end
+    if relay.to_s.empty? || !@metadata
+      update_state(status: 'identity_configured', service_readiness: 'identity_configured')
+      update_operation(message: '本机身份已切换；请选择城市连接，尚未验证联网')
+      return true
+    end
+    activate(relay, reason: 'identity-switch', transport_preference: preference)
+  end
+
   def load_account_manager
     capability_path = File.join(@state_dir, 'account-capability')
     @account_capability = File.file?(capability_path) ? File.read(capability_path).strip : SecureRandom.hex(32)
@@ -1118,6 +1297,10 @@ class MullvadAdapter
     atomic_account_file(capability_path, @account_capability)
     path = File.join(@state_dir, 'account.json')
     @account_number = normalize_account(JSON.parse(File.read(path))['account_number']) if File.file?(path)
+    if (saved = active_saved_identity)
+      data = identity_profiles_document
+      @account_number = data.key?('management_account_number') ? data['management_account_number'] : saved['account_number']
+    end
   rescue StandardError
     @account_number = @account_data = @account_token = nil
     # Account metadata must never prevent the legacy tunnel from starting.
@@ -1190,7 +1373,7 @@ class MullvadAdapter
       devices: devices, account_fingerprint: @account_number && Digest::SHA256.hexdigest(@account_number),
       identity_configured: !pubkey.empty?, api_route: @options[:bootstrap_proxy].to_s.empty? ? 'system_https' : 'configured_proxy',
       api_route_source: @api_route_source, device_source: @account_data ? 'official_api' : 'not_verified',
-      identity_abandonment_supported: true, pending_identity_installation: pending_identity_installation }.merge(installed_draft_match(pubkey, devices))
+      identity_abandonment_supported: true, pending_identity_installation: pending_identity_installation }.merge(installed_draft_match(pubkey, devices)).merge(saved_identity_snapshot)
   end
 
   def verify_account_binding!(payload)
@@ -1291,17 +1474,26 @@ class MullvadAdapter
       case [method, path]
       when ['GET', '/account']
         respond(sock, 200, account_snapshot)
+      when ['POST', '/account/identities/switch']
+        raise AccountError.new('confirmation_required', '请确认切换本机隧道身份') unless payload['confirm'] == true
+        validate_identity_selection!(payload)
+        relay = @mutex.synchronize { @state[:active_relay] } || load_persisted_relay
+        accepted_async(sock, relay.to_s, 'identity-switch', nil, identity_selection: payload.slice('id', 'expected_active_id'))
       when ['POST', '/account/login']
         number = normalize_account(payload['account_number'])
         verified = account_refresh(number)
         atomic_account_file(File.join(@state_dir, 'account.json'), JSON.generate(account_number: number))
         @account_number, @account_data = number, verified
+        persist_saved_management_login(number)
+        remember_verified_identity_name
         respond(sock, 200, account_snapshot)
       when ['POST', '/account/refresh']
         @account_data = account_refresh
+        remember_verified_identity_name
         respond(sock, 200, account_snapshot)
       when ['POST', '/account/logout']
         verify_account_binding!(payload)
+        persist_saved_management_login(nil)
         account_path = File.join(@state_dir, 'account.json')
         File.unlink(account_path) if File.exist?(account_path)
         @account_number = @account_data = @account_token = nil
@@ -1650,9 +1842,13 @@ class MullvadAdapter
     sock.close rescue nil
   end
 
-  def accepted_async(sock, relay, reason, transport_preference = nil, profile: nil)
+  def accepted_async(sock, relay, reason, transport_preference = nil, profile: nil, identity_selection: nil)
     preference = normalize_transport_preference(transport_preference || current_transport_preference)
-    unless %w[repair diagnose].include?(reason)
+    if preference == 'ipv6' && !local_transport_available?('ipv6') && reason != 'identity-switch'
+      respond(sock, 409, { ok: false, code: 'local_ipv6_unavailable', error: '本机当前没有可用的 IPv6 地址；原连接保留。可选自动或 SS，不代表节点失效' })
+      return
+    end
+    unless %w[repair diagnose identity-switch].include?(reason)
       unless @metadata
         respond(sock, 503, { ok: false, code: 'metadata_unavailable', error: '节点列表尚未就绪，后台正在重试' })
         return
@@ -1706,6 +1902,8 @@ class MullvadAdapter
         update_operation(state: 'running')
         action_evidence = {}
         ok = case reason
+             when 'identity-switch'
+               switch_saved_identity(identity_selection, relay, preference)
              when 'speedtest'
                deadline = monotonic_now + 20
                loop do
@@ -1759,7 +1957,9 @@ class MullvadAdapter
           'preserved' => '本次操作未完成，原连接已保留或恢复',
           'failed' => '尚未恢复连接，后台将继续有限重试'
         }
-        message = if reason == 'speedtest' && outcome == 'failed'
+        message = if reason == 'identity-switch' && ok
+                    current[:service_readiness] == 'ready' ? '已切换本机身份并验证原节点连接' : '本机身份已切换；尚未验证联网，请在主页选择城市并连接'
+                  elsif reason == 'speedtest' && outcome == 'failed'
                     '测速未完成，当前连接保持原样'
                   elsif %w[repair diagnose].include?(reason) && ok
                     current.dig(:diagnosis, :summary) || messages[outcome]
@@ -2974,9 +3174,14 @@ class MullvadAdapter
       end
       active_worker = context[:worker]
       active_mode = active_worker[:transport_mode].to_s.empty? ? 'ss' : active_worker[:transport_mode]
+      classification = classify_canary(canary)
+      if classification[:relay_liveness] == 'unknown'
+        log_probe_event('health-result-inconclusive', relay: relay_name,
+                        reason: 'incomplete-observation-not-a-confirmed-tunnel-failure')
+        return
+      end
       cache_speed_test(relay_name, canary, 'active-health', active_mode)
       record_ss_endpoint_canary(relay_name, active_mode, active_worker, canary)
-      classification = classify_canary(canary)
       clear_relay_quarantine(relay_name) if classification[:service_readiness] == 'ready'
       observe_inner_dns_result(relay_name, canary)
       now = Time.now
@@ -5082,6 +5287,8 @@ class MullvadAdapter
               network_epoch: network_epoch, worker_instance: route_worker&.dig(:instance_token),
               entry_relay: result[:entry_relay], multihop: result[:multihop] || false, post_quantum: result[:post_quantum] || false,
               duration_ms: canary[:duration_ms], **classification,
+              ping: canary.dig(:ping_data, :status), ping_ms: canary.dig(:ping_data, :delay_ms),
+              ping_scope: 'outer-icmp-not-tunnel-data',
               ip: canary.dig(:ip_data, :status), dns: canary.dig(:inner_dns, :status),
               https: canary.dig(:https_data, :status),
               phase_duration_ms: { ip: canary.dig(:ip_data, :wall_duration_ms),
@@ -6432,7 +6639,9 @@ class MullvadAdapter
       { status: 'fail', target: endpoint.to_s, detail: detail[0, 160] }
     end
   rescue LocalProbeTimeout
-    raise
+    # No ICMP response within a bounded diagnostic window is not evidence that
+    # the local daemon stalled, nor a reason to discard successful data probes.
+    { status: 'unknown', target: endpoint.to_s, detail: 'ICMP 未在时限内返回；不用于判定隧道失败' }
   rescue StandardError => e
     { status: 'fail', target: endpoint.to_s, detail: "#{e.class}: #{e.message}" }
   end
@@ -6828,23 +7037,55 @@ class MullvadAdapter
       address = IPAddr.new(endpoint.to_s)
       family = address.ipv6? ? :ipv6 : :ipv4
       interface = route_interface_for(endpoint.to_s, family)
-      return interface if usable_physical_interface?(interface)
+      return interface if usable_transport_interface?(interface, family)
     end
 
     if family
       interface = route_interface_for('default', family)
-      return interface if usable_physical_interface?(interface)
+      return interface if usable_transport_interface?(interface, family)
+    end
+
+    if family == :ipv6
+      # A TUN can own the unscoped route. Inspect the physical interface's own
+      # IPv6 routing scope; never infer an IPv6 route from an IPv4 default.
+      fallback = network_interface_fallbacks.find do |name|
+        next false unless usable_transport_interface?(name, family)
+        begin
+          text = bounded_network_command('/sbin/route', '-n', 'get', '-inet6', '-ifscope', name, endpoint.to_s)
+          text[/interface:\s+(\S+)/, 1] == name
+        rescue StandardError
+          false
+        end
+      end
+      return fallback if fallback
+      raise LocalProbeUnavailable, 'physical-ipv6-route-unavailable'
     end
 
     interface = route_interface_for('default', nil)
-    return interface if usable_physical_interface?(interface)
+    return interface if usable_transport_interface?(interface, family)
 
-    fallback = network_interface_fallbacks.find { |name| usable_physical_interface?(name) }
+    fallback = network_interface_fallbacks.find { |name| usable_transport_interface?(name, family) }
     return fallback if fallback
 
-    raise "unable to determine physical interface for #{endpoint || 'default route'}"
+    raise LocalProbeUnavailable, family == :ipv6 ? 'physical-ipv6-route-unavailable' : 'physical-route-unavailable'
   rescue IPAddr::InvalidAddressError => e
     raise "invalid transport endpoint #{endpoint}: #{e.message}"
+  end
+
+  def usable_transport_interface?(name, family)
+    return false unless usable_physical_interface?(name)
+    return true unless family == :ipv6
+    # A default IPv4 interface or link-local IPv6 address does not establish an
+    # IPv6 outer path. This is a local read, never an Internet probe.
+    text = bounded_network_command('/sbin/ifconfig', name.to_s)
+    return false unless text.match?(/^\s*status:\s*active\s*$/)
+    text.scan(/^\s*inet6\s+(\S+)([^\n]*)/).any? do |literal, flags|
+      next false if flags.match?(/\b(?:tentative|duplicated|detached)\b/)
+      ip = IPAddr.new(literal.split('%').first) rescue nil
+      ip && !ip.loopback? && !ip.to_i.zero? && !IPAddr.new('fe80::/10').include?(ip) && !IPAddr.new('ff00::/8').include?(ip)
+    end
+  rescue StandardError
+    false
   end
 
   def route_interface_for(target, family)
@@ -6975,7 +7216,7 @@ class MullvadAdapter
       last_poll_at = now
       remaining = deadline - now
       if remaining <= 0
-        log_probe_event('local-command-timeout', phase: phase, budget_ms: (timeout_seconds * 1000).round,
+        log_probe_event(phase == 'outer-ping' ? 'icmp-deadline-reached' : 'local-command-timeout', phase: phase, budget_ms: (timeout_seconds * 1000).round,
                         duration_ms: ((now - started) * 1000).round,
                         spawn_ms: ((spawned_at - started) * 1000).round,
                         capture_ms: ((now - spawned_at) * 1000).round,

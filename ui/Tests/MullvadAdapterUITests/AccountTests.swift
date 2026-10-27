@@ -161,6 +161,39 @@ final class AccountTests: XCTestCase {
         _ = try await client().account("login", payload: ["account_number": "1234567890123456"])
     }
 
+    func testSavedIdentityListDecodesWithoutInventingAnUnknownDeviceName() throws {
+        var object = try JSONSerialization.jsonObject(with: CityPreview.data("account")) as! [String: Any]
+        object["identity_switch_supported"] = true
+        object["active_identity_id"] = "old"
+        object["saved_identities"] = [
+            ["id": "old", "account_suffix": "3456", "public_key": "fixture-old", "current": true, "name_source": "not_verified"],
+            ["id": "new", "account_suffix": "3478", "public_key": "fixture-new", "current": false, "device_name": "Example Bird", "name_source": "saved_official_response"]]
+        let snapshot = try JSONDecoder().decode(AccountSnapshot.self, from: JSONSerialization.data(withJSONObject: object))
+        XCTAssertEqual(snapshot.savedIdentities?.count, 2)
+        XCTAssertNil(snapshot.savedIdentities?.first?.deviceName)
+        XCTAssertEqual(snapshot.savedIdentities?.last?.title, "Example Bird")
+        XCTAssertEqual(snapshot.activeIdentityID, "old")
+    }
+
+    func testIdentitySwitchSendsOnlySelectionAndNeverReplaysAfterAmbiguousResponse() async throws {
+        var calls = 0
+        AccountProtocol.handler = { request in
+            calls += 1
+            XCTAssertEqual(request.url?.path, "/account/identities/switch")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-capability")
+            let payload = self.requestObject(request)
+            XCTAssertEqual(payload["id"] as? String, "new")
+            XCTAssertEqual(payload["expected_active_id"] as? String, "old")
+            XCTAssertEqual(payload["confirm"] as? Bool, true)
+            XCTAssertNil(payload["private_key"])
+            XCTAssertNil(payload["account_number"])
+            return (500, Data("{\"error\":\"fixture failure\"}".utf8))
+        }
+        do { _ = try await client().switchIdentity("new", expectedActiveID: "old"); XCTFail("expected a definite client error") }
+        catch { }
+        XCTAssertEqual(calls, 1)
+    }
+
     @MainActor
     func testFailedRefreshRetainsKnownSnapshotWithVisibleError() async {
         var requests = 0

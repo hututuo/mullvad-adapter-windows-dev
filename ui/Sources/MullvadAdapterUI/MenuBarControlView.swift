@@ -50,7 +50,7 @@ struct MenuBarStatusLabel: View {
 
     private var menuPing: Int? {
         guard model.connectionError == nil, model.status?.localNetwork?.message == nil else { return nil }
-        return model.status?.lastCanary?.pingData?.delayMs
+        return model.status?.validatedMenuPing()
     }
 }
 
@@ -73,8 +73,10 @@ struct MenuBarControlView: View {
                         Text(facts.map { "\($0.label) \($0.detail)" }.joined(separator: " · "))
                     }
                 }
-                if model.connectionError == nil, model.status?.localNetwork?.message == nil, let ping = model.status?.lastCanary?.pingData?.delayMs {
-                    Text("Ping：\(ping) ms")
+                if model.connectionError == nil, model.status?.localNetwork?.message == nil, let ping = model.status?.validatedMenuPing() {
+                    Text("外层 Ping：\(ping) ms（通道已通过验证）")
+                } else if let ping = model.status?.lastCanary?.pingData?.delayMs {
+                    Text("上次外层 Ping \(ping) ms，不代表当前隧道可用")
                 }
                 if let message = model.status?.localNetwork?.message { Text(message) }
                 if let error = model.connectionError { Text(error) }
@@ -169,5 +171,27 @@ struct MenuBarControlView: View {
         // SwiftUI opens and raises this scene. Raising every key-capable
         // NSApp window can resurrect the menu's transparent hosting window
         // after dismissal, leaving an invisible surface above other apps.
+    }
+}
+
+extension AdapterStatus {
+    func validatedMenuPing(now: Date = Date()) -> Int? {
+        guard status == "ready", serviceReadiness == "ready", relayLiveness == "pass", activeSlot != nil,
+              operation?.isRunning != true, recovery?.running != true, localNetwork?.message == nil,
+              lastCanary?.ipData?.status == "pass" || lastCanary?.httpsData?.status == "pass",
+              lastCanary?.innerDNS?.status == "pass", lastCanary?.httpsData?.status == "pass",
+              lastCanary?.pingData?.status == "pass", let value = lastCanary?.pingData?.delayMs, value >= 0,
+              let at = lastCanary?.at else { return nil }
+        let formatter = ISO8601DateFormatter()
+        func parse(_ string: String) -> Date? {
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            if let date = formatter.date(from: string) { return date }
+            formatter.formatOptions = [.withInternetDateTime]
+            return formatter.date(from: string)
+        }
+        guard let checked = parse(at), now.timeIntervalSince(checked) >= -2,
+              now.timeIntervalSince(checked) <= Double(max(health?.intervalSeconds ?? 30, 1) + 40) else { return nil }
+        if let switchedAt, let switched = parse(switchedAt), checked < switched { return nil }
+        return value
     }
 }
