@@ -127,7 +127,7 @@ class MullvadAdapter
   TRANSPORT_PREFERENCES = (%w[auto] + TRANSPORT_MODES).freeze
   AUTO_TRANSPORT_ORDER = %w[ss ipv6 ipv4].freeze
   DEFAULT_TRANSPORT_PREFERENCE = 'ss'
-  BUILD_ID = '20261026-catalogue-changes-rotation-1'
+  BUILD_ID = '20261028-identities-health-1'
   SOURCE_SHA256 = Digest::SHA256.file(__FILE__).hexdigest
   STATUS_PUBLICATION_INTERVAL = 1.0
   STATUS_PUBLICATION_MAX_AGE = 3.0
