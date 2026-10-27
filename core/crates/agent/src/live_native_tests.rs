@@ -364,6 +364,8 @@ fn native_phase_refill_preserves_manual_deadline_city_and_fixed_relay_set() {
     ));
 
     assert!(harness.connections.enter_next_phase(&mut owner, &dashboard));
+    assert!(harness.connections.plan.quic_phase);
+    assert!(harness.connections.enter_next_phase(&mut owner, &dashboard));
     for expected in [live_route::Family::V6, live_route::Family::V4] {
         let (saved_deadline, city, relays, exact) =
             harness.connections.manual_candidates.as_ref().unwrap();
@@ -657,4 +659,53 @@ fn exact_ss_restore_reconciles_peer_key_and_retains_authorized_custom_port() {
         .unwrap()
         .iter()
         .any(|endpoint| endpoint == exact_endpoint));
+}
+
+#[test]
+fn quic_start_failure_finishes_carrier_candidate_and_moves_to_native_without_ss_blame() {
+    use crate::recovery_retry::AttemptFailureDisposition as D;
+    for code in [
+        "quic_helper_start_failed",
+        "quic_helper_unavailable",
+        "quic_connect_failed",
+    ] {
+        let mut h = harness();
+        let cat = make_catalogue(Some(IPV4), Some(IPV6));
+        let relay = only_relay(&cat);
+        let original = native_path(relay, live_route::SS, "192.0.2.20:51900", 80);
+        let target = native_path(relay, live_route::QUIC, "192.0.2.30:443", 81);
+        let (mut owner, attempt) = synthetic_native_fallback_attempt(&original, &target);
+        h.connections
+            .plan
+            .start(vec![relay.hostname().into()], false);
+        assert!(h.connections.plan.enter_quic());
+        let deadline = Instant::now() + Duration::from_secs(120);
+        h.connections.recovering = Some((deadline, VecDeque::new()));
+        let history = h.connections.inlet_trials.history_bytes().unwrap();
+        let mut dashboard = dashboard(Some("us-test"));
+        assert_eq!(
+            h.connections
+                .handle_attempt_failure(&mut owner, &mut dashboard, &attempt, code, true),
+            D::SkipUnavailablePath
+        );
+        if code == "quic_connect_failed" {
+            assert_eq!(h.connections.deferred.as_deref(), Some(relay.hostname()));
+            // This synthetic catalogue has no further QUIC metadata. The queued
+            // pick ends as quic_path_unavailable before another process starts.
+            assert!(h.connections.pick_route(&cat, relay, None, false).is_err());
+            h.connections.deferred = None;
+        } else {
+            assert!(h.connections.deferred.is_none());
+        }
+        assert_eq!(h.connections.inlet_trials.history_bytes().unwrap(), history);
+        assert_eq!(h.connections.recovering.as_ref().unwrap().0, deadline);
+        assert!(h.connections.enter_next_phase(&mut owner, &dashboard));
+        assert_eq!(
+            h.connections.plan.native_phase,
+            Some(live_route::Family::V6)
+        );
+        assert!(!h.connections.plan.quic_phase);
+        assert_eq!(h.connections.recovering.as_ref().unwrap().0, deadline);
+        assert_eq!(h.connections.inlet_trials.history_bytes().unwrap(), history);
+    }
 }

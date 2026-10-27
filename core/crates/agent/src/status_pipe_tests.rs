@@ -23,6 +23,7 @@ fn fixture_dashboard(boot: &str, source_sha: &str, build: &str, sequence: u64) -
         status: format!("fixture-public-{sequence}"),
         physical_attachment: "fixture-available".into(),
         settings: Settings::default(),
+        quic_available: false,
         front_ready: true,
         front_selected: "fixture-front".into(),
         identity_configured: false,

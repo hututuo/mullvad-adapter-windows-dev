@@ -143,8 +143,8 @@ fn current_relay_reports_ss_address_add_remove_and_ip_change_with_windows_counts
     let report = compare(Some(&previous), &current, Some("us-sea-wg-1"), 44);
 
     assert_eq!(report.current_relay.state, "changed");
-    assert_eq!(report.current_relay.ss_before_count, Some(6));
-    assert_eq!(report.current_relay.ss_after_count, Some(8));
+    assert_eq!(report.current_relay.ss_before_count, Some(8));
+    assert_eq!(report.current_relay.ss_after_count, Some(11));
     let extras = field(&report.current_relay.fields, "shadowsocks_extra_addr_in");
     assert_eq!(extras.added_count, Some(2));
     assert_eq!(extras.removed_count, Some(1));
@@ -294,4 +294,14 @@ fn changed_relay_list_is_bounded_current_first_and_json_stays_under_ipc_limit() 
     assert_eq!(report.changed_relays[0].relay.as_deref(), Some("relay-12"));
     assert_eq!(report.truncated_count, 6);
     assert!(serde_json::to_vec(&report).unwrap().len() < 16 * 1024);
+}
+
+#[test]
+fn quic_changes_never_render_authorization_material() {
+    let before = serde_json::json!({"features":{"quic":{"domain":"old.private.example","token":"old-secret-material"}}});
+    let after = serde_json::json!({"features":{"quic":{"domain":"new.private.example","token":"new-secret-material"}}});
+    let change = super::field("other", "其他官方节点参数", &before, &after);
+    let output = serde_json::to_string(&change).unwrap();
+    assert!(!output.contains("secret-material"));
+    assert!(!output.contains("private.example"));
 }

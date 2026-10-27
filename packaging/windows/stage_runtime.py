@@ -35,6 +35,7 @@ MAX_COMPATIBILITY_MANIFEST_BYTES = 1024 * 1024
 MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 MAX_ADAPTER_BYTES = 256 * 1024 * 1024
 MAX_ENGINE_BYTES = 128 * 1024 * 1024
+MAX_QUIC_BYTES = 64 * 1024 * 1024
 MAX_PE_HEADER_OFFSET = 1024 * 1024
 DOWNLOAD_TIMEOUT_SECONDS = 10
 DOWNLOAD_DEADLINE_SECONDS = 90
@@ -433,6 +434,7 @@ def stage_runtime(
     *,
     mihomo_archive: str | os.PathLike[str] | None = None,
     compatibility_manifest: str | os.PathLike[str] = DEFAULT_COMPATIBILITY_MANIFEST,
+    quic_helper: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     """Build and atomically publish ``output_root/runtime``.
 
@@ -512,7 +514,12 @@ def stage_runtime(
             archive_out.unlink()
 
             notices_out = staging / "THIRD_PARTY_NOTICES.txt"
-            notices_out.write_bytes(_notices(compatibility))
+            notices = _notices(compatibility)
+            if quic_helper is not None:
+                notices += ("\nQUIC carrier: GPL-3.0-only wrapper; official Mullvad MASQUE client GPL-3.0-or-later.\n"
+                            "Source: https://github.com/mullvad/mullvadvpn-app/tree/19fb87407f4b81fe15372c2c7f8a20e7ab4eb220/mullvad-masque-proxy\n"
+                            "Locked wrapper source: helpers/quic-carrier/\n").encode("utf-8")
+            notices_out.write_bytes(notices)
             notices_size, notices_hash = _hash_file(
                 notices_out,
                 max_bytes=MAX_COMPATIBILITY_MANIFEST_BYTES,
@@ -528,6 +535,14 @@ def stage_runtime(
                 },
                 "THIRD_PARTY_NOTICES.txt": {"size_bytes": notices_size, "sha256": notices_hash},
             }
+            if quic_helper is not None:
+                helper_out = staging / "mullvad-quic-carrier.exe"
+                helper_size, helper_hash = _copy_limited(
+                    Path(quic_helper).expanduser(), helper_out,
+                    max_bytes=MAX_QUIC_BYTES, label="QUIC carrier",
+                )
+                _validate_amd64_pe(helper_out, label="QUIC carrier", file_size=helper_size)
+                files[helper_out.name] = {"size_bytes": helper_size, "sha256": helper_hash}
             payload_manifest = {
                 "schema": 1,
                 "source_sha": source_sha,
@@ -562,6 +577,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-root", required=True, help="Fresh staging root; runtime/ is created beneath it")
     parser.add_argument("--source-sha", required=True, help="Full 40-character source commit SHA")
     parser.add_argument("--version", required=True, help="Adapter package version")
+    parser.add_argument("--quic-helper", help="Optional built x64 QUIC carrier, hash-bound in the runtime manifest")
     parser.add_argument(
         "--mihomo-archive",
         help="Optional already-downloaded pinned Mihomo ZIP for offline staging",
@@ -578,6 +594,7 @@ def main(argv: list[str] | None = None) -> int:
             args.source_sha,
             args.version,
             mihomo_archive=args.mihomo_archive,
+            quic_helper=args.quic_helper,
         )
     except StageRuntimeError as exc:
         print(f"runtime staging failed: {exc}", file=sys.stderr)

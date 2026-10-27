@@ -751,6 +751,7 @@ pub fn import_stdin(scope: &str) -> io::Result<()> {
 }
 
 pub fn serve(scope: &str) -> io::Result<()> {
+    let quic_available = crate::live_runtime::quic_helper_path().is_ok();
     let pipe_identity = Identity::current()?.with_scope(scope)?;
     let _instance = SingleInstance::acquire(&pipe_identity)?;
     let boot = boot_id()?;
@@ -786,6 +787,7 @@ pub fn serve(scope: &str) -> io::Result<()> {
         status: "disconnected".into(),
         physical_attachment: "unknown".into(),
         settings,
+        quic_available,
         front_ready: false,
         front_selected: "unavailable".into(),
         identity_configured: identity.is_some(),
@@ -1451,6 +1453,7 @@ pub fn serve(scope: &str) -> io::Result<()> {
                                     active: r.active(),
                                     ipv4: r.ipv4().is_some(),
                                     ipv6: r.ipv6().is_some(),
+                                    quic: r.quic().is_some() && quic_available,
                                     shadowsocks: catalogue
                                         .as_ref()
                                         .unwrap()

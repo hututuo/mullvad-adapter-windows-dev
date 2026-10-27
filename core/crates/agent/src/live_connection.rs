@@ -73,11 +73,12 @@ pub(crate) struct Connections {
     active_failures: crate::recovery_plan::ActiveFailures,
     direct_return: crate::recovery_plan::DirectReturn,
     route_trial: Option<RouteTrial>,
+    quic_trials: crate::quic_trials::QuicTrials,
     forced_route: Option<bool>,
     restore_target: Option<Path>,
     history_save: Option<(
         std::sync::mpsc::SyncSender<()>,
-        Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+        Arc<std::sync::Mutex<Option<(Vec<u8>, Vec<u8>)>>>,
     )>,
     chain_store: Option<adapter_platform::windows_store::PrivateStore>,
     verified_chain: Option<crate::verified_chain::VerifiedChain>,
@@ -118,6 +119,7 @@ impl Connections {
                 active_failures: Default::default(),
                 direct_return: Default::default(),
                 route_trial: None,
+                quic_trials: crate::quic_trials::QuicTrials::default(),
                 forced_route: None,
                 restore_target: None,
                 history_save: None,
@@ -135,6 +137,7 @@ impl Connections {
     }
     fn clear_plan(&mut self) {
         self.plan.clear();
+        self.quic_trials.clear_round();
         self.active_failures.clear();
         self.direct_return.clear();
         self.route_trial = None;
@@ -146,6 +149,7 @@ impl Connections {
         // Route trials have a temporary target and rollback path. Keep the
         // persistent city/relay intent used by ordinary recovery.
         self.plan.clear();
+        self.quic_trials.clear_round();
         self.startup_route = None;
         self.active_failures.clear();
         self.route_trial = None;
@@ -183,8 +187,11 @@ impl Connections {
         if let Ok(bytes) = store.load(RecordKind::RecoveryHistory) {
             self.inlet_trials.restore_history(bytes.expose());
         }
+        if let Ok(bytes) = store.load(RecordKind::QuicHistory) {
+            self.quic_trials.restore(bytes.expose());
+        }
         let (send, receive) = std::sync::mpsc::sync_channel::<()>(1);
-        let latest = Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+        let latest = Arc::new(std::sync::Mutex::new(None::<(Vec<u8>, Vec<u8>)>));
         let pending = latest.clone();
         let logs = self.logs.clone();
         if std::thread::Builder::new()
@@ -192,9 +199,16 @@ impl Connections {
             .spawn(move || {
                 while receive.recv().is_ok() {
                     let bytes = pending.lock().ok().and_then(|mut p| p.take());
-                    let Some(bytes) = bytes else {
+                    let Some((bytes, quic)) = bytes else {
                         continue;
                     };
+                    if store
+                        .prepare(RecordKind::QuicHistory, &quic)
+                        .and_then(|p| p.commit())
+                        .is_err()
+                    {
+                        let _ = logs.event("connection", "recovery_history_save_failed");
+                    }
                     if store
                         .prepare(RecordKind::RecoveryHistory, &bytes)
                         .and_then(|p| p.commit())
@@ -219,10 +233,16 @@ impl Connections {
                 .event("connection", "recovery_history_save_failed");
             return;
         };
+        let Some(quic) = self.quic_trials.history_bytes() else {
+            let _ = self
+                .logs
+                .event("connection", "recovery_history_save_failed");
+            return;
+        };
         // Coalesce to the newest full snapshot while disk I/O is in flight;
         // a full notification queue must not discard the newest attempts.
         if let Ok(mut latest) = pending.lock() {
-            *latest = Some(bytes);
+            *latest = Some((bytes, quic));
         }
         let _ = send.try_send(());
     }
@@ -375,6 +395,16 @@ impl Connections {
     }
     fn enter_next_phase(&mut self, owner: &mut ResourceOwner, dashboard: &Dashboard) -> bool {
         if self.route_trial.is_none()
+            && dashboard.settings.tunnel_route != adapter_protocol::app::TunnelRoute::Quic
+            && dashboard.settings.tunnel_route != adapter_protocol::app::TunnelRoute::Chain
+            && self.plan.enter_quic()
+        {
+            self.refill_phase(owner);
+            let _ = self.logs.event("connection", "quic_fallback_started");
+            return true;
+        }
+        if self.route_trial.is_none()
+            && dashboard.settings.tunnel_route != adapter_protocol::app::TunnelRoute::Quic
             && dashboard.settings.tunnel_route != adapter_protocol::app::TunnelRoute::Chain
             && self.plan.enter_native()
         {
@@ -669,6 +699,17 @@ impl Connections {
             && dashboard.operation.is_none()
         {
             ("idle", "monitor")
+        } else if self.plan.quic_phase
+            || self.chain_mode == adapter_protocol::app::TunnelRoute::Quic
+        {
+            (
+                "quic",
+                if self.chain_mode == adapter_protocol::app::TunnelRoute::Quic {
+                    "new_round"
+                } else {
+                    "native_ipv6"
+                },
+            )
         } else if self.plan.native_phase == Some(live_route::Family::V6) {
             ("native_ipv6", "native_ipv4")
         } else if self.plan.native_phase == Some(live_route::Family::V4) {
@@ -676,7 +717,7 @@ impl Connections {
         } else if self.plan.chain_phase {
             ("chain_fallback", "new_round")
         } else if target.is_some_and(|p| Some(p.relay.as_str()) != self.plan.original_relay()) {
-            ("same_city", "native_ipv6")
+            ("same_city", "quic")
         } else if self.plan.short_attempt() < 3 || self.plan.attempts <= 3 {
             ("original_inlet", "same_relay_inlets")
         } else {
@@ -904,7 +945,40 @@ impl Connections {
                 self.inlet_trials
                     .reconcile(relay.hostname(), relay.public_key(), &allowed);
             }
+            if route.kind() == live_route::QUIC {
+                let allowed: Vec<_> = relay
+                    .quic()
+                    .map(|q| {
+                        q.addresses()
+                            .iter()
+                            .map(|ip| std::net::SocketAddr::new(*ip, adapter_catalogue::QUIC_PORT))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.quic_trials
+                    .reconcile(relay.hostname(), relay.public_key(), &allowed);
+            }
             return Ok(route);
+        }
+        if self.plan.quic_phase
+            || (self.chain_mode == adapter_protocol::app::TunnelRoute::Quic
+                && self.forced_route.is_none())
+        {
+            let allowed: Vec<_> = relay
+                .quic()
+                .map(|q| {
+                    q.addresses()
+                        .iter()
+                        .map(|ip| std::net::SocketAddr::new(*ip, adapter_catalogue::QUIC_PORT))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let endpoint = self
+                .quic_trials
+                .choose(relay.hostname(), relay.public_key(), &allowed)
+                .ok_or("quic_path_unavailable")?;
+            return Route::authorize(catalogue, relay, live_route::QUIC, &endpoint.to_string())
+                .ok_or("quic_path_unavailable");
         }
         if let Some(family) = self.plan.native_phase {
             return Route::native(catalogue, relay, family).ok_or("native_path_unavailable");
@@ -1062,7 +1136,11 @@ impl Connections {
             .cloned();
         let mut route = match self.pick_route(catalogue, picked, exact.as_ref(), chained) {
             Ok(route) => route,
-            Err(code @ ("shadowsocks_inlets_exhausted" | "native_path_unavailable")) => {
+            Err(
+                code @ ("shadowsocks_inlets_exhausted"
+                | "native_path_unavailable"
+                | "quic_path_unavailable"),
+            ) => {
                 if !automatic && self.manual_candidates.is_none() {
                     let alternatives = self.plan.relays.iter().skip(1).cloned().collect();
                     self.seed_manual_candidates(city.clone(), alternatives, relay.is_some());
@@ -1079,6 +1157,8 @@ impl Connections {
         if binding.is_none()
             && exact.is_none()
             && self.plan.native_phase.is_none()
+            && !self.plan.quic_phase
+            && self.chain_mode != adapter_protocol::app::TunnelRoute::Quic
             && !route.is_ss()
             && self.startup_route.is_some()
         {
@@ -1086,7 +1166,33 @@ impl Connections {
             route = self.pick_route(catalogue, picked, None, chained)?;
             binding = route.binding(owner.observation().bindings());
         }
-        let binding = binding.ok_or(if self.plan.native_phase.is_some() && exact.is_none() {
+        if binding.is_none() && route.kind() == live_route::QUIC && exact.is_none() {
+            if let Some(other) = picked.quic().and_then(|q| {
+                q.addresses()
+                    .iter()
+                    .copied()
+                    .filter_map(|ip| {
+                        Route::authorize(
+                            catalogue,
+                            picked,
+                            live_route::QUIC,
+                            &std::net::SocketAddr::new(ip, adapter_catalogue::QUIC_PORT)
+                                .to_string(),
+                        )
+                    })
+                    .find(|r| {
+                        r.binding(owner.observation().bindings()).is_some()
+                            && self.quic_trials.unseen(picked.hostname(), r.endpoint())
+                    })
+            }) {
+                route = other;
+                self.quic_trials.prefer(picked.hostname(), route.endpoint());
+                binding = route.binding(owner.observation().bindings());
+            }
+        }
+        let binding = binding.ok_or(if route.kind() == live_route::QUIC {
+            "quic_path_unavailable"
+        } else if self.plan.native_phase.is_some() && exact.is_none() {
             "native_path_unavailable"
         } else if !route.is_ss()
             && exact.is_some()
@@ -1136,6 +1242,26 @@ impl Connections {
         let secret = Zeroizing::new(random.iter().map(|b| format!("{b:02x}")).collect());
         let port = if slot == "a" { 17920 } else { 17930 };
         let policy = serde_json::to_vec(&serde_json::json!({"schema":1,"relay":path.relay,"city":path.city,"transport":path.transport,"inlet":path.inlet,"instance":path.instance,"slot":path.slot,"front":path.front})).map_err(|_|"policy_invalid")?;
+        let quic = if route.kind() == live_route::QUIC {
+            let metadata = picked.quic().ok_or("quic_path_unavailable")?;
+            let allowed: Vec<_> = metadata
+                .addresses()
+                .iter()
+                .map(|ip| std::net::SocketAddr::new(*ip, adapter_catalogue::QUIC_PORT))
+                .collect();
+            self.quic_trials
+                .reconcile(picked.hostname(), picked.public_key(), &allowed);
+            self.quic_trials.prefer(picked.hostname(), route.endpoint());
+            Some(adapter_engine_mihomo::quic::Config {
+                helper_executable: crate::live_runtime::quic_helper_path()
+                    .map_err(|_| "quic_helper_unavailable")?,
+                server_hostname: metadata.domain().into(),
+                auth_token: Zeroizing::new(metadata.token().into()),
+                target_endpoint: "127.0.0.1:51820".parse().unwrap(),
+            })
+        } else {
+            None
+        };
         let spec = identity.with_engine_identity(|key| TunnelSpec {
             instance: path.instance,
             runtime: worker_runtime,
@@ -1145,6 +1271,7 @@ impl Connections {
             relay_public_key: picked.public_key().into(),
             transport: route.transport,
             chain: if chained { self.chain.clone() } else { None },
+            quic,
             slot: if slot == "a" {
                 Selected::SlotA
             } else {
@@ -1407,6 +1534,51 @@ impl Connections {
         if !automatic && self.manual_candidates.is_none() {
             return false;
         }
+        if path.transport == live_route::QUIC {
+            self.startup_route = None;
+            self.quic_trials.attempted(&path.relay, &path.inlet);
+            if !self.plan.quic_phase && self.chain_mode != adapter_protocol::app::TunnelRoute::Quic
+            {
+                if automatic {
+                    self.deferred = Some(path.relay.clone());
+                } else {
+                    self.retry_manual_candidate(path.relay.clone(), true);
+                }
+                self.next_attempt = Instant::now() + Duration::from_millis(250);
+                return true;
+            }
+            if catalogue
+                .and_then(|c| {
+                    c.active_in_city(&path.city)
+                        .find(|r| r.hostname() == path.relay)
+                })
+                .is_some_and(|relay| {
+                    let allowed: Vec<_> = relay
+                        .quic()
+                        .map(|q| {
+                            q.addresses()
+                                .iter()
+                                .map(|ip| {
+                                    std::net::SocketAddr::new(*ip, adapter_catalogue::QUIC_PORT)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    self.quic_trials
+                        .choose(relay.hostname(), relay.public_key(), &allowed)
+                        .is_some()
+                })
+            {
+                if automatic {
+                    self.deferred = Some(path.relay.clone());
+                } else {
+                    self.retry_manual_candidate(path.relay.clone(), true);
+                }
+                self.next_attempt = Instant::now() + Duration::from_millis(250);
+                return true;
+            }
+            return false;
+        }
         if matches!(path.transport.as_str(), live_route::V6 | live_route::V4) {
             self.startup_route = None;
             if self.plan.native_phase.is_none() && self.route_trial.is_none() {
@@ -1592,7 +1764,14 @@ impl Connections {
                     self.deferred = None;
                 }
                 self.local_retry.clear();
-                let _ = self.logs.event("connection", "native_path_unavailable");
+                let _ = self.logs.event(
+                    "connection",
+                    if attempt.path.transport == live_route::QUIC {
+                        "quic_path_unavailable"
+                    } else {
+                        "native_path_unavailable"
+                    },
+                );
                 D::SkipUnavailablePath
             }
             D::RetrySameTarget if self.retry_failed_attempt_locally(owner, attempt, automatic) => {
@@ -1637,12 +1816,12 @@ impl Connections {
         automatic: bool,
     ) -> crate::recovery_retry::AttemptFailureDisposition {
         let disposition = if code == "worker_route_unavailable"
-            && (self.plan.native_phase.is_some()
+            && ((self.plan.native_phase.is_some() || self.plan.quic_phase)
                 || owner.state().stage == adapter_domain::Stage::RebuildOriginal)
             && self.route_trial.is_none()
             && matches!(
                 attempt.path.transport.as_str(),
-                live_route::V6 | live_route::V4
+                live_route::V6 | live_route::V4 | live_route::QUIC
             )
             && !owner.state().paused
             && owner.observation().binding_settled()
@@ -1652,7 +1831,34 @@ impl Connections {
         } else {
             crate::recovery_retry::attempt_failure_disposition(code)
         };
-        self.apply_attempt_failure_disposition(owner, dashboard, attempt, disposition, automatic)
+        let consumed_quic = code == "quic_connect_failed"
+            && owner.state().current(&attempt.owner)
+            && attempt.path.transport == live_route::QUIC
+            && self
+                .quic_trials
+                .attempted(&attempt.path.relay, &attempt.path.inlet);
+        if consumed_quic {
+            self.save_history();
+        }
+        let disposition = self.apply_attempt_failure_disposition(
+            owner,
+            dashboard,
+            attempt,
+            disposition,
+            automatic,
+        );
+        if consumed_quic
+            && disposition == crate::recovery_retry::AttemptFailureDisposition::SkipUnavailablePath
+            && (self.plan.quic_phase || self.chain_mode == adapter_protocol::app::TunnelRoute::Quic)
+        {
+            if automatic {
+                self.deferred = Some(attempt.path.relay.clone());
+            } else {
+                self.retry_manual_candidate(attempt.path.relay.clone(), true);
+            }
+            self.next_attempt = Instant::now() + Duration::from_millis(250);
+        }
+        disposition
     }
     fn recovery(
         &mut self,
@@ -1748,6 +1954,7 @@ impl Connections {
                     self.manual_candidates = None;
                     self.deferred = None;
                     self.plan.clear();
+                    self.quic_trials.clear_round();
                 }
                 self.next_health = Instant::now();
             } else if self.recovering.is_some() {
@@ -2017,6 +2224,10 @@ impl Connections {
                         );
                         self.save_history();
                     }
+                    if path.transport == live_route::QUIC {
+                        self.quic_trials.attempted(&path.relay, &path.inlet);
+                        self.save_history();
+                    }
                     self.startup_route = None;
                     self.inlet_trials.clear();
                     self.chain_relays.clear();
@@ -2038,6 +2249,7 @@ impl Connections {
                     self.manual_candidates = None;
                     self.deferred = None;
                     self.plan.clear();
+                    self.quic_trials.clear_round();
                     self.trial_connected(owner, dashboard, &path);
                     self.next_health = Instant::now() + HEALTHY_INTERVAL;
                 }
@@ -2537,6 +2749,7 @@ impl Connections {
             self.inlet_trials.clear();
             self.chain_relays.clear();
             self.plan.clear();
+            self.quic_trials.clear_round();
             if let (Some(identity), Some(catalogue)) = (identity, catalogue) {
                 let exact = self.retry_round.exact_relay().map(str::to_owned);
                 if exact.is_none() {
@@ -2581,7 +2794,9 @@ impl Connections {
                         if self.route_trial.is_some()
                             && matches!(
                                 code,
-                                "original_native_family_unavailable" | "original_inlet_withdrawn"
+                                "original_native_family_unavailable"
+                                    | "quic_path_unavailable"
+                                    | "original_inlet_withdrawn"
                             )
                         {
                             self.trial_failed(owner, dashboard, true);
@@ -2593,6 +2808,8 @@ impl Connections {
                             "relay_not_active"
                                 | "shadowsocks_inlets_exhausted"
                                 | "native_path_unavailable"
+                                | "quic_path_unavailable"
+                                | "quic_helper_unavailable"
                         ) {
                             if let Some((_, _, queue, _)) = &mut self.manual_candidates {
                                 queue.push_front(relay.clone());
@@ -2635,8 +2852,10 @@ impl Connections {
                     self.defer_local_target(relay.clone());
                 }
                 Err(code) => {
-                    if code == "original_native_family_unavailable"
-                        && owner.state().stage == adapter_domain::Stage::RebuildOriginal
+                    if matches!(
+                        code,
+                        "original_native_family_unavailable" | "quic_path_unavailable"
+                    ) && owner.state().stage == adapter_domain::Stage::RebuildOriginal
                     {
                         let now = owner.now();
                         let _ = owner.state_mut().finish_original_phase(now);
@@ -2645,8 +2864,10 @@ impl Connections {
                         self.local_retry.clear();
                         self.next_attempt = Instant::now();
                         let _ = self.logs.event("connection", code);
-                    } else if matches!(code, "relay_not_active" | "original_inlet_withdrawn")
-                        && owner.state().stage == adapter_domain::Stage::RebuildOriginal
+                    } else if matches!(
+                        code,
+                        "relay_not_active" | "original_inlet_withdrawn" | "quic_helper_unavailable"
+                    ) && owner.state().stage == adapter_domain::Stage::RebuildOriginal
                     {
                         self.deferred = None;
                         self.local_retry.clear();
@@ -2660,6 +2881,8 @@ impl Connections {
                             | "recovery_budget_exhausted"
                             | "shadowsocks_inlets_exhausted"
                             | "native_path_unavailable"
+                            | "quic_path_unavailable"
+                            | "quic_helper_unavailable"
                     ) {
                         self.deferred = None;
                         self.local_retry.clear();
@@ -2701,13 +2924,20 @@ impl Connections {
                 return;
             };
             let instance = path.instance;
-            let Some(binding) = owner
-                .observation()
-                .bindings()
-                .iter()
-                .find(|b| b.ipv4)
-                .copied()
+            let Some(interface_index) = dashboard
+                .connection
+                .as_ref()
+                .filter(|c| c.instance == instance)
+                .map(|c| c.interface_index)
             else {
+                return;
+            };
+            let Some(binding) = live_route::active_binding(
+                owner.observation().bindings(),
+                interface_index,
+                &path.transport,
+                &path.inlet,
+            ) else {
                 return;
             };
             if let Ok((ticket, network)) = owner.begin_operation(binding, instance, None) {

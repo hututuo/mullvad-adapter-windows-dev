@@ -66,6 +66,7 @@ fn enabled() -> bool {
 #[serde(rename_all = "snake_case")]
 pub enum TunnelRoute {
     Direct,
+    Quic,
     Chain,
     #[default]
     Auto,
@@ -289,6 +290,8 @@ pub struct Relay {
     pub ipv4: bool,
     pub ipv6: bool,
     pub shadowsocks: bool,
+    #[serde(default)]
+    pub quic: bool,
     pub last_ping_ms: Option<u64>,
     pub readiness: Option<String>,
 }
@@ -406,6 +409,13 @@ pub struct ConnectionInfo {
 impl ConnectionInfo {
     pub fn valid(&self) -> bool {
         self.transport.as_deref().is_none_or(|kind| match kind {
+            "wireguard-over-quic" => {
+                !self.chained
+                    && self
+                        .inlet
+                        .parse::<std::net::SocketAddr>()
+                        .is_ok_and(|a| a.port() == 443)
+            }
             "wireguard-ipv6" => {
                 !self.chained
                     && self
@@ -478,6 +488,8 @@ pub struct Dashboard {
     pub status: String,
     pub physical_attachment: String,
     pub settings: Settings,
+    #[serde(default)]
+    pub quic_available: bool,
     pub front_ready: bool,
     pub front_selected: String,
     pub identity_configured: bool,

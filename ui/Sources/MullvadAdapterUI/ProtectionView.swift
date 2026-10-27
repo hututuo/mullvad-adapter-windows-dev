@@ -147,7 +147,8 @@ struct ProtectionView: View {
                         Divider()
                         capability("DAITA 流量分析防护", "需要兼容的隧道引擎执行官方填充机器；不是只更改账号设置。当前核心不支持，尚未接入。", "waveform.path")
                         Divider()
-                        capability("QUIC、UDP-over-TCP、LWO", "是其他传输混淆方式。需要对应的传输组件和核心支持，目前只有 SS 可用。", "point.3.connected.trianglepath.dotted")
+                        capability("QUIC 混淆", "通过官方 QUIC 承载建立隧道。组件和节点同时支持时才可用，接通后仍验证实际流量；可在传输方式中选择。", "point.3.connected.trianglepath.dotted")
+                        capability("UDP-over-TCP、LWO", "这两种混淆尚未接入，不能用 QUIC 或 SS 的成功替代验证。", "network")
                         Link("查看 Mullvad 官方开源实现", destination: URL(string: "https://github.com/mullvad/mullvadvpn-app")!)
                     }
                 }.padding(.bottom, 16)

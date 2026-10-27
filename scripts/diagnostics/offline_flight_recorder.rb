@@ -299,11 +299,21 @@ class OfflineFlightRecorder
       end
       worker = state.fetch('workers', {})[slot] || {}
       context = { slot: slot, pid: pid, relay: worker['relay'], started_at: worker['started_at'],
-                  interface: worker['interface'], endpoint: worker['endpoint'], endpoint_port: worker['endpoint_port'] }
+                  interface: worker['interface'], endpoint: worker['endpoint'], endpoint_port: worker['endpoint_port'], transport_mode: worker['transport_mode'] }
+      helper_pid = worker['quic_carrier_pid']
+      context[:udp_pid] = if worker['transport_mode'] == 'quic'
+                           helper_pid if state_fresh && helper_pid.is_a?(Integer) && helper_pid.positive?
+                         else pid
+                         end
+      if worker['transport_mode'] == 'quic'
+        raw = worker['quic_observed_packets']
+        keys = %w[tx_packets rx_packets tx_bytes rx_bytes wg_initiations wg_response_packets wg_cookie_packets]
+        context[:quic_observed_packets] = raw.is_a?(Hash) ? raw.select { |key, value| keys.include?(key) && value.is_a?(Integer) && value >= 0 } : nil
+      end
       contexts[pid] = context
       start_watcher(slot, pid, context)
     end
-    expected = contexts.transform_values { |context| context[:interface] }
+    expected = contexts.values.filter_map { |context| [context[:udp_pid], context[:interface]] if context[:udp_pid] }.to_h
     counters = {}
     begin
       unless expected.empty?
@@ -316,22 +326,23 @@ class OfflineFlightRecorder
     end
     observed = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     samples = contexts.map do |pid, context|
-      current = counters[pid]
-      old = @previous[pid]
+      udp_pid = context[:udp_pid]
+      current = counters[udp_pid]
+      old = @previous[udp_pid]
       delta = if current && old && current[:rx_bytes] >= old[:rx_bytes] && current[:tx_bytes] >= old[:tx_bytes]
                 { rx_delta: current[:rx_bytes] - old[:rx_bytes], tx_delta: current[:tx_bytes] - old[:tx_bytes],
                   interval_ms: ((observed - old[:observed]) * 1000).round }
               else
                 { rx_delta: nil, tx_delta: nil }
               end
-      @previous[pid] = current && current.merge(observed: observed)
+      @previous[udp_pid] = current && current.merge(observed: observed) if udp_pid
       watcher = @watchers[context[:slot]]
       wg = watcher && watcher[:mutex].synchronize do
         { status: watcher[:status], since: watcher[:since], last_event_at: watcher[:last_event_at], counts: watcher[:counts].dup }
       end
-      context.merge(udp: current, udp_error: udp_error, delta: delta, wg: wg)
+      context.merge(udp: current, udp_error: udp_error || (context[:transport_mode] == 'quic' && !udp_pid ? 'quic-carrier-state-unavailable' : nil), delta: delta, wg: wg)
     end
-    @previous.select! { |pid, _| contexts.key?(pid) }
+    @previous.select! { |pid, _| expected.key?(pid) }
     now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     signature = [state_fresh, state['generation'], state['service_readiness'], contexts.keys.sort]
     fault = !state_fresh || state['service_readiness'] != 'ready'

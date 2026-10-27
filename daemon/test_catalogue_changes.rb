@@ -93,8 +93,8 @@ class CatalogueChangesTest < Minitest::Test
 
     assert result[:catalogue_changed]
     assert_equal 'changed', result.dig(:current_relay, :state)
-    assert_equal 4, result.dig(:current_relay, :ss_before_count)
-    assert_equal 6, result.dig(:current_relay, :ss_after_count)
+    assert_equal 6, result.dig(:current_relay, :ss_before_count)
+    assert_equal 10, result.dig(:current_relay, :ss_after_count)
     assert_includes result[:shared_changes].map { |field| field.fetch(:key) }, 'shadowsocks_port_ranges'
   end
 

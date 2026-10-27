@@ -10,6 +10,7 @@ require 'optparse'
 require 'rbconfig'
 require 'time'
 require 'socket'
+require 'timeout'
 require_relative 'scripts/mac-launch-agent-policy'
 
 options = {}
@@ -27,6 +28,8 @@ source = File.join(__dir__, 'daemon', 'mullvad_adapter.rb')
 installed = File.expand_path('~/.local/libexec/mullvad-local-adapter')
 helper_source = File.join(__dir__, 'helpers', 'pq-negotiator', 'bin', 'mullvad-pq-negotiator')
 helper_installed = File.expand_path('~/.local/libexec/mullvad-pq-negotiator')
+quic_source = File.join(__dir__, 'helpers', 'quic-carrier', 'bin', 'mullvad-quic-carrier')
+quic_installed = File.expand_path('~/.local/libexec/mullvad-quic-carrier')
 plist = File.expand_path('~/Library/LaunchAgents/local.mullvad.adapter.plist')
 domain = "gui/#{Process.uid}"
 service = "#{domain}/local.mullvad.adapter"
@@ -110,6 +113,8 @@ if options[:rollback]
   copy_atomic(backup, installed)
   previous_helper = File.join(options[:rollback], 'installed-pq-helper')
   copy_atomic(previous_helper, helper_installed) if File.file?(previous_helper)
+  previous_quic = File.join(options[:rollback], 'installed-quic-helper')
+  copy_atomic(previous_quic, quic_installed) if File.file?(previous_quic)
   copy_atomic(previous_plist, plist, mode: File.stat(previous_plist).mode & 0o777)
   restart_service(domain, service, plist)
   state = wait_ready
@@ -127,8 +132,14 @@ abort 'PQ helper identity check failed' unless helper_status.success? &&
   JSON.parse(helper_info).values_at('component', 'schema', 'upstream_sha') ==
     ['mullvad-pq-negotiator', 1, '19fb87407f4b81fe15372c2c7f8a20e7ab4eb220']
 helper_sha = Digest::SHA256.file(helper_source).hexdigest
+abort 'compiled QUIC carrier missing from this candidate' unless File.executable?(quic_source)
+quic_info, _quic_error, quic_status = Timeout.timeout(5) { Open3.capture3([quic_source, quic_source], '--version-json') }
+abort 'QUIC carrier identity check failed' unless quic_status.success? &&
+  JSON.parse(quic_info).values_at('name', 'schema', 'upstream_sha') ==
+    ['mullvad-quic-carrier', 1, '19fb87407f4b81fe15372c2c7f8a20e7ab4eb220']
+quic_sha = Digest::SHA256.file(quic_source).hexdigest
 if options[:check]
-  puts JSON.generate(check: 'PASS', source_sha256: source_sha, pq_helper_sha256: helper_sha, installed_helper_matches: File.file?(helper_installed) && Digest::SHA256.file(helper_installed).hexdigest == helper_sha, installed_matches: Digest::SHA256.file(installed).hexdigest == source_sha,
+  puts JSON.generate(check: 'PASS', source_sha256: source_sha, pq_helper_sha256: helper_sha, quic_helper_sha256: quic_sha, installed_quic_matches: File.file?(quic_installed) && Digest::SHA256.file(quic_installed).hexdigest == quic_sha, installed_helper_matches: File.file?(helper_installed) && Digest::SHA256.file(helper_installed).hexdigest == helper_sha, installed_matches: Digest::SHA256.file(installed).hexdigest == source_sha,
                      current_process_type: MullvadLaunchAgentPolicy.configuration(plist)['ProcessType'],
                      install_process_type: MullvadLaunchAgentPolicy::PROCESS_TYPE)
   exit
@@ -150,12 +161,14 @@ if File.exist?(backup)
 else
   FileUtils.cp(installed, backup, preserve: true)
   FileUtils.cp(helper_installed, File.join(options[:backup], 'installed-pq-helper'), preserve: true) if File.file?(helper_installed)
+  FileUtils.cp(quic_installed, File.join(options[:backup], 'installed-quic-helper'), preserve: true) if File.file?(quic_installed)
   FileUtils.cp(plist, File.join(options[:backup], 'daemon.plist'), preserve: true)
 end
-report.merge!(source_sha256: source_sha, pq_helper_sha256: helper_sha, previous_sha256: Digest::SHA256.file(backup).hexdigest)
+report.merge!(source_sha256: source_sha, pq_helper_sha256: helper_sha, quic_helper_sha256: quic_sha, previous_sha256: Digest::SHA256.file(backup).hexdigest)
 begin
   report[:launch_agent_policy_updated] = MullvadLaunchAgentPolicy.apply(plist)
   copy_atomic(helper_source, helper_installed)
+  copy_atomic(quic_source, quic_installed)
   copy_atomic(source, installed)
   restart_service(domain, service, plist)
   current = wait_ready(expected_sha: source_sha, expected_helper_sha: helper_sha, helper_path: helper_installed)
@@ -165,6 +178,8 @@ rescue StandardError => e
   copy_atomic(backup, installed)
   old_helper = File.join(options[:backup], 'installed-pq-helper')
   copy_atomic(old_helper, helper_installed) if File.file?(old_helper)
+  old_quic = File.join(options[:backup], 'installed-quic-helper')
+  copy_atomic(old_quic, quic_installed) if File.file?(old_quic)
   begin
     old_plist = File.join(options[:backup], 'daemon.plist')
     MullvadLaunchAgentPolicy.validate_backup!(old_plist)

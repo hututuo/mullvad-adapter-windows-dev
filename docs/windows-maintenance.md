@@ -10,7 +10,7 @@ flowchart LR
   C -->|AI或普通组选择适配器| F[适配器固定本机 SOCKS front]
   F --> W[受控 Mihomo worker: WireGuard]
   W --> S[本机绑定 UDP carrier]
-  S -->|绑定物理网卡的 UDP| R[Mullvad SS / 原生 WG 入口]
+  S -->|绑定物理网卡的 UDP| R[Mullvad SS / QUIC / 原生 WG 入口]
   R --> I[目标互联网服务]
   C -->|国内/LAN| D[DIRECT]
   C -->|用户选择旧节点| P[已有独立外网节点]
@@ -35,7 +35,8 @@ Windows 不是使用 Mac 的 Ruby/launchd；它用 Rust 后台和 Tauri/React �
 | Keepalive | 当前 25 秒，用于维持空闲 NAT 映射；不解决完全封禁 UDP、断 Wi-Fi、账号撤销和错误出口 |
 | TCP 控制连接 | carrier 的 SOCKS TCP 控制连接不等于 WireGuard 数据已经套了 TCP；只看到 TCP ESTABLISHED 不能证明 UDP 通 |
 | Direct IPv4/IPv6 | 产品恢复已接入 SS 之后、链式之前的原生 IPv6/IPv4 有界保底；从当前目录授权入口、按地址族绑定。实机出口和恢复需独立验收 |
-| UDP2TCP/QUIC/LWO | 没有在此产品基线接通；若网络禁 UDP，仅换 SS、加重试或批量 Ping 不能承诺修复 |
+| QUIC | 双端源码已接入固定上游 MASQUE helper；Windows 安装包须含经过 manifest 校验的 x64 helper，缺失时不伪装可用。实际 Windows QUIC 出口与长期恢复仍需真机验收 |
+| UDP2TCP/LWO | 未接通；QUIC 仍使用 UDP，不能承诺修复全面禁 UDP |
 | 多跳/PQ/DAITA | Windows 不支持的必需保护会显式拒绝，不会静默降低。Mac/helper 的实现不代表 Windows 已验收 |
 | MTU | 这是本地策略，不是官方目录数据。双栈 userspace WG 统一1280（此前 SS/chain 低于1280），满足IPv6最小MTU。固定内核保持原版本；配置/parser通过不等于复杂网络的大流量/PMTU验收 |
 

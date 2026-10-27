@@ -36,3 +36,8 @@ assert.equal(recoveryView({...d,recovery:{...d.recovery,stage:'chain_fallback'}}
 assert.match(recoveryView({...d,status:'connected',connection:{transport:'wireguard-ipv6'},recovery:{...d.recovery,stage:'connected'}},false).title,/IPv6/);
 assert.equal(canContinueBackup({...restored,connection:{...restored.connection,transport:'wireguard-ipv4'}},fence),false);
 console.log('native recovery: V6/V4 before chain, transport labels and exact backup protocol fence PASS');
+
+assert.match(recoveryView({...d,recovery:{...d.recovery,stage:"quic",next:"native_ipv6",transport:"wireguard-over-quic"}},false).title,/QUIC/);
+assert.equal(recoveryView({...d,recovery:{...d.recovery,stage:"quic"}},false).index,3);
+assert.match(recoveryView({...d,status:"connected",connection:{transport:"wireguard-over-quic"},recovery:{...d.recovery,stage:"connected"}},false).title,/QUIC/);
+console.log("QUIC recovery: before native/chain and actual transport labels PASS");

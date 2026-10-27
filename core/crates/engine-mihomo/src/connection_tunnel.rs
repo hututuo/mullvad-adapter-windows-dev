@@ -27,6 +27,7 @@ pub struct TunnelSpec {
     pub relay_public_key: String,
     pub transport: Transport,
     pub chain: Option<Arc<crate::chain::UpstreamSs>>,
+    pub quic: Option<crate::quic::Config>,
     pub slot: Selected,
     pub mixed_port: u16,
     pub controller_port: u16,
@@ -209,7 +210,9 @@ impl Manager {
                         controller_secret: &spec.controller_secret,
                     },
                 };
-                let worker = if let Some(chain) = &spec.chain {
+                let worker = if let Some(quic) = &spec.quic {
+                    Worker::start_quic(&self.executable, &spec.runtime, &request, network, quic)
+                } else if let Some(chain) = &spec.chain {
                     Worker::start_chained(&self.executable, &spec.runtime, &request, network, chain)
                 } else {
                     Worker::start_carried(&self.executable, &spec.runtime, &request, network)

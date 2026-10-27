@@ -216,3 +216,49 @@ fn outer_family_requires_a_matching_physical_binding() {
     assert_eq!(v6.binding(&[v4_binding, v6_binding]).unwrap().index, 2);
     assert_eq!(v4.binding(&[v6_binding, v4_binding]).unwrap().index, 1);
 }
+
+#[test]
+fn quic_endpoint_is_authorized_only_by_current_official_capability() {
+    let mut payload = json!({"wireguard":{"port_ranges":[[51820,51820]],"shadowsocks_port_ranges":[[51900,51900]],"relays":[{"hostname":"us-test-wg-1","location":"us-test","active":true,"public_key":PUBLIC_KEY,"ipv4_addr_in":IPV4,"features":{"quic":{"addr_in":["192.0.2.11","2001:db8::11"],"domain":"quic.example.net","token":"not-for-logs"}}}]}});
+    let cat = Catalogue::parse(payload.to_string().as_bytes()).unwrap();
+    let relay = &cat.relays()[0];
+    for inlet in ["192.0.2.11:443", "[2001:db8::11]:443"] {
+        let route = Route::authorize(&cat, relay, super::QUIC, inlet).unwrap();
+        assert_eq!(route.kind(), super::QUIC);
+        assert!(!route.chained);
+    }
+    for inlet in ["192.0.2.10:443", "192.0.2.11:51820", "[::1]:443"] {
+        assert!(Route::authorize(&cat, relay, super::QUIC, inlet).is_none());
+    }
+    payload["wireguard"]["relays"][0]["features"]["quic"] = serde_json::Value::Null;
+    let withdrawn = Catalogue::parse(payload.to_string().as_bytes()).unwrap();
+    assert!(Route::authorize(
+        &withdrawn,
+        &withdrawn.relays()[0],
+        super::QUIC,
+        "192.0.2.11:443"
+    )
+    .is_none());
+}
+
+#[test]
+fn active_checks_keep_selected_interface_and_outer_family() {
+    use adapter_platform::physical_attachment::PhysicalBinding;
+    let v4 = PhysicalBinding {
+        luid: 1,
+        index: 1,
+        ipv4: true,
+        ipv6: false,
+    };
+    let v6 = PhysicalBinding {
+        luid: 2,
+        index: 2,
+        ipv4: false,
+        ipv6: true,
+    };
+    let bindings = [v4, v6];
+    assert!(super::active_binding(&bindings, 2, super::QUIC, "[2001:db8::1]:443") == Some(v6));
+    assert!(super::active_binding(&bindings, 1, super::QUIC, "[2001:db8::1]:443").is_none());
+    assert!(super::active_binding(&bindings, 2, V6, "[2001:db8::1]:33431") == Some(v6));
+    assert!(super::active_binding(&bindings, 1, SS, "192.0.2.1:443") == Some(v4));
+}

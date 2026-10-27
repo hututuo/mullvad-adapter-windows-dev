@@ -12,7 +12,7 @@ use windows_sys::Win32::{
     Foundation::*,
     Security::SECURITY_ATTRIBUTES,
     Storage::FileSystem::*,
-    System::{JobObjects::*, Threading::*},
+    System::{JobObjects::*, Pipes::*, Threading::*},
 };
 
 struct Handle(HANDLE);
@@ -168,6 +168,7 @@ impl OwnedProcess {
             Some(&environment),
             None,
             None,
+            None,
             || Ok(()),
             |_| {},
         )
@@ -199,6 +200,7 @@ impl OwnedProcess {
             Some(&environment),
             Some(input),
             None,
+            None,
             preflight,
             |_| {},
         )
@@ -221,6 +223,7 @@ impl OwnedProcess {
             Some(&environment),
             Some(input),
             Some(peer),
+            None,
             preflight,
             |_| {},
         )
@@ -238,6 +241,7 @@ impl OwnedProcess {
             None,
             None,
             None,
+            None,
             || Ok(()),
             before_resume,
         )
@@ -249,6 +253,7 @@ impl OwnedProcess {
         environment: Option<&[u16]>,
         input: Option<super::windows_runtime::SecretInput>,
         peer: Option<&super::windows::PeerLease>,
+        pipes: Option<&HelperPipes>,
         mut preflight: impl FnMut() -> io::Result<()>,
         before_resume: F,
     ) -> io::Result<Self> {
@@ -274,6 +279,34 @@ impl OwnedProcess {
         // Keep the briefly inheritable secret duplicate scoped to serialized
         // allowlisted process creation. All agent process launches use this gate.
         let _spawn_gate = super::launch_gate::acquire(&SPAWN_LOCK, &mut preflight)?;
+        // Create inheritable duplicates only while all cooperative launches
+        // hold the shared gate; the persistent parent ends never inherit.
+        let inherited_pipes = pipes
+            .map(|pipes| -> io::Result<_> {
+                let duplicate = |handle: &Handle| -> io::Result<Handle> {
+                    let mut copy = null_mut();
+                    if unsafe {
+                        DuplicateHandle(
+                            GetCurrentProcess(),
+                            handle.0,
+                            GetCurrentProcess(),
+                            &mut copy,
+                            0,
+                            1,
+                            DUPLICATE_SAME_ACCESS,
+                        )
+                    } == 0
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                    checked(copy)
+                };
+                Ok((
+                    duplicate(&pipes.input_reader)?,
+                    duplicate(&pipes.output_writer)?,
+                ))
+            })
+            .transpose()?;
         let stdin = input
             .as_ref()
             .map(|input| input.inheritable_read())
@@ -314,6 +347,9 @@ impl OwnedProcess {
                 .map(|_| super::engine_output::windows::Output::open())
                 .transpose()?;
             let mut inherited = vec![stdio.0];
+            if let Some((input, output)) = &inherited_pipes {
+                inherited.extend([input.0, output.0]);
+            }
             if let Some(output) = &output {
                 inherited.push(output.raw_writer());
             }
@@ -362,9 +398,19 @@ impl OwnedProcess {
             let mut startup: STARTUPINFOEXW = zeroed();
             startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
             startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-            startup.StartupInfo.hStdInput = stdin.as_ref().map_or(stdio.0, |handle| handle.0);
-            startup.StartupInfo.hStdOutput = output.as_ref().map_or(stdio.0, |o| o.raw_writer());
-            startup.StartupInfo.hStdError = startup.StartupInfo.hStdOutput;
+            startup.StartupInfo.hStdInput = inherited_pipes.as_ref().map_or_else(
+                || stdin.as_ref().map_or(stdio.0, |handle| handle.0),
+                |p| p.0 .0,
+            );
+            startup.StartupInfo.hStdOutput = inherited_pipes.as_ref().map_or_else(
+                || output.as_ref().map_or(stdio.0, |o| o.raw_writer()),
+                |p| p.1 .0,
+            );
+            startup.StartupInfo.hStdError = if pipes.is_some() {
+                stdio.0
+            } else {
+                startup.StartupInfo.hStdOutput
+            };
             startup.lpAttributeList = attributes.pointer();
             let mut info: PROCESS_INFORMATION = zeroed();
             preflight()?;
@@ -464,6 +510,148 @@ impl OwnedProcess {
             }
             std::thread::sleep(Duration::from_millis(10).min(deadline - now));
         }
+    }
+}
+
+/// Persistent, bounded helper IPC. The child owns no device secrets and remains
+/// in a kill-on-close job. Only its two IPC handles are inherited; stderr is NUL.
+struct HelperPipes {
+    input_reader: Handle,
+    input_writer: Handle,
+    output_reader: Handle,
+    output_writer: Handle,
+}
+impl HelperPipes {
+    fn open() -> io::Result<Self> {
+        unsafe {
+            let sa = SECURITY_ATTRIBUTES {
+                nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: null_mut(),
+                bInheritHandle: 0,
+            };
+            fn pair(sa: &SECURITY_ATTRIBUTES) -> io::Result<(Handle, Handle)> {
+                let (mut read, mut write) = (null_mut(), null_mut());
+                if unsafe { CreatePipe(&mut read, &mut write, sa, 16384) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok((checked(read)?, checked(write)?))
+            }
+            let (input_reader, input_writer) = pair(&sa)?;
+            let (output_reader, output_writer) = pair(&sa)?;
+            Ok(Self {
+                input_reader,
+                input_writer,
+                output_reader,
+                output_writer,
+            })
+        }
+    }
+}
+pub struct HelperProcess {
+    process: OwnedProcess,
+    input: Option<Handle>,
+    output: Handle,
+    pending: Vec<u8>,
+}
+impl HelperProcess {
+    pub fn spawn_checked(
+        executable: &Path,
+        directory: &Path,
+        preflight: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<Self> {
+        let pipes = HelperPipes::open()?;
+        let environment = sanitized_environment(directory)?;
+        let process = OwnedProcess::spawn_configured(
+            executable,
+            &[],
+            directory,
+            Some(&environment),
+            None,
+            None,
+            Some(&pipes),
+            preflight,
+            |_| {},
+        )?;
+        Ok(Self {
+            process,
+            input: Some(pipes.input_writer),
+            output: pipes.output_reader,
+            pending: Vec::with_capacity(1024),
+        })
+    }
+    pub fn write_line(&self, line: &[u8]) -> io::Result<()> {
+        if line.is_empty() || line.len() > 8192 || line.contains(&b'\n') {
+            return Err(invalid());
+        }
+        let input = self.input.as_ref().ok_or_else(invalid)?;
+        for bytes in [line, b"\n".as_slice()] {
+            let mut count = 0;
+            if unsafe {
+                WriteFile(
+                    input.0,
+                    bytes.as_ptr(),
+                    bytes.len() as u32,
+                    &mut count,
+                    null_mut(),
+                )
+            } == 0
+                || count as usize != bytes.len()
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+    /// Poll without a reader thread: no blocking join after cancellation/crash.
+    pub fn poll_line(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let mut available = 0;
+        if unsafe {
+            PeekNamedPipe(
+                self.output.0,
+                null_mut(),
+                0,
+                null_mut(),
+                &mut available,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if available != 0 {
+            let mut scratch = [0u8; 1024];
+            let mut count = 0;
+            let size = available.min(scratch.len() as u32);
+            if unsafe {
+                ReadFile(
+                    self.output.0,
+                    scratch.as_mut_ptr(),
+                    size,
+                    &mut count,
+                    null_mut(),
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if self.pending.len() + count as usize > 4096 {
+                return Err(invalid());
+            }
+            self.pending.extend_from_slice(&scratch[..count as usize]);
+        }
+        if let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
+            let mut line: Vec<_> = self.pending.drain(..=end).collect();
+            line.pop();
+            return Ok(Some(line));
+        }
+        Ok(None)
+    }
+    pub fn is_running(&self) -> bool {
+        matches!(self.process.wait(Duration::ZERO), Ok(None))
+    }
+    pub fn stop_confirmed(&mut self) -> io::Result<()> {
+        self.input = None;
+        self.process.terminate(Duration::from_secs(5))
     }
 }
 

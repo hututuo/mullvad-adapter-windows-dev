@@ -60,6 +60,12 @@ pub(crate) fn attempt_failure_disposition(code: &str) -> AttemptFailureDispositi
         return AttemptFailureDisposition::RetrySameTarget;
     }
     match code {
+        // The helper has already been positively stopped by Prepare. A QUIC
+        // handshake/H3 timeout ends only this carrier candidate, without a WG
+        // or SS failure sample and without a same-target local defer loop.
+        "quic_helper_unavailable" | "quic_helper_start_failed" | "quic_connect_failed" => {
+            AttemptFailureDisposition::SkipUnavailablePath
+        }
         "worker_configuration_rejected"
         | "worker_start_cancelled"
         | "candidate_cancelled"
@@ -194,6 +200,28 @@ mod tests {
         assert!(!is_retryable_local_failure("tunnel_transaction_failed"));
     }
 
+    #[test]
+    fn quic_start_timeout_and_local_unavailability_advance_without_retrying_same_target() {
+        for code in [
+            "quic_helper_start_failed",
+            "quic_helper_unavailable",
+            "quic_connect_failed",
+        ] {
+            assert!(!is_retryable_local_failure(code));
+            assert_eq!(
+                attempt_failure_disposition(code),
+                AttemptFailureDisposition::SkipUnavailablePath
+            );
+        }
+        assert_eq!(
+            attempt_failure_disposition("cleanup_uncertain"),
+            AttemptFailureDisposition::Freeze
+        );
+        assert_eq!(
+            attempt_failure_disposition("worker_start_cancelled"),
+            AttemptFailureDisposition::StopCleanly
+        );
+    }
     #[test]
     fn async_attempt_failures_retry_only_known_recoverable_local_codes() {
         use AttemptFailureDisposition as D;

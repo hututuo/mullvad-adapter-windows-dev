@@ -32,6 +32,7 @@ _BUILD_INPUT_PATHS = (
     ".gitmodules",
     ".cargo",
     "core",
+    "helpers/quic-carrier",
     "desktop",
     "packaging/windows/build_candidate.py",
     "packaging/windows/stage_runtime.py",
@@ -43,6 +44,8 @@ _BUILD_INPUT_PATHS = (
 # desktop/.env.local), because they can alter what Cargo or Tauri builds.
 _BUILD_CACHE_PATHS = (
     "core/target",
+    "helpers/quic-carrier/target",
+    "helpers/quic-carrier/bin",
     "desktop/node_modules",
     "desktop/dist",
     "desktop/src-tauri/gen",
@@ -314,9 +317,13 @@ def build(
     command_runner(["cargo", "build", "--locked", "--release", "--target", TARGET,
                     "-p", "adapter-agent"], cwd=source / "core", env=env, check=True)
     source_snapshot.assert_unchanged()
+    command_runner(["cargo", "build", "--locked", "--release", "--target", TARGET],
+                   cwd=source / "helpers/quic-carrier", env=env, check=True)
+    source_snapshot.assert_unchanged()
     runtime = output / "payload"
     stage_runtime(core_target / TARGET / "release/adapter-agent.exe", runtime,
-                  args.source_sha, version, mihomo_archive=args.mihomo_archive)
+                  args.source_sha, version, mihomo_archive=args.mihomo_archive,
+                  quic_helper=core_target / TARGET / "release/mullvad-quic-carrier.exe")
     source_snapshot.assert_unchanged()
     manifest = runtime / "runtime/manifest.json"
     env["ADAPTER_RUNTIME_MANIFEST_SHA256"] = file_record(manifest)["sha256"]

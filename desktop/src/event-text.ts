@@ -63,7 +63,7 @@ export const eventMessages: Record<string, string> = {
   active_binding_changed:"网卡环境变化，重新核对原路径", active_local_rebuild:"正在按原节点重建本地通道",
   active_data_failed:"原连接的数据检查失败，先复测原路径", active_failure_confirmation:"正在快速复测，确认是否需要重连",
   active_front_repair_failed:"正在处理本地转发入口，优先保留后端隧道",
-  original_inlet_short_retry:"正在重试原节点、原入口", original_native_family_unavailable:"本机已无原通道所需地址族，回原节点 SS 恢复", native_path_unavailable:"该原生路径没有可用的本机路由，继续下一候选", native_ipv6_fallback_started:"同城 SS 未恢复，开始尝试原生 IPv6", native_ipv4_fallback_started:"开始尝试原生 IPv4 保底", direct_routes_exhausted_chain_last:"本轮直连路线用尽，最后尝试链式保底",
+  original_inlet_short_retry:"正在重试原节点、原入口", original_native_family_unavailable:"本机已无原通道所需地址族，回原节点 SS 恢复", native_path_unavailable:"该原生路径没有可用的本机路由，继续下一候选", quic_fallback_started:"同城 SS 未恢复，开始验证 QUIC 混淆", quic_helper_unavailable:"当前安装缺少可用的 QUIC 组件", quic_helper_start_failed:"QUIC 承载尚未建立成功", quic_connect_failed:"QUIC 远端连接未通过，继续下一候选", quic_path_unavailable:"本机暂时没有可用的 QUIC 出站路径", native_ipv6_fallback_started:"SS / QUIC 未恢复，开始尝试原生 IPv6", native_ipv4_fallback_started:"开始尝试原生 IPv4 保底", direct_routes_exhausted_chain_last:"本轮直连路线用尽，最后尝试链式保底",
   route_trial_failed:"路线测试未通过", route_trial_failed_restore_previous:"路线测试未通过，正在恢复之前的连接",
   restore_previous_failed_use_verified_backup:"原路线尚未恢复，尝试已验证的备用承载",
   network_binding_changed:"连接期间网卡环境变化，暂停旧尝试", waiting_network_settle:"等待本机网络稳定后再重试",

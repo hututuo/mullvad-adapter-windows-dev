@@ -31,6 +31,8 @@ pub(crate) struct RoundPlan {
     pub(crate) started: Option<Instant>,
     pub(crate) chain_phase: bool,
     pub(crate) chain_entered: bool,
+    pub(crate) quic_phase: bool,
+    quic_entered: bool,
     pub(crate) native_phase: Option<crate::live_route::Family>,
     native_phases: u8,
     original: Option<(String, String, String)>,
@@ -81,11 +83,24 @@ impl RoundPlan {
     pub(crate) fn short_attempt(&self) -> u32 {
         u32::from(self.original_failures.saturating_add(1).min(3))
     }
+    pub(crate) fn enter_quic(&mut self) -> bool {
+        if self.chain_entered
+            || self.quic_entered
+            || self.native_phases != 0
+            || self.relays.is_empty()
+        {
+            return false;
+        }
+        self.quic_entered = true;
+        self.quic_phase = true;
+        true
+    }
     /// A single bounded V6 pass, then V4 pass over this round's fixed city set.
     pub(crate) fn enter_native(&mut self) -> bool {
         if self.chain_entered || self.native_phases >= 2 || self.relays.is_empty() {
             return false;
         }
+        self.quic_phase = false;
         self.native_phase = Some(if self.native_phases == 0 {
             crate::live_route::Family::V6
         } else {
@@ -138,6 +153,21 @@ impl DirectReturn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn quic_is_one_serial_phase_before_native_then_chain() {
+        let mut plan = RoundPlan::default();
+        plan.start(vec!["same-city-relay".into()], false);
+        assert!(plan.enter_quic());
+        assert!(plan.quic_phase);
+        assert!(!plan.enter_quic());
+        assert!(plan.enter_native());
+        assert!(!plan.quic_phase);
+        assert_eq!(plan.native_phase, Some(crate::live_route::Family::V6));
+        assert!(plan.enter_native());
+        assert_eq!(plan.native_phase, Some(crate::live_route::Family::V4));
+        assert!(plan.enter_chain());
+        assert!(!plan.enter_quic());
+    }
     #[test]
     fn short_retry_never_moves_endpoint_or_repeats_forever() {
         let mut p = RoundPlan::default();

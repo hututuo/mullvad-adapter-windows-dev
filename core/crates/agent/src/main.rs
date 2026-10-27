@@ -20,6 +20,8 @@ mod live_route;
 mod live_runtime;
 mod live_status;
 #[cfg(any(windows, feature = "windows-api-check", test))]
+mod quic_trials;
+#[cfg(any(windows, feature = "windows-api-check", test))]
 mod recovery_plan;
 #[cfg(any(windows, feature = "windows-api-check", test))]
 mod recovery_retry;

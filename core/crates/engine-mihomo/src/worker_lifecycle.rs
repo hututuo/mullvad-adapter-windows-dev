@@ -34,6 +34,9 @@ pub enum WorkerStartError {
     Controller,
     Deadline,
     Cleanup,
+    QuicUnavailable,
+    QuicStart,
+    QuicConnect,
 }
 impl WorkerStartError {
     /// Closed diagnostics shared by product and explicit maintenance probes.
@@ -49,6 +52,9 @@ impl WorkerStartError {
             Self::Controller => "worker_controller_unavailable",
             Self::Deadline => "worker_start_deadline",
             Self::Cleanup => "cleanup_uncertain",
+            Self::QuicUnavailable => "quic_helper_unavailable",
+            Self::QuicStart => "quic_helper_start_failed",
+            Self::QuicConnect => "quic_connect_failed",
         }
     }
 }
@@ -57,6 +63,7 @@ pub struct Worker {
     network: BoundNetwork,
     mixed_port: u16,
     carrier: Option<crate::carrier::windows::Run>,
+    quic: Option<crate::quic::windows::Run>,
     _peer: adapter_platform::windows::PeerLease,
 }
 impl Worker {
@@ -70,7 +77,9 @@ impl Worker {
         request: &WorkerRequest<'_>,
         network: BoundNetwork,
     ) -> Result<Self, WorkerStartError> {
-        Self::start_config(executable, runtime, request, network, false, false, None)
+        Self::start_config(
+            executable, runtime, request, network, false, false, None, None,
+        )
     }
     /// Only for the explicit maintenance probe; raw diagnostics never escape.
     pub fn start_diagnostic(
@@ -79,7 +88,9 @@ impl Worker {
         request: &WorkerRequest<'_>,
         network: BoundNetwork,
     ) -> Result<Self, WorkerStartError> {
-        Self::start_config(executable, runtime, request, network, true, false, None)
+        Self::start_config(
+            executable, runtime, request, network, true, false, None, None,
+        )
     }
     /// Own the physical outer socket; this alone is not candidate readiness.
     pub fn start_carried(
@@ -88,7 +99,9 @@ impl Worker {
         request: &WorkerRequest<'_>,
         network: BoundNetwork,
     ) -> Result<Self, WorkerStartError> {
-        Self::start_config(executable, runtime, request, network, true, true, None)
+        Self::start_config(
+            executable, runtime, request, network, true, true, None, None,
+        )
     }
     pub fn start_chained(
         executable: &Path,
@@ -105,6 +118,28 @@ impl Worker {
             false,
             true,
             Some(upstream),
+            None,
+        )
+    }
+    pub fn start_quic(
+        executable: &Path,
+        runtime: &PrivateRuntime,
+        request: &WorkerRequest<'_>,
+        network: BoundNetwork,
+        config: &crate::quic::Config,
+    ) -> Result<Self, WorkerStartError> {
+        if !config.helper_executable.is_file() {
+            return Err(WorkerStartError::QuicUnavailable);
+        }
+        Self::start_config(
+            executable,
+            runtime,
+            request,
+            network,
+            false,
+            false,
+            None,
+            Some(config),
         )
     }
     fn start_config(
@@ -115,6 +150,7 @@ impl Worker {
         diagnostic: bool,
         carried: bool,
         chain: Option<&crate::chain::UpstreamSs>,
+        quic_config: Option<&crate::quic::Config>,
     ) -> Result<Self, WorkerStartError> {
         let deadline = Instant::now() + Duration::from_secs(15);
         let checkpoint = || {
@@ -139,6 +175,7 @@ impl Worker {
                     IpAddr::V4(endpoint)
                 }
                 Transport::DirectV6 { endpoint, .. } => IpAddr::V6(endpoint),
+                Transport::Quic { endpoint, .. } => endpoint,
             }
         };
         // Acquire within the captured operation, never from an earlier factory.
@@ -181,7 +218,8 @@ impl Worker {
                 .unwrap_or_else(|| match request.transport {
                     Transport::DirectV4 { port, .. }
                     | Transport::DirectV6 { port, .. }
-                    | Transport::Shadowsocks { port, .. } => port,
+                    | Transport::Shadowsocks { port, .. }
+                    | Transport::Quic { port, .. } => port,
                 });
         let mut carrier = if carried {
             Some(
@@ -191,8 +229,53 @@ impl Worker {
         } else {
             None
         };
+        let mut quic = if let Some(config) = quic_config {
+            let remote = std::net::SocketAddr::new(destination, outer_port);
+            Some(
+                crate::quic::windows::Run::open(
+                    runtime.path(),
+                    &route,
+                    remote,
+                    config,
+                    &network,
+                    deadline,
+                )
+                .map_err(|e| {
+                    if e.to_string() == "quic_cleanup_uncertain" {
+                        WorkerStartError::Cleanup
+                    } else if network.is_cancelled() {
+                        WorkerStartError::Cancelled
+                    } else if e.to_string() == "quic_connect_failed" {
+                        WorkerStartError::QuicConnect
+                    } else {
+                        WorkerStartError::QuicStart
+                    }
+                })?,
+            )
+        } else {
+            None
+        };
+        // QUIC authentication can take longer than a route snapshot's 2s
+        // freshness window. Recollect the exact same path after helper startup;
+        // never extend the old snapshot's age or accept a changed route.
+        let quic_route = if quic.is_some() {
+            match snapshot(network.binding(), destination) {
+                Ok(fresh) if fresh.is_fresh() && route.same_path(&fresh) => Some(fresh),
+                _ => {
+                    if quic.as_mut().is_some_and(|q| q.stop_confirmed().is_err()) {
+                        return Err(WorkerStartError::Cleanup);
+                    }
+                    return Err(WorkerStartError::Route);
+                }
+            }
+        } else {
+            None
+        };
+        let route = quic_route.as_ref().unwrap_or(&route);
         let prepared = (|| {
-            let config = if let (Some(carrier), Some(chain), Some(endpoint)) =
+            let config = if let Some(quic) = &quic {
+                crate::worker_with_quic_route(&input, &route, quic.local())
+            } else if let (Some(carrier), Some(chain), Some(endpoint)) =
                 (&carrier, chain, chain_endpoint)
             {
                 crate::worker_with_chain_carrier_route(
@@ -250,9 +333,11 @@ impl Worker {
         let process = match prepared {
             Ok(process) => process,
             Err(error) => {
-                if carrier
-                    .as_mut()
-                    .is_some_and(|carrier| carrier.stop_confirmed().is_err())
+                let quic_failed = quic.as_mut().is_some_and(|q| q.stop_confirmed().is_err());
+                if quic_failed
+                    || carrier
+                        .as_mut()
+                        .is_some_and(|carrier| carrier.stop_confirmed().is_err())
                 {
                     return Err(WorkerStartError::Cleanup);
                 }
@@ -339,6 +424,7 @@ impl Worker {
                 network,
                 mixed_port: request.listener.mixed_port,
                 carrier,
+                quic,
                 _peer: peer,
             }),
             Err(error) => {
@@ -346,8 +432,9 @@ impl Worker {
                 let carrier_failed = carrier
                     .as_mut()
                     .is_some_and(|c| c.stop_confirmed().is_err());
+                let quic_failed = quic.as_mut().is_some_and(|q| q.stop_confirmed().is_err());
                 let process_failed = process.terminate(Duration::from_secs(5)).is_err();
-                if carrier_failed || process_failed {
+                if carrier_failed || quic_failed || process_failed {
                     return Err(WorkerStartError::Cleanup);
                 }
                 Err(error)
@@ -441,6 +528,46 @@ impl Worker {
         if operation.binding() != self.network.binding() {
             return Err(BatchError::LocalFailure);
         }
+        if let Some(quic) = &self.quic {
+            if !quic.current(operation) {
+                return Err(BatchError::LocalFailure);
+            }
+            let before = quic
+                .stats(operation)
+                .map_err(|_| BatchError::LocalFailure)?;
+            let report =
+                crate::canary_batch::for_worker(&self.process, operation, self.mixed_port)?;
+            let after = quic
+                .stats(operation)
+                .map_err(|_| BatchError::LocalFailure)?;
+            if operation.is_cancelled() {
+                return Err(BatchError::Cancelled);
+            }
+            if !quic.current(operation) {
+                return Err(BatchError::LocalFailure);
+            }
+            if !report.fresh_canary(Instant::now())?.alive() {
+                // Transmit counters only prove submission to the authenticated
+                // carrier, sufficient for a measured negative, never readiness.
+                return if after.tx_packets > before.tx_packets {
+                    Ok(Assessment::Unready(UnreadyReport {
+                        report,
+                        observed: Instant::now(),
+                    }))
+                } else {
+                    Err(BatchError::LocalFailure)
+                };
+            }
+            if after.tx_packets <= before.tx_packets || after.rx_packets <= before.rx_packets {
+                return Err(BatchError::LocalFailure);
+            }
+            return Ok(Assessment::Bound(BoundReport {
+                report,
+                carrier_instance: 0,
+                window: 0,
+                observed: Instant::now(),
+            }));
+        }
         let carrier = self.carrier.as_ref().ok_or(BatchError::LocalFailure)?;
         let window = carrier
             .begin(operation.cancellation_monitor())
@@ -481,10 +608,14 @@ impl Worker {
                 report.observed + Duration::from_secs(2),
                 || {
                     report.observed.elapsed() < Duration::from_secs(2)
-                        && self.carrier.as_ref().is_some_and(|c| {
-                            c.instance() == report.carrier_instance
-                                && c.verify(report.window).is_ok()
-                        })
+                        && (self
+                            .quic
+                            .as_ref()
+                            .is_some_and(|q| report.carrier_instance == 0 && q.current(operation))
+                            || self.carrier.as_ref().is_some_and(|c| {
+                                c.instance() == report.carrier_instance
+                                    && c.verify(report.window).is_ok()
+                            }))
                         && self.is_running()
                 },
             )
@@ -505,7 +636,8 @@ impl Worker {
         self.carrier.as_ref().map(|c| c.snapshot())
     }
     pub fn is_running(&self) -> bool {
-        matches!(self.process.wait(Duration::ZERO), Ok(None))
+        self.quic.as_ref().is_none_or(|q| q.is_running())
+            && matches!(self.process.wait(Duration::ZERO), Ok(None))
             && self
                 .carrier
                 .as_ref()
@@ -582,8 +714,12 @@ impl Resource for Worker {
             .carrier
             .as_mut()
             .is_some_and(|c| c.stop_confirmed().is_err());
+        let quic_failed = self
+            .quic
+            .as_mut()
+            .is_some_and(|q| q.stop_confirmed().is_err());
         let process_failed = self.process.terminate(Duration::from_secs(5)).is_err();
-        if carrier_failed || process_failed {
+        if carrier_failed || quic_failed || process_failed {
             Err(Failure::Stop)
         } else {
             Ok(())

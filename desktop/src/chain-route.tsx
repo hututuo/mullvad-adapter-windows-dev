@@ -106,7 +106,7 @@ export function useChainBackup(data:Dashboard|null,observationCurrent=true) {
   }
   // Independent SS-only maintenance does not open another WG identity.
   useEffect(()=>{
-    if(!observationCurrent||!data||!("__TAURI_INTERNALS__" in window)||data.settings.tunnel_route==="direct"||data.physical_attachment!=="available"||data.operation||!["connected","disconnected","retry_wait"].includes(data.status)||data.connection?.chained||flight.current||performance.now()<next.current)return;
+    if(!observationCurrent||!data||!("__TAURI_INTERNALS__" in window)||["direct","quic"].includes(data.settings.tunnel_route)||data.physical_attachment!=="available"||data.operation||!["connected","disconnected","retry_wait"].includes(data.status)||data.connection?.chained||flight.current||performance.now()<next.current)return;
     next.current=performance.now()+5*60*1000;void maintain();
   },[data?.sequence,observationCurrent]);
   return {working,notice,choices,selected,setSelected,loadChoices,maintain,test,cancel:()=>{generation.current+=1;}};
@@ -120,7 +120,7 @@ export function ChainRoute({data,disabled,onSettings,backup,observationCurrent=t
     <p className="backup-route-result" role="status">{backup.notice||(data.backup_verified_at?`最近一次完整连通：${timeText(data.backup_verified_at)}`:data.chain_node?"备用已保存；同城 SS 及原生 IPv6/IPv4 均失败后才使用。":"不需要逐个选、逐个测试；后台会从实际配置中筛选可承载隧道的节点。")}</p>
     <details className="clash-advanced" onToggle={e=>{if(e.currentTarget.open&&!backup.choices.length)void backup.loadChoices();}}><summary>备用节点与连接策略</summary>
       <div className="settings-grid"><label>备用节点<select aria-label="链式备用节点" value={backup.selected} disabled={disabled||backup.working} onChange={e=>{backup.setSelected(e.target.value);void onSettings({...data.settings,chain_selection:e.target.value||null});}}><option value="">自动选择（推荐）</option>{backup.choices.map(c=><option key={c.fingerprint} value={c.name}>{c.name}</option>)}</select></label>
-      <label>连接策略<select aria-label="隧道连接策略" value={data.settings.tunnel_route??"auto"} disabled={disabled||backup.working} onChange={e=>void onSettings({...data.settings,tunnel_route:e.target.value as Settings["tunnel_route"]})}><option value="auto">直连恢复后，最后链式保底</option><option value="direct">仅直连</option><option value="chain" disabled={!data.chain_node}>固定链式</option></select></label></div>
+      <label>连接策略<select aria-label="隧道连接策略" value={data.settings.tunnel_route??"auto"} disabled={disabled||backup.working} onChange={e=>void onSettings({...data.settings,tunnel_route:e.target.value as Settings["tunnel_route"]})}><option value="auto">直连恢复后，最后链式保底</option><option value="direct">仅直连</option><option value="quic" disabled={data.quic_available !== true}>仅 QUIC 混淆</option><option value="chain" disabled={!data.chain_node}>固定链式</option></select></label></div>
       <div className="panel-actions"><button disabled={disabled||backup.working} onClick={()=>void backup.maintain(!!backup.selected)}>应用并自动检查</button><button disabled={backup.working} onClick={()=>void backup.loadChoices()}>刷新本机节点</button></div>
       <p className="hint">读取本机实际 Clash 配置与订阅缓存，当前可导入无插件的标准 SS UDP 节点。列表包含所有兼容节点；名称用于优先顺序，真实收发决定是否采用。密码只在本机后台读取与加密保存。</p>
     </details>

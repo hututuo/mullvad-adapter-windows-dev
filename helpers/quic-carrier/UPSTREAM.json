@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "repository": "https://github.com/mullvad/mullvadvpn-app",
+  "tag": "2026.5",
+  "sha": "19fb87407f4b81fe15372c2c7f8a20e7ab4eb220",
+  "component": "mullvad-masque-proxy",
+  "integration": "Linked official QUIC/H3 CONNECT-UDP client; adapter owns physical socket binding, parent lifecycle and bounded IPC",
+  "wireguard_target": "127.0.0.1:51820",
+  "target_reference": "talpid-wireguard/src/obfuscation.rs",
+  "credentials": "Directory-issued CONNECT token supplied on stdin; no WireGuard device private key"
+}

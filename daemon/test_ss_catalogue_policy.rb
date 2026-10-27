@@ -39,7 +39,7 @@ class SsCataloguePolicyTest < Minitest::Test
     keys = candidates.map { |ip, port, _kind| [ip, port] }
 
     assert_equal keys.uniq, keys
-    assert_equal 9, candidates.length
+    assert_equal 21, candidates.length
     assert_includes keys, ['192.0.2.2', MullvadAdapter::EXTRA_SS_PORT]
     assert_includes keys, ['192.0.2.3', MullvadAdapter::EXTRA_SS_PORT]
     assert_includes keys, ['192.0.2.1', MullvadAdapter::EXTRA_SS_PORT]
@@ -53,7 +53,7 @@ class SsCataloguePolicyTest < Minitest::Test
   def test_endpoint_selector_defaults_to_six_and_recovery_can_read_full_pool
     assert_equal 6, @adapter.send(:ss_endpoint_candidates, @relay).length
     full_pool = @adapter.send(:ss_endpoint_candidates, @relay, include_cooling: true)
-    assert_equal 9, full_pool.length
+    assert_equal 21, full_pool.length
     assert_equal full_pool.map { |ip, port, _kind| [ip, port] }.uniq,
                  full_pool.map { |ip, port, _kind| [ip, port] }
   end
@@ -72,10 +72,22 @@ class SsCataloguePolicyTest < Minitest::Test
     assert @adapter.send(:ss_candidate_authorized?, @relay, ['192.0.2.1', 20_487])
     assert @adapter.send(:ss_candidate_authorized?, @relay, ['192.0.2.1', MullvadAdapter::EXTRA_SS_PORT])
 
-    refute @adapter.send(:ss_candidate_authorized?, @relay, ['192.0.2.2', 20_485])
+    assert @adapter.send(:ss_candidate_authorized?, @relay, ['192.0.2.2', 20_485])
     refute @adapter.send(:ss_candidate_authorized?, @relay, ['192.0.2.9', 20_485])
     refute @adapter.send(:ss_candidate_authorized?, @relay, ['192.0.2.1', 20_483])
     refute @adapter.send(:ss_candidate_authorized?, @relay, ['2001:db8::1', 20_485])
+  end
+
+  def test_extra_addresses_cover_official_port_range_and_exact_saved_path
+    @metadata['wireguard']['shadowsocks_port_ranges'] = [[51_900, 51_949]]
+    pool = @adapter.send(:ss_catalogue_candidates, @relay)
+    [51_907, 51_947].each do |port|
+      assert_includes pool.map { |ip, p, _| [ip, p] }, ['192.0.2.2', port]
+      path = { relay: 'relay-one', transport_mode: 'ss', endpoint: '192.0.2.2', endpoint_port: port, endpoint_kind: 'extra-ss-port' }
+      assert_equal ['192.0.2.2', port, 'extra-ss-port'], @adapter.send(:original_recovery_inlet, path, 'relay-one', 'ss')[:candidate]
+    end
+    refute @adapter.send(:ss_candidate_authorized?, @relay, ['192.0.2.2', 51_950])
+    assert_equal 6, @adapter.send(:ss_endpoint_candidates, @relay).length
   end
 
   def test_fallback_rotation_returns_three_unseen_candidates_after_first_three_attempts
@@ -120,7 +132,7 @@ class SsCataloguePolicyTest < Minitest::Test
     refreshed = @adapter.send(:rotating_ss_recovery_inlets, 'relay-one', refreshed_pool)
     refreshed_keys = refreshed.map { |item| @adapter.send(:recovery_inlet_key, item) }
 
-    assert_equal 10, refreshed_pool.length
+    assert_equal 28, refreshed_pool.length
     seen.each do |inlet|
       refute_includes refreshed_keys, @adapter.send(:recovery_inlet_key, inlet)
     end

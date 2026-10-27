@@ -74,12 +74,25 @@ class OrderedRecoveryTest < Minitest::Test
     assert_equal %w[five four three two], @adapter.paths[6, 8].map(&:first).uniq
     assert_equal [2, 2, 2, 2], @adapter.paths[6, 8].group_by(&:first).values.map(&:length)
     assert_equal ['ss'] * 14, @adapter.path_modes.first(14)
-    assert_equal %w[ipv6 ipv4] * 5, @adapter.path_modes.drop(14)
+    assert_equal ['ipv6'] * 5 + ['ipv4'] * 5, @adapter.path_modes.drop(14)
     assert_equal [0, 1, 5], @adapter.waits.first(3)
     assert_equal 24, @adapter.paths.length
     assert_equal 'exhausted', @adapter.send(:snapshot).dig(:recovery, :phase)
     assert_equal 24, @adapter.send(:snapshot).dig(:recovery, :attempt)
     assert @adapter.instance_variable_get(:@workers).empty?
+  end
+
+  def test_quic_candidates_follow_all_ss_and_precede_any_native_fallback
+    @adapter.instance_variable_get(:@options)[:quic_helper] = RbConfig.ruby
+    @adapter.instance_variable_get(:@metadata)['wireguard']['relays'].each do |relay|
+      relay['features'] = { 'quic' => { 'addr_in' => ['192.0.2.99'], 'domain' => 'fixture.invalid', 'token' => 'fixture-token' } }
+    end
+    refute run_round
+    modes = @adapter.path_modes
+    assert_equal ['ss'] * 14, modes.first(14)
+    assert_equal ['quic'] * 5, modes[14, 5]
+    assert_equal ['ipv6'] * 5 + ['ipv4'] * 5, modes.drop(19)
+    assert_equal 29, modes.length
   end
 
   def test_second_original_attempt_restores_without_extra_entry_or_peer_overlap

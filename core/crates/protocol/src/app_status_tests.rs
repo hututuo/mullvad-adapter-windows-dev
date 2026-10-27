@@ -42,6 +42,7 @@ fn dashboard(sequence: u64, status: &str) -> Dashboard {
         status: status.into(),
         physical_attachment: "available".into(),
         settings: Settings::default(),
+        quic_available: false,
         front_ready: true,
         front_selected: "fixture-front".into(),
         identity_configured: false,
@@ -462,4 +463,20 @@ fn unknown_error_codes_are_collapsed_without_echoing_private_text() {
     let error = result.unwrap_err();
     assert_eq!(error, "status_response_invalid");
     assert!(!error.contains(private));
+}
+
+#[test]
+fn quic_capability_defaults_false_for_old_dashboards_and_publishes_cached_value() {
+    let mut legacy = serde_json::to_value(dashboard(1, "fixture")).unwrap();
+    legacy.as_object_mut().unwrap().remove("quic_available");
+    assert!(
+        !serde_json::from_value::<Dashboard>(legacy)
+            .unwrap()
+            .quic_available
+    );
+    let mut capable = dashboard(2, "fixture");
+    capable.quic_available = true;
+    let roundtrip: Dashboard =
+        serde_json::from_value(serde_json::to_value(capable).unwrap()).unwrap();
+    assert!(roundtrip.quic_available);
 }

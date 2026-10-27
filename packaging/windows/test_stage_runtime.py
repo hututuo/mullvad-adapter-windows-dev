@@ -147,6 +147,20 @@ class StageRuntimeTests(unittest.TestCase):
         manifest_text = (runtime / "manifest.json").read_text(encoding="utf-8")
         self.assertNotIn(str(self.root), manifest_text)
 
+    def test_optional_quic_carrier_is_pe_checked_and_hash_bound(self) -> None:
+        helper = self.root / "quic-input.exe"
+        content = make_pe()
+        helper.write_bytes(content)
+        result = self._stage(quic_helper=helper)
+        target = self.output_root / "runtime/mullvad-quic-carrier.exe"
+        self.assertEqual(target.read_bytes(), content)
+        self.assertEqual(result["files"][target.name]["sha256"], hashlib.sha256(content).hexdigest())
+
+    def test_optional_quic_rejects_wrong_architecture_before_publication(self) -> None:
+        helper = self.root / "quic-input.exe"
+        helper.write_bytes(make_pe(machine=0x014C))
+        self._assert_failed_cleanly("x64", quic_helper=helper)
+
     def test_bad_pinned_digest_rejects_archive_without_publishing(self) -> None:
         self._write_compatibility_manifest(digest="0" * 64)
         self._assert_failed_cleanly("SHA256 does not match")

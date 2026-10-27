@@ -30,6 +30,25 @@ fn normalized(value: &Value, key: &str) -> Value {
     }
 }
 fn render(value: &Value, key: &str) -> String {
+    // QUIC authorization material is only an internal comparison fact. Never
+    // include its token/domain (including nested `other` facts) in UI or logs.
+    fn contains_quic(value: &Value) -> bool {
+        match value {
+            Value::Object(object) => {
+                object.contains_key("quic") || object.values().any(contains_quic)
+            }
+            Value::Array(values) => values.iter().any(contains_quic),
+            _ => false,
+        }
+    }
+    if key == "quic" || contains_quic(value) {
+        return if value.is_null() {
+            "无".into()
+        } else {
+            "QUIC 参数已配置".into()
+        };
+    }
+
     if key == "public_key" {
         return value
             .as_str()
@@ -147,6 +166,16 @@ pub(crate) fn compare(
                     .filter(|(key, _)| normalized(&prior[*key], key) != normalized(&row[*key], key))
                     .map(|(key, label)| field(key, label, &prior[*key], &row[*key]))
                     .collect();
+                if normalized(&prior["features"]["quic"], "")
+                    != normalized(&row["features"]["quic"], "")
+                {
+                    fields.push(field(
+                        "quic",
+                        "QUIC 入口或认证参数",
+                        &prior["features"]["quic"],
+                        &row["features"]["quic"],
+                    ));
+                }
                 let other = |r: &Value| -> Value {
                     Value::Object(
                         r.as_object()
@@ -156,7 +185,15 @@ pub(crate) fn compare(
                                 key.as_str() != "hostname"
                                     && !labels.iter().any(|(k, _)| *k == key.as_str())
                             })
-                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .map(|(k, v)| {
+                                let mut safe = v.clone();
+                                if k == "features" {
+                                    if let Some(features) = safe.as_object_mut() {
+                                        features.remove("quic");
+                                    }
+                                }
+                                (k.clone(), safe)
+                            })
                             .collect::<Map<_, _>>(),
                     )
                 };
@@ -231,7 +268,7 @@ pub(crate) fn compare(
             c.relays()
                 .iter()
                 .find(|r| Some(r.hostname()) == current_relay)
-                .map_or(0, |r| c.shadowsocks_inlets(r).len())
+                .map_or(0, |r| c.shadowsocks_candidate_count(r))
         })
     };
     focus.ss_before_count = count(previous);

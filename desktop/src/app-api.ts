@@ -6,7 +6,7 @@ export type Settings = {
   front_port: number;
   automatic_recovery: boolean;
   connect_on_start: boolean;
-  tunnel_route: "direct" | "chain" | "auto";
+  tunnel_route: "direct" | "chain" | "auto" | "quic";
   chain_selection?: string | null;
   required_multihop: boolean;
   required_pq: boolean;
@@ -27,6 +27,7 @@ export type Relay = {
   ipv4: boolean;
   ipv6: boolean;
   shadowsocks: boolean;
+  quic?: boolean;
   last_ping_ms: number | null;
   readiness: string | null;
 };
@@ -49,6 +50,7 @@ export function probeText(value: boolean | null, outcome?: ProbeOutcome) {
 export type RecoveryAction = "retry_current" | "retry_city" | "test_backup" | "chain_fallback" | "return_direct";
 export type RecoveryProgress = { transport?:string|null; stage:string; relay:string|null; inlet:string|null; attempt:number; elapsed_seconds:number; budget_seconds:number; wait_seconds:number; next:string; direct_return_in_seconds:number|null };
 export type Dashboard = {
+  quic_available?: boolean;
   status_observation?: { age_ms:number; capture_ms:number; native_elapsed_ms:number } | null;
   sequence: number;
   boot_id: string;

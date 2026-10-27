@@ -18,7 +18,8 @@ class OfflineFlightRecorderTest < Minitest::Test
       elsif binary.end_with?('nettop')
         raise IOError if @udp_fail
         raise 'DNS lookup must be disabled' unless args.include?('-n')
-        ",interface,bytes_in,bytes_out,\ncore.123,,900,900,\nudp6 *.123<->*.*,en0,#{@rx},#{@tx},\nudp4 127.0.0.1:17910<->*:*,lo0,800,700,\n"
+        outer = @state.dig('workers', 'a', 'quic_carrier_pid') || 123
+        ",interface,bytes_in,bytes_out,\ncore.#{outer},,900,900,\nudp6 *.123<->*.*,en0,#{@rx},#{@tx},\nudp4 127.0.0.1:17910<->*:*,lo0,800,700,\n"
       else
         raise 'unexpected command'
       end
@@ -55,6 +56,20 @@ class OfflineFlightRecorderTest < Minitest::Test
     sample = @recorder.tick.first
     assert_nil sample.dig(:delta, :rx_delta)
     assert_equal 2, sample.dig(:udp, :rx_bytes)
+  end
+
+  def test_quic_uses_outer_carrier_pid_and_keeps_wg_observations_on_core
+    @state['workers']['a'].merge!('transport_mode' => 'quic', 'quic_carrier_pid' => 456,
+      'quic_observed_packets' => { 'tx_packets' => 3, 'rx_packets' => 1, 'auth_token' => 'not-public' })
+    sample = @recorder.tick.first
+    assert_equal 123, sample[:pid]
+    assert_equal 456, sample[:udp_pid]
+    assert_equal 100, sample.dig(:udp, :rx_bytes)
+    assert_equal({ 'tx_packets' => 3, 'rx_packets' => 1 }, sample[:quic_observed_packets])
+    @offline = true
+    sample = @recorder.tick.first
+    assert_nil sample[:udp]
+    assert_equal 'quic-carrier-state-unavailable', sample[:udp_error]
   end
 
   def test_udp_failure_does_not_prevent_local_state_evidence

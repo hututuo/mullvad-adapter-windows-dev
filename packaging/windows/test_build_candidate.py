@@ -75,6 +75,9 @@ class BuildSourceProvenanceTests(unittest.TestCase):
         self._write("core/Cargo.lock", "version = 4\n")
         self._write("core/crates/agent/Cargo.toml", "[package]\nname='adapter-agent'\n")
         self._write("core/crates/agent/src/main.rs", "fn main() {}\n")
+        self._write("helpers/quic-carrier/Cargo.toml", "[package]\nname='mullvad-quic-carrier'\n")
+        self._write("helpers/quic-carrier/Cargo.lock", "version = 4\n")
+        self._write("helpers/quic-carrier/src/main.rs", "fn main() {}\n")
         self._write("desktop/package.json", '{"scripts":{"build":"vite build"}}\n')
         self._write("desktop/package-lock.json", '{"lockfileVersion":3}\n')
         self._write("desktop/src/main.ts", "console.log('desktop');\n")
@@ -199,7 +202,7 @@ class BuildSourceProvenanceTests(unittest.TestCase):
         target = self.root / "desktop/build cache"
         result, commands = self._run_build(source_sha, output=output, target=target)
         self.assertEqual(result["source_sha"], source_sha)
-        self.assertEqual([command[0] for command in commands], ["cargo", "npm.cmd"])
+        self.assertEqual([command[0] for command in commands], ["cargo", "cargo", "npm.cmd"])
         self.assertTrue((output / "candidate.json").is_file())
 
     def test_input_changes_during_either_build_stage_fail_before_receipt(self):

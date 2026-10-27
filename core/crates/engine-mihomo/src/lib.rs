@@ -6,6 +6,7 @@ pub mod chain_probe;
 mod device_identity;
 #[cfg(any(test, windows, feature = "windows-api-check"))]
 mod promotion_gate;
+pub mod quic;
 use serde::Serialize;
 use std::{
     io,
@@ -25,6 +26,7 @@ pub enum Transport {
     DirectV4 { endpoint: Ipv4Addr, port: u16 },
     DirectV6 { endpoint: Ipv6Addr, port: u16 },
     Shadowsocks { endpoint: Ipv4Addr, port: u16 },
+    Quic { endpoint: IpAddr, port: u16 },
 }
 /// Caller owns the original secrets and their lifetime; this view does not copy them.
 pub struct Identity<'a> {
@@ -345,6 +347,7 @@ fn route_matches(
             IpAddr::V4(endpoint)
         }
         Transport::DirectV6 { endpoint, .. } => IpAddr::V6(endpoint),
+        Transport::Quic { endpoint, .. } => endpoint,
     };
     destination == endpoint
         && input.egress.alias == alias
@@ -359,6 +362,24 @@ fn route_matches(
 
 pub fn worker(input: &WorkerInput<'_>) -> io::Result<SecretConfig> {
     worker_config(input, None)
+}
+
+/// The QUIC helper owns the physical socket. This config points WireGuard at
+/// its loopback UDP entrance and adds no SS or general proxy alternative.
+pub fn worker_with_quic_route(
+    input: &WorkerInput<'_>,
+    route: &adapter_platform::egress::EgressSnapshot,
+    local: std::net::SocketAddr,
+) -> io::Result<SecretConfig> {
+    if !matches!(input.transport, Transport::Quic { .. })
+        || !local.ip().is_loopback()
+        || local.port() == 0
+        || !route.is_fresh()
+        || !route_matches(input, route.binding(), route.alias(), route.destination())
+    {
+        return Err(invalid());
+    }
+    worker_config_graph(input, None, false, None, Some(local))
 }
 
 /// A fixed loopback carrier capability, borrowed only into private config stdin.
@@ -419,7 +440,13 @@ pub fn worker_chain_config(
     if !matches!(input.transport, Transport::Shadowsocks { .. }) || !chain::public_ipv4(endpoint) {
         return Err(invalid());
     }
-    worker_config_graph(input, Some(carrier), false, Some((upstream, endpoint)))
+    worker_config_graph(
+        input,
+        Some(carrier),
+        false,
+        Some((upstream, endpoint)),
+        None,
+    )
 }
 fn worker_config(
     input: &WorkerInput<'_>,
@@ -432,13 +459,14 @@ fn worker_config_with_output(
     carrier: Option<&Carrier<'_>>,
     diagnostic: bool,
 ) -> io::Result<SecretConfig> {
-    worker_config_graph(input, carrier, diagnostic, None)
+    worker_config_graph(input, carrier, diagnostic, None, None)
 }
 fn worker_config_graph<'a>(
     input: &'a WorkerInput<'a>,
     carrier: Option<&'a Carrier<'a>>,
     diagnostic: bool,
     chain: Option<(&'a chain::UpstreamSs, Ipv4Addr)>,
+    quic_local: Option<std::net::SocketAddr>,
 ) -> io::Result<SecretConfig> {
     if carrier.is_some_and(|carrier| {
         carrier.port < 1024
@@ -483,6 +511,7 @@ fn worker_config_graph<'a>(
         Transport::DirectV4 { endpoint, port } => (IpAddr::V4(endpoint), port, false),
         Transport::DirectV6 { endpoint, port } => (IpAddr::V6(endpoint), port, true),
         Transport::Shadowsocks { endpoint, port } => (IpAddr::V4(endpoint), port, false),
+        Transport::Quic { endpoint, port } => (endpoint, port, endpoint.is_ipv6()),
     };
     if !endpoint_valid(endpoint)
         || port == 0
@@ -505,6 +534,19 @@ fn worker_config_graph<'a>(
     wg.mtu = Some(1280);
     let mut proxies = vec![];
     match input.transport {
+        Transport::Quic { port, .. } => {
+            if port != 443 {
+                return Err(invalid());
+            }
+            let local = quic_local
+                .filter(|a| a.ip().is_loopback() && a.port() != 0)
+                .ok_or_else(invalid)?;
+            if carrier.is_some() || chain.is_some() {
+                return Err(invalid());
+            }
+            wg.server = local.ip().to_string();
+            wg.port = local.port();
+        }
         Transport::DirectV4 { .. } => {
             wg.interface_name = Some(input.egress.alias);
             wg.ip_version = Some("ipv4");
@@ -864,6 +906,39 @@ mod tests {
         assert_eq!(wg["mtu"], 1280);
         assert!(wg.get("interface-name").is_none());
         assert!(wg.get("ip-version").is_none());
+    }
+    #[test]
+    fn quic_configuration_has_only_local_udp_wg_and_requires_owned_helper() {
+        let request = input(Transport::Quic {
+            endpoint: "192.0.2.1".parse().unwrap(),
+            port: 443,
+        });
+        assert!(worker(&request).is_err());
+        let value = parsed(
+            worker_config_graph(
+                &request,
+                None,
+                false,
+                None,
+                Some("127.0.0.1:60000".parse().unwrap()),
+            )
+            .unwrap(),
+        );
+        assert_eq!(value["proxies"].as_array().unwrap().len(), 1);
+        let wg = &value["proxies"][0];
+        assert_eq!(wg["type"], "wireguard");
+        assert_eq!(wg["server"], "127.0.0.1");
+        assert_eq!(wg["port"], 60000);
+        assert!(wg.get("dialer-proxy").is_none());
+        assert!(wg.get("interface-name").is_none());
+        assert!(worker_config_graph(
+            &request,
+            None,
+            false,
+            None,
+            Some("192.0.2.1:60000".parse().unwrap())
+        )
+        .is_err());
     }
     #[test]
     fn static_preshared_key_is_preserved_but_never_counts_as_pq() {

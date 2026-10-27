@@ -109,6 +109,11 @@ fn safe_event(value: &LogEvent) -> bool {
                 | "chain_configured"
                 | "recovery_retry_scheduled"
                 | "recovery_retry_started"
+                | "quic_fallback_started"
+                | "quic_helper_unavailable"
+                | "quic_helper_start_failed"
+                | "quic_connect_failed"
+                | "quic_path_unavailable"
                 | "shadowsocks_inlets_exhausted"
                 | "candidate_cancelled"
                 | "candidate_start_failed"
@@ -566,6 +571,7 @@ enum ReportRecoveryStage {
     SameCity,
     NativeIpv6,
     NativeIpv4,
+    Quic,
     OriginalInlet,
     SameRelayInlets,
 }
@@ -584,6 +590,7 @@ impl ReportRecoveryStage {
             "verifying_original" => Self::VerifyingOriginal,
             "idle" => Self::Idle,
             "chain_fallback" => Self::ChainFallback,
+            "quic" => Self::Quic,
             "native_ipv6" => Self::NativeIpv6,
             "native_ipv4" => Self::NativeIpv4,
             "same_city" => Self::SameCity,
@@ -622,6 +629,7 @@ struct ReportSettings {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ReportTransport {
+    Quic,
     Ss,
     Chain,
     NativeIpv6,
@@ -630,6 +638,7 @@ enum ReportTransport {
 impl ReportTransport {
     fn from_dashboard(kind: Option<&str>) -> Option<Self> {
         Some(match kind? {
+            "wireguard-over-quic" => Self::Quic,
             "wireguard-over-shadowsocks" => Self::Ss,
             "wireguard-over-shadowsocks-chain" => Self::Chain,
             "wireguard-ipv6" => Self::NativeIpv6,
@@ -744,6 +753,7 @@ impl From<&adapter_protocol::catalogue_changes::CatalogueChanges> for ReportCata
             "shadowsocks_port_ranges",
             "port_ranges",
             "other",
+            "quic",
         ];
         Self {
             checked_at: value.checked_at,
@@ -1429,6 +1439,7 @@ mod tests {
             status: "disconnected".into(),
             physical_attachment: "unknown".into(),
             settings: Settings::default(),
+            quic_available: false,
             front_ready: false,
             front_selected: "reject".into(),
             device_draft: None,

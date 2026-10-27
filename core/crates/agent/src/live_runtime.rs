@@ -19,6 +19,8 @@ const MAX_COMPATIBILITY_BYTES: u64 = 1024 * 1024;
 const MAX_NOTICES_BYTES: u64 = 1024 * 1024;
 const MAX_AGENT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_MIHOMO_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_QUIC_BYTES: u64 = 64 * 1024 * 1024;
+const QUIC_COMPONENT: &str = "mullvad-quic-carrier.exe";
 const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PE_HEADER_OFFSET: u64 = 1024 * 1024;
 const PE_AMD64: u16 = 0x8664;
@@ -48,6 +50,7 @@ pub struct VerifiedRuntime {
     pub runtime_dir: PathBuf,
     pub adapter_agent: PathBuf,
     pub mihomo: PathBuf,
+    pub quic_carrier: Option<PathBuf>,
     pub source_sha: String,
     pub version: String,
     pub mihomo_version: String,
@@ -73,6 +76,14 @@ pub fn resolve_process() -> io::Result<VerifiedRuntime> {
     };
     verify_hashed_file(&verified.mihomo, &record, MAX_MIHOMO_BYTES, Some("pe-x64"))?;
     Ok(verified)
+}
+
+/// Optional carrier is launchable only when present in the verified manifest.
+/// Legacy four-component packages continue to work with QUIC unavailable.
+pub fn quic_helper_path() -> io::Result<PathBuf> {
+    resolve_process()?
+        .quic_carrier
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "quic_helper_unavailable"))
 }
 
 /// Resolve runtime files for the current process using immutable build identity.
@@ -147,7 +158,7 @@ pub fn verify_runtime_dir(
     let mut names = BTreeSet::new();
     for entry in fs::read_dir(runtime_dir).map_err(|_| invalid("runtime_directory_unavailable"))? {
         let entry = entry.map_err(|_| invalid("runtime_directory_unreadable"))?;
-        if names.len() >= RUNTIME_ENTRIES.len() {
+        if names.len() >= RUNTIME_ENTRIES.len() + 1 {
             return Err(invalid("runtime_entries_mismatch"));
         }
         let name = entry
@@ -162,7 +173,11 @@ pub fn verify_runtime_dir(
         }
         names.insert(name);
     }
-    let expected_names: BTreeSet<_> = RUNTIME_ENTRIES.into_iter().map(str::to_owned).collect();
+    let mut expected_names: BTreeSet<_> = RUNTIME_ENTRIES.into_iter().map(str::to_owned).collect();
+    let has_quic = names.contains(QUIC_COMPONENT);
+    if has_quic {
+        expected_names.insert(QUIC_COMPONENT.into());
+    }
     if names != expected_names {
         return Err(invalid("runtime_entries_mismatch"));
     }
@@ -172,22 +187,29 @@ pub fn verify_runtime_dir(
     let manifest: Value = serde_json::from_slice(&manifest_bytes)
         .map_err(|_| invalid("runtime_manifest_invalid_json"))?;
     let files = validate_runtime_manifest(&manifest, expected_source_sha, expected_version)?;
+    if files.contains_key(QUIC_COMPONENT) != has_quic {
+        return Err(invalid("runtime_manifest_file_set_mismatch"));
+    }
 
     let mut compatibility_bytes = None;
-    for name in COMPONENTS {
+    for name in COMPONENTS
+        .into_iter()
+        .chain(has_quic.then_some(QUIC_COMPONENT))
+    {
         let record = files
             .get(name)
             .ok_or_else(|| invalid("runtime_manifest_file_missing"))?;
         let max = match name {
             "adapter-agent.exe" => MAX_AGENT_BYTES,
             "mihomo.exe" => MAX_MIHOMO_BYTES,
+            QUIC_COMPONENT => MAX_QUIC_BYTES,
             "mihomo-compatibility.json" => MAX_COMPATIBILITY_BYTES,
             "THIRD_PARTY_NOTICES.txt" => MAX_NOTICES_BYTES,
             _ => return Err(invalid("runtime_manifest_file_unknown")),
         };
         let path = runtime_dir.join(name);
         match name {
-            "adapter-agent.exe" | "mihomo.exe" => {
+            "adapter-agent.exe" | "mihomo.exe" | QUIC_COMPONENT => {
                 verify_hashed_file(&path, record, max, Some("pe-x64"))?;
             }
             "mihomo-compatibility.json" => {
@@ -209,6 +231,7 @@ pub fn verify_runtime_dir(
         runtime_dir: runtime_dir.to_owned(),
         adapter_agent: runtime_dir.join("adapter-agent.exe"),
         mihomo: runtime_dir.join("mihomo.exe"),
+        quic_carrier: has_quic.then(|| runtime_dir.join(QUIC_COMPONENT)),
         source_sha: expected_source_sha.to_ascii_lowercase(),
         version: expected_version.to_owned(),
         mihomo_version,
@@ -255,7 +278,10 @@ fn validate_runtime_manifest(
     }
 
     let files = object(root.get("files"), "runtime_manifest_files_invalid")?;
-    let expected: BTreeSet<_> = COMPONENTS.into_iter().map(str::to_owned).collect();
+    let mut expected: BTreeSet<_> = COMPONENTS.into_iter().map(str::to_owned).collect();
+    if files.contains_key(QUIC_COMPONENT) {
+        expected.insert(QUIC_COMPONENT.into());
+    }
     let actual: BTreeSet<_> = files.keys().cloned().collect();
     if actual != expected {
         return Err(invalid("runtime_manifest_file_set_mismatch"));
@@ -272,6 +298,7 @@ fn validate_runtime_manifest(
         let maximum = match name.as_str() {
             "adapter-agent.exe" => MAX_AGENT_BYTES,
             "mihomo.exe" => MAX_MIHOMO_BYTES,
+            QUIC_COMPONENT => MAX_QUIC_BYTES,
             "mihomo-compatibility.json" => MAX_COMPATIBILITY_BYTES,
             "THIRD_PARTY_NOTICES.txt" => MAX_NOTICES_BYTES,
             _ => return Err(invalid("runtime_manifest_file_unknown")),
@@ -763,6 +790,32 @@ mod tests {
         assert_eq!(result.source_sha, source);
         assert_eq!(result.version, "0.1.0");
         assert_eq!(result.mihomo_version, "v1.19.31");
+        assert!(result.quic_carrier.is_none());
+    }
+
+    #[test]
+    fn optional_quic_requires_manifest_hash_and_x64_pe_and_rejects_tampering() {
+        let temp = TempDir::new();
+        let runtime = temp.0.join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        let source = write_fixture(&runtime);
+        let helper = make_pe();
+        fs::write(runtime.join(QUIC_COMPONENT), &helper).unwrap();
+        assert!(verify_runtime_dir(&runtime, &source, "0.1.0").is_err());
+        let path = runtime.join("manifest.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest["files"][QUIC_COMPONENT] = record(&helper);
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert_eq!(
+            verify_runtime_dir(&runtime, &source, "0.1.0")
+                .unwrap()
+                .quic_carrier,
+            Some(runtime.join(QUIC_COMPONENT))
+        );
+        let mut changed = helper;
+        changed[100] ^= 1;
+        fs::write(runtime.join(QUIC_COMPONENT), changed).unwrap();
+        assert!(verify_runtime_dir(&runtime, &source, "0.1.0").is_err());
     }
 
     #[cfg(debug_assertions)]

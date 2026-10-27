@@ -46,6 +46,18 @@ jobs:
           path: helpers/pq-negotiator/bin/mullvad-pq-negotiator
           if-no-files-found: error
           retention-days: 14
+      - name: Build and check official QUIC carrier
+        run: |
+          export QUIC_CARGO_BIN="$HOME/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo"
+          export RUSTC="$HOME/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustc"
+          scripts/build-quic-helper.sh
+          test "$(lipo -archs helpers/quic-carrier/bin/mullvad-quic-carrier)" = arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quic-component-${{ github.sha }}
+          path: helpers/quic-carrier/bin/mullvad-quic-carrier
+          if-no-files-found: error
+          retention-days: 14
       - name: Swift tests
         working-directory: ui
         run: swift test -c release
@@ -65,6 +77,10 @@ jobs:
         with:
           name: pq-component-${{ github.sha }}
           path: helpers/pq-negotiator/bin
+      - uses: actions/download-artifact@v4
+        with:
+          name: quic-component-${{ github.sha }}
+          path: helpers/quic-carrier/bin
       - name: Build app
         working-directory: ui
         run: swift build -c release --arch arm64
@@ -91,6 +107,13 @@ jobs:
           test "$(lipo -archs "$OUT/payload/helpers/pq-negotiator/bin/mullvad-pq-negotiator")" = arm64
           cp helpers/pq-negotiator/Cargo.toml helpers/pq-negotiator/Cargo.lock helpers/pq-negotiator/LICENSE.md helpers/pq-negotiator/README.md "$OUT/payload/helpers/pq-negotiator/"
           cp -R helpers/pq-negotiator/src "$OUT/payload/helpers/pq-negotiator/"
+          mkdir -p "$OUT/payload/helpers/quic-carrier/bin"
+          cp helpers/quic-carrier/bin/mullvad-quic-carrier "$OUT/payload/helpers/quic-carrier/bin/"
+          chmod 755 "$OUT/payload/helpers/quic-carrier/bin/mullvad-quic-carrier"
+          test "$(lipo -archs "$OUT/payload/helpers/quic-carrier/bin/mullvad-quic-carrier")" = arm64
+          cp helpers/quic-carrier/Cargo.toml helpers/quic-carrier/Cargo.lock helpers/quic-carrier/README.md helpers/quic-carrier/UPSTREAM.json "$OUT/payload/helpers/quic-carrier/"
+          cp -R helpers/quic-carrier/src "$OUT/payload/helpers/quic-carrier/"
+          cp LICENSE THIRD_PARTY.md "$OUT/payload/"
           ARCH="$(lipo -archs "$BIN")"
           test "$ARCH" = arm64
           VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$OUT/payload/Mullvad Adapter.app/Contents/Info.plist")"
@@ -114,7 +137,7 @@ jobs:
           for p in sorted(out.glob('Mullvad-Adapter-macos-*.zip')):
               data = p.read_bytes(); files.append({'name': p.name, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
           version = os.environ.get('CANDIDATE_VERSION', 'unknown')
-          manifest = {'project':os.environ['GITHUB_REPOSITORY'],'version':version + '-candidate', 'source_sha':sha, 'workflow_run':run, 'platform':'macOS', 'architecture':os.environ['CANDIDATE_ARCH'], 'toolchain':{'xcode':'15.4','ruby':'3.3.11','rust':'1.97.1','protoc':'36.2'}, 'pq_helper':{'upstream_sha':'19fb87407f4b81fe15372c2c7f8a20e7ab4eb220','sha256':hashlib.sha256((out/'payload/helpers/pq-negotiator/bin/mullvad-pq-negotiator').read_bytes()).hexdigest()}, 'files':files, 'signed':False, 'tests':'checks job passed before candidate build', 'production_install':'NOT_RUN', 'live_failover':'NOT_RUN', 'clean_install':'NOT_RUN', 'runtime_requirements':'existing configured Ruby 3.0+, Clash Verge/Mihomo, WireGuard template and launchd service; see INSTALL.md'}
+          manifest = {'project':os.environ['GITHUB_REPOSITORY'],'version':version + '-candidate', 'source_sha':sha, 'workflow_run':run, 'platform':'macOS', 'architecture':os.environ['CANDIDATE_ARCH'], 'toolchain':{'xcode':'15.4','ruby':'3.3.11','rust':'1.97.1','protoc':'36.2'}, 'pq_helper':{'upstream_sha':'19fb87407f4b81fe15372c2c7f8a20e7ab4eb220','sha256':hashlib.sha256((out/'payload/helpers/pq-negotiator/bin/mullvad-pq-negotiator').read_bytes()).hexdigest()}, 'quic_helper':{'upstream_sha':'19fb87407f4b81fe15372c2c7f8a20e7ab4eb220','sha256':hashlib.sha256((out/'payload/helpers/quic-carrier/bin/mullvad-quic-carrier').read_bytes()).hexdigest()}, 'files':files, 'signed':False, 'tests':'checks job passed before candidate build', 'production_install':'NOT_RUN', 'live_failover':'NOT_RUN', 'clean_install':'NOT_RUN', 'runtime_requirements':'existing configured Ruby 3.0+, Clash Verge/Mihomo, WireGuard template and launchd service; see INSTALL.md'}
           (out/'manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
           PY
           cp "$OUT"/Mullvad-Adapter-macos-*.zip "$OUT/manifest.json" "$RUNNER_TEMP/"

@@ -118,13 +118,15 @@ pub fn verify(
     let outer_port = match transport {
         Transport::DirectV4 { port, .. }
         | Transport::DirectV6 { port, .. }
-        | Transport::Shadowsocks { port, .. } => port,
+        | Transport::Shadowsocks { port, .. }
+        | Transport::Quic { port, .. } => port,
     };
     let outer_address = match transport {
         Transport::DirectV4 { endpoint, .. } | Transport::Shadowsocks { endpoint, .. } => {
             std::net::IpAddr::V4(endpoint)
         }
         Transport::DirectV6 { endpoint, .. } => std::net::IpAddr::V6(endpoint),
+        Transport::Quic { endpoint, .. } => endpoint,
     };
     let relay_key = relay.public_key().to_owned();
     let worker_runtime = PrivateRuntime::open(&root.path().join("tunnel-check"))?;

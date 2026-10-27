@@ -23,6 +23,7 @@ Encoding.default_internal = Encoding::UTF_8
 
 class MullvadAdapter
   class LocalNetworkInterrupted < StandardError; end
+  class QuicRemoteFailure < StandardError; end
   class LocalProbeTimeout < StandardError
     attr_reader :phase
 
@@ -38,6 +39,108 @@ class MullvadAdapter
       "local probe unavailable: #{phase}"
     end
     alias to_s message
+  end
+
+  # Persistent bounded IPC; status readers only consult the cached counters.
+  # Tokens enter the helper on stdin and are never retained in public state.
+  class QuicCarrier
+    UPSTREAM_SHA = '19fb87407f4b81fe15372c2c7f8a20e7ab4eb220'
+    attr_reader :pid, :local_endpoint
+
+    def initialize(executable, request, current: -> { true })
+      @mutex, @write_mutex = Mutex.new, Mutex.new
+      @latest, @ready, @failure = {}, nil, false
+      Thread.handle_interrupt(Object => :never) do
+        @input, @output, @errors, @child = Open3.popen3([executable, executable])
+        @pid = @child.pid
+        yield self if block_given?
+      end
+      @drain = Thread.new { loop { @errors.readpartial(4096) } rescue nil }
+      @reader = Thread.new do
+        begin
+          while (line = @output.gets("\n", 8193))
+            raise 'invalid carrier output' unless line.end_with?("\n") && line.bytesize <= 8192
+            value = JSON.parse(line)
+            raise 'invalid carrier output' unless value.is_a?(Hash) && value['schema'] == 1
+            @mutex.synchronize do
+              case value['event']
+              when 'ready' then @ready = value
+              when 'stats'
+                keys = %w[tx_packets rx_packets tx_bytes rx_bytes wg_initiations wg_response_packets wg_cookie_packets]
+                raise 'invalid carrier counters' unless keys.all? { |key| value[key].is_a?(Integer) && value[key].between?(0, (1 << 64) - 1) }
+                @latest = value.slice(*keys).merge('captured_at' => Time.now.iso8601)
+              when 'error'
+                @failure = %w[quic_connect_timeout quic_connect_failed carrier_closed].include?(value['code']) ? :remote : true
+              else @failure = true
+              end
+            end
+          end
+        rescue StandardError
+          @mutex.synchronize { @failure = true }
+        end
+      end
+      @input.write(JSON.generate(request) + "\n")
+      @input.flush
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15
+      loop do
+        ready, failed = @mutex.synchronize { [@ready, @failure] }
+        raise LocalProbeUnavailable, 'quic-start-cancelled' unless current.call
+        unless @child.alive?
+          @reader.join(0.2)
+          ready, failed = @mutex.synchronize { [@ready, @failure] }
+        end
+        raise QuicRemoteFailure, 'QUIC carrier connection failed' if failed == :remote
+        raise LocalProbeUnavailable, 'quic-helper-failed' if failed || !@child.alive?
+        if ready
+          binding = ready['binding']
+          local = ready['local_endpoint'].to_s
+          uri = URI.parse('udp://' + local)
+          ip = IPAddr.new(uri.hostname)
+          valid = ready['transport'] == 'quic' && ready['carrier_authenticated'] == true && ready['upstream_sha'] == UPSTREAM_SHA &&
+            ip.loopback? && uri.port && uri.port.between?(1, 65_535) &&
+            binding.is_a?(Hash) && %w[interface_index interface_name remote_endpoint].all? { |key| binding[key] == request[key] } &&
+            (!request['source_address'] || binding['source_address'] == request['source_address'])
+          raise LocalProbeUnavailable, 'quic-ready-invalid' unless valid
+          @local_endpoint = [uri.hostname, uri.port]
+          break
+        end
+        raise LocalProbeTimeout, 'quic-connect' if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+        sleep 0.025
+      end
+    rescue StandardError
+      stop
+      raise
+    end
+
+    def alive?
+      @child&.alive? && !@mutex.synchronize { @failure }
+    end
+
+    def stats
+      @mutex.synchronize { @latest.dup }
+    end
+
+    def request_stats
+      @write_mutex.synchronize { @input.write_nonblock("{\"action\":\"stats\"}\n") } if alive?
+    rescue IOError, SystemCallError
+      nil
+    end
+
+    def stop
+      if @input && !@input.closed?
+        @write_mutex.synchronize { @input.close rescue nil }
+      end
+      if @child&.alive? && !@child.join(2)
+        Process.kill('TERM', @pid) rescue nil
+        unless @child.join(2)
+          Process.kill('KILL', @pid) rescue nil
+          raise LocalProbeUnavailable, 'quic-cleanup' unless @child.join(2)
+        end
+      end
+      [@output, @errors].compact.each { |io| io.close rescue nil }
+      [@reader, @drain].compact.each { |thread| thread.join(1) }
+      true
+    end
   end
   # Local decoder only: never monkey-patch Resolv or allocate globally cached
   # resource classes from response-controlled type/class numbers.
@@ -123,11 +226,11 @@ class MullvadAdapter
   INNER_DNS_BREAKER_THRESHOLD = 2
   INNER_DNS_BREAKER_WINDOW = 180
   INNER_DNS_BREAKER_COOLDOWN = 300
-  TRANSPORT_MODES = %w[ss ipv6 ipv4].freeze
+  TRANSPORT_MODES = %w[ss quic ipv6 ipv4].freeze
   TRANSPORT_PREFERENCES = (%w[auto] + TRANSPORT_MODES).freeze
-  AUTO_TRANSPORT_ORDER = %w[ss ipv6 ipv4].freeze
+  AUTO_TRANSPORT_ORDER = %w[ss quic ipv6 ipv4].freeze
   DEFAULT_TRANSPORT_PREFERENCE = 'ss'
-  BUILD_ID = '20261026-catalogue-changes-rotation-1'
+  BUILD_ID = '20261028-quic-ss-pool-1'
   SOURCE_SHA256 = Digest::SHA256.file(__FILE__).hexdigest
   STATUS_PUBLICATION_INTERVAL = 1.0
   STATUS_PUBLICATION_MAX_AGE = 3.0
@@ -145,6 +248,7 @@ class MullvadAdapter
     profile: nil, # Import a legacy profile only when explicitly configured.
     core: '/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo',
     pq_helper: File.basename(__FILE__) == 'mullvad-local-adapter' ? File.join(__dir__, 'mullvad-pq-negotiator') : File.expand_path('../helpers/pq-negotiator/bin/mullvad-pq-negotiator', __dir__),
+    quic_helper: File.basename(__FILE__) == 'mullvad-local-adapter' ? File.join(__dir__, 'mullvad-quic-carrier') : File.expand_path('../helpers/quic-carrier/bin/mullvad-quic-carrier', __dir__),
     api_host: '127.0.0.1',
     api_port: 17_891,
     front_mixed: 17_890,
@@ -1337,7 +1441,7 @@ class MullvadAdapter
       effective: active, capabilities: {
         multihop: 'mihomo-nested-wireguard', shadowsocks: 'supported',
         post_quantum: File.executable?(@options[:pq_helper]) ? 'single-hop-supported' : 'requires-packaged-pq-helper', daita: 'requires-daita-tunnel-engine',
-        quic: 'requires-obfuscation-helper', udp_over_tcp: 'requires-obfuscation-helper',
+        quic: File.executable?(@options[:quic_helper]) ? 'supported' : 'requires-packaged-quic-helper', udp_over_tcp: 'requires-obfuscation-helper',
         lwo: 'requires-compatible-tunnel-engine'
       } }
   end
@@ -2390,7 +2494,8 @@ class MullvadAdapter
     recovery = nil
     begin
       snapshot = @mutex.synchronize { @workers.transform_values(&:dup) }
-      dead = snapshot.select { |_slot, worker| !process_alive?(worker[:pid]) }
+      snapshot.each_value { |worker| worker[:quic_carrier]&.request_stats }
+      dead = snapshot.select { |_slot, worker| !process_alive?(worker[:pid]) || (worker[:quic_carrier] && !worker[:quic_carrier].alive?) }
       return if dead.empty?
 
       active_slot = @mutex.synchronize { @state[:active_slot] }
@@ -2398,7 +2503,11 @@ class MullvadAdapter
 
       dead.each do |slot, worker|
         public_state = slot_lifecycle_state(slot)
-        @mutex.synchronize { @metrics[:worker_crashes] += 1 }
+        carrier_failure = process_alive?(worker[:pid]) && worker[:quic_carrier]
+        @mutex.synchronize do
+          key = carrier_failure ? :quic_carrier_failures : :worker_crashes
+          @metrics[key] = @metrics[key].to_i + 1
+        end
 
         if slot == active_slot && public_state == 'active'
           active_failure = [slot, worker]
@@ -2416,6 +2525,7 @@ class MullvadAdapter
       return if action_pending?
 
       slot, worker = active_failure
+      carrier_failure = process_alive?(worker[:pid]) && worker[:quic_carrier]
       relay = worker[:relay].to_s
       preference = current_transport_preference
       generation = @mutex.synchronize { @state[:generation] }
@@ -2426,16 +2536,19 @@ class MullvadAdapter
         @state[:relay_liveness] = 'unknown'
         @state[:service_readiness] = 'data_fail'
         @state[:status] = 'data_fail'
-        @state[:last_error] = "active worker-#{slot} exited unexpectedly"
+        @state[:last_error] = carrier_failure ? 'QUIC 承载已中断，正在恢复原路径' : "active worker-#{slot} exited unexpectedly"
         @state[:updated_at] = Time.now.iso8601
-        @metrics[:worker_crash_recoveries] += 1
+        key = carrier_failure ? :quic_carrier_recoveries : :worker_crash_recoveries
+        @metrics[key] = @metrics[key].to_i + 1
         @state[:health][:last_attempt_at] = Time.now.iso8601
       end
       stop_worker(slot)
-      record_routing_event('active-worker-crashed', relay: relay, reason: 'worker-crash-recovery')
+      record_routing_event(carrier_failure ? 'quic-carrier-disconnected' : 'active-worker-crashed', relay: relay,
+                           reason: carrier_failure ? 'health-recovery' : 'worker-crash-recovery')
       recovery = {
         relay: relay,
         preference: preference,
+        reason: carrier_failure ? 'health-recovery' : 'worker-crash-recovery',
         expected_state: { generation: generation, active_slot: nil, active_relay: relay }
       }
     ensure
@@ -2443,7 +2556,7 @@ class MullvadAdapter
     end
 
     return unless recovery
-    run_ordered_recovery(recovery[:relay], reason: 'worker-crash-recovery', expected_state: recovery[:expected_state])
+    run_ordered_recovery(recovery[:relay], reason: recovery[:reason], expected_state: recovery[:expected_state])
   end
 
   def start_control_plane_monitor
@@ -3179,10 +3292,10 @@ class MullvadAdapter
     if protection_profile[:multihop]
       entry = entry_name ? find_relay(entry_name) : multihop_entries(relay, mode).first
       return [] unless entry && entry['hostname'] != relay_name
-      entries = mode == 'ss' ? ss_endpoint_candidates(entry, include_cooling: true) : [nil]
+      entries = mode == 'ss' ? ss_endpoint_candidates(entry, include_cooling: true) : mode == 'quic' ? quic_endpoint_candidates(entry) : [nil]
       return entries.map { |inlet| { entry: entry['hostname'], inlet: inlet } }
     end
-    mode == 'ss' ? ss_endpoint_candidates(relay, include_cooling: true) : [nil]
+    mode == 'ss' ? ss_endpoint_candidates(relay, include_cooling: true) : mode == 'quic' ? quic_endpoint_candidates(relay) : [nil]
   rescue RuntimeError, ArgumentError
     [] # A withdrawn relay/entry must not be resurrected from a saved path.
   end
@@ -3194,12 +3307,11 @@ class MullvadAdapter
     if mode == 'ss'
       ip, port = path.values_at(:endpoint, :endpoint_port)
       return nil unless ipv4?(ip) && port
-      extra = Array(relay['shadowsocks_extra_addr_in'])
-      authorized = extra.include?(ip) && port.to_i == EXTRA_SS_PORT
-      ranges = validated_port_ranges(@metadata.dig('wireguard', 'shadowsocks_port_ranges'), 'shadowsocks port ranges')
-      authorized ||= relay['ipv4_addr_in'] == ip && ranges.any? { |low, high| port.to_i.between?(low, high) }
-      return nil unless authorized
+      return nil unless ss_candidate_authorized?(relay, [ip, port.to_i])
       inlet = [ip, port.to_i, path[:endpoint_kind]]
+    elsif mode == 'quic'
+      inlet = [path[:endpoint], path[:endpoint_port], 'relay-quic']
+      return nil unless quic_candidate_authorized?(relay, inlet)
     end
     candidate = path[:entry_relay] ? { entry: path[:entry_relay], inlet: inlet } : inlet
     { candidate: candidate }
@@ -3240,7 +3352,7 @@ class MullvadAdapter
       path = original_path
       path = @mutex.synchronize { (@workers[current[:active_slot]] || @last_network_path || {}).dup } if !path || path.empty?
       preference = current_transport_preference
-      mode = current_only ? (path[:transport_mode] || (preference == 'auto' ? 'ss' : preference)) : (preference == 'auto' ? 'ss' : preference)
+      mode = (current_only || preference == 'auto') ? (path[:transport_mode] || (preference == 'auto' ? 'ss' : preference)) : preference
       token = @mutex.synchronize do
         @recovery_control_epoch if !@recovery_stopped && request_epoch == @recovery_control_epoch
       end
@@ -3265,30 +3377,39 @@ class MullvadAdapter
       log_event('recovery-round-started', relay: relay_name, reason: reason, policy: 'original-ss-city', budget_seconds: @options[:ordered_recovery_budget])
       inlets = recovery_inlets(relay_name, mode, path)
       original = original_recovery_inlet(path, relay_name, mode)
-      primary = original ? original[:candidate] : (mode == 'ss' ? rotating_ss_recovery_inlets(relay_name, inlets).first : inlets.first)
+      primary = original ? original[:candidate] : (%w[ss quic].include?(mode) ? rotating_ss_recovery_inlets(relay_name, inlets, mode: mode).first : inlets.first)
       has_primary = original || !inlets.empty?
       plan = has_primary ? (original ? [0, 1, 5] : [0]).each_with_index.map { |delay, index| [original ? 'original' : 'current_relay', relay_name, primary, delay, index + 1, 0, mode] } : []
       city_candidates = []
       unless current_only
-        alternate_pool = mode == 'ss' ? rotating_ss_recovery_inlets(relay_name, inlets, excluding: [recovery_inlet_key(primary)], allow_cycle_restart: !!original) : []
+        ss_fallback = preference == 'auto' ? 'ss' : mode
+        ss_inlets = ss_fallback == mode ? inlets : recovery_inlets(relay_name, ss_fallback)
+        alternate_pool = ss_fallback == 'ss' ? rotating_ss_recovery_inlets(relay_name, ss_inlets, excluding: mode == 'ss' ? [recovery_inlet_key(primary)] : [], allow_cycle_restart: !!original) : []
         alternate_pool.first(3).each_with_index do |inlet, index|
-          plan << ['alternate_ss', relay_name, inlet, 0, index + 1, 0, mode]
+          plan << ['alternate_ss', relay_name, inlet, 0, index + 1, 0, ss_fallback]
+        end
+        if preference == 'quic'
+          rotating_ss_recovery_inlets(relay_name, inlets, excluding: [recovery_inlet_key(primary)], mode: 'quic').first(2).each do |inlet|
+            plan << ['transport_fallback', relay_name, inlet, 0, 1, 0, 'quic']
+          end
         end
         city_candidates = recovery_relay_candidates(relay_name, preference: preference).first(4)
         city_candidates.each_with_index do |candidate, index|
-          pool = recovery_inlets(candidate, mode)
-          pool = rotating_ss_recovery_inlets(candidate, pool) if mode == 'ss'
+          pool = recovery_inlets(candidate, ss_fallback)
+          pool = rotating_ss_recovery_inlets(candidate, pool, mode: ss_fallback) if %w[ss quic].include?(ss_fallback)
           pool.first(2).each_with_index do |inlet, inlet_index|
-            plan << ['same_city', candidate, inlet, 0, inlet_index + 1, index + 1, mode]
+            plan << ['same_city', candidate, inlet, 0, inlet_index + 1, index + 1, ss_fallback]
           end
         end
         if preference == 'auto'
-          [relay_name, *city_candidates].uniq.each_with_index do |candidate, city_index|
-            %w[ipv6 ipv4].each do |fallback_mode|
+          %w[quic ipv6 ipv4].each do |fallback_mode|
+            [relay_name, *city_candidates].uniq.each_with_index do |candidate, city_index|
               fallback_relay = Array(@metadata&.dig('wireguard', 'relays')).find { |item| item['hostname'] == candidate && item['active'] == true }
               next unless fallback_relay && transport_supported?(fallback_relay, fallback_mode)
               pool = recovery_inlets(candidate, fallback_mode)
-              pool.first(1).each { |inlet| plan << ['transport_fallback', candidate, inlet, 0, 1, city_index, fallback_mode] }
+              pool.reject! { |inlet| original && mode == fallback_mode && candidate == relay_name && recovery_inlet_key(inlet) == recovery_inlet_key(primary) }
+              pool = rotating_ss_recovery_inlets(candidate, pool, mode: 'quic') if fallback_mode == 'quic'
+              pool.first(fallback_mode == 'quic' ? 2 : 1).each { |inlet| plan << ['transport_fallback', candidate, inlet, 0, 1, city_index, fallback_mode] }
             end
           end
         end
@@ -3297,7 +3418,8 @@ class MullvadAdapter
         break unless recovery_budget_remaining? && network_attempt_current?
         break unless @mutex.synchronize { @state[:generation] == generation }
         next_step = %w[original current_relay].include?(phase) ? '原入口最多 3 次 → 同节点最多 3 个备用 SS → 最多 4 个同城节点；最后才是 IPv6/IPv4' : phase == 'alternate_ss' ? '备用入口仍失败，再试同城节点；每节点最多 2 个入口' : '继续下一个同城候选；不跨城，也不转为直连回落'
-        next_step = 'SS 候选已失败；依次验证同城 IPv6/IPv4，仍无 DIRECT 回落' if phase == 'transport_fallback'
+        next_step = 'SS 候选已失败；依次验证同城 QUIC、IPv6/IPv4，仍无 DIRECT 回落' if phase == 'transport_fallback'
+        next_step = '仅 QUIC 模式：原入口短重试后尝试其他同节点／同城 QUIC 入口' if preference == 'quic'
         fields = { target_relay: relay, inlet_attempt: inlet_index, city_attempt: city_index,
                    next_step: next_step, _retry_mono: delay.positive? ? monotonic_now + delay : nil }
         endpoint = inlet.is_a?(Hash) ? inlet[:inlet] : inlet
@@ -3313,9 +3435,10 @@ class MullvadAdapter
         resuming = reason == 'network-resume' || (manual && local_network_recovery_pending?)
         activation_reason = resuming ? (relay == relay_name ? 'network-resume' : 'network-resume-fallback') : 'ordered-recovery'
         ok = activate(relay, reason: activation_reason, transport_preference: preference, expected_state: expected, attempt_evidence: evidence)
-        if candidate_mode == 'ss' && phase != 'original' && evidence[:attempted] && !evidence[:local_failure] &&
-           (ok || evidence[:relay_failed]) && network_attempt_current?
-          record_ss_recovery_attempt(relay, inlet)
+        measured = evidence[:attempted] && !evidence[:local_failure] && (ok || evidence[:relay_failed])
+        measured ||= candidate_mode == 'quic' && evidence[:quic_remote_failed]
+        if %w[ss quic].include?(candidate_mode) && phase != 'original' && measured && network_attempt_current?
+          record_ss_recovery_attempt(relay, inlet, mode: candidate_mode)
         end
         break unless network_attempt_current?
         if ok
@@ -3966,7 +4089,10 @@ class MullvadAdapter
 
   def catalogue_field_change(key, label, before, after)
     render = lambda do |value|
-      if key == 'public_key'
+      if key == 'features'
+        quic = value.is_a?(Hash) && value['quic']
+        quic.is_a?(Hash) ? "QUIC：#{Array(quic['addr_in']).length} 个入口，域名#{quic['domain'].to_s.empty? ? '未配置' : '已配置'}，认证参数#{quic['token'].to_s.empty? ? '未配置' : '已配置'}" : '未声明 QUIC'
+      elsif key == 'public_key'
         value.to_s.empty? ? '无' : "SHA256:#{Digest::SHA256.hexdigest(value.to_s)[0, 12]}"
       elsif value.nil? then '无'
       elsif value == true then '可用'
@@ -3991,10 +4117,11 @@ class MullvadAdapter
     fresh = Array(current.dig('wireguard', 'relays')).to_h { |row| [row['hostname'], row] }
     added, removed = baseline ? [fresh.keys - prior.keys, prior.keys - fresh.keys] : [[], []]
     labels = { 'ipv4_addr_in' => 'IPv4 直连地址', 'ipv6_addr_in' => 'IPv6 直连地址', 'public_key' => '节点公钥',
-               'active' => '官方可用状态', 'location' => '城市', 'shadowsocks_extra_addr_in' => '专用 SS 地址' }
+               'active' => '官方可用状态', 'location' => '城市', 'shadowsocks_extra_addr_in' => '专用 SS 地址',
+               'features' => 'QUIC 与其他官方能力参数' }
     shared = []
     if baseline
-      { 'shadowsocks_port_ranges' => '主地址 SS 端口范围', 'port_ranges' => 'WG 直连端口范围' }.each do |key, label|
+      { 'shadowsocks_port_ranges' => '官方 SS 端口范围', 'port_ranges' => 'WG 直连端口范围' }.each do |key, label|
         a, b = previous.dig('wireguard', key), current.dig('wireguard', key)
         shared << catalogue_field_change(key, label, a, b) if canonical_catalogue(a, key) != canonical_catalogue(b, key)
       end
@@ -4041,10 +4168,12 @@ class MullvadAdapter
     pool_count = lambda do |payload, row|
       next nil unless payload
       next 0 unless row && row['active'] == true
-      extra = Array(row['shadowsocks_extra_addr_in']).map { |ip| [ip, EXTRA_SS_PORT] }
-      ranges = validated_port_ranges(payload.dig('wireguard', 'shadowsocks_port_ranges'), 'SS ranges')
-      extra_ports = ranges.flat_map { |low, high| (low..high).to_a }.uniq
-      (extra + extra_ports.map { |port| [row['ipv4_addr_in'], port] }).uniq.length
+      extra = Array(row['shadowsocks_extra_addr_in']).select { |ip| ipv4?(ip) }.uniq
+      addresses = [*extra, row['ipv4_addr_in']].select { |ip| ipv4?(ip) }.uniq
+      ranges = normalized_ss_port_ranges(payload)
+      ports = ranges.sum { |low, high| high - low + 1 }
+      fixed_in_range = ranges.any? { |low, high| EXTRA_SS_PORT.between?(low, high) }
+      addresses.length * ports + (fixed_in_range ? 0 : extra.length)
     end
     focus.merge!(ss_before_count: pool_count.call(previous, prior[current_relay]), ss_after_count: pool_count.call(current, fresh[current_relay]))
     ordered = changes.keys.sort_by { |name| [name == current_relay ? 0 : 1, name] }
@@ -4318,6 +4447,8 @@ class MullvadAdapter
     targets['ss'] = { target: extra || ipv4, kind: extra ? 'shadowsocks-extra-ipv4' : 'relay-ipv4' } unless (extra || ipv4).empty?
     targets['ipv4'] = { target: ipv4, kind: 'wireguard-ipv4' } unless ipv4.empty?
     targets['ipv6'] = { target: ipv6, kind: 'wireguard-ipv6' } unless ipv6.empty?
+    endpoint = quic_endpoint_candidates(relay).first
+    targets['quic'] = { target: endpoint.first, kind: 'quic-entry' } if endpoint
     targets
   end
 
@@ -4329,6 +4460,8 @@ class MullvadAdapter
     case mode.to_s
     when 'ss'
       !relay['ipv4_addr_in'].to_s.empty? && !Array(@metadata&.dig('wireguard', 'shadowsocks_port_ranges')).empty?
+    when 'quic'
+      @options && @options[:quic_helper] && File.executable?(@options[:quic_helper]) && !quic_endpoint_candidates(relay).empty?
     when 'ipv6'
       !relay['ipv6_addr_in'].to_s.empty? && wireguard_port_allowed?(DIRECT_IPV6_PORT)
     when 'ipv4'
@@ -4339,9 +4472,43 @@ class MullvadAdapter
   end
 
   def local_transport_available?(mode)
-    local = @mutex.synchronize { @state[:local_network].dup }
+    local = @mutex.owned? ? @state[:local_network].dup : @mutex.synchronize { @state[:local_network].dup }
     return true unless local[:status] == 'available' && local.key?(:address_families)
+    return !(Array(local[:address_families]) & %w[ipv4 ipv6]).empty? if mode.to_s == 'quic'
     Array(local[:address_families]).include?(mode.to_s == 'ipv6' ? 'ipv6' : 'ipv4')
+  end
+
+  def quic_feature(relay)
+    value = relay.dig('features', 'quic')
+    return nil unless value.is_a?(Hash) && value['addr_in'].is_a?(Array) && value['addr_in'].length.between?(1, 128)
+    domain, token = value.values_at('domain', 'token')
+    return nil unless domain.is_a?(String) && domain.bytesize.between?(1, 253) && domain.split('.').all? { |label| label.match?(/\A[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\z/) }
+    return nil unless token.is_a?(String) && token.bytesize.between?(1, 4096) && token.match?(/\A[!-~]+\z/) && !token.start_with?('Bearer')
+    addresses = value['addr_in'].select do |ip|
+      next false unless ip.is_a?(String) && !ip.include?('/')
+      parsed = IPAddr.new(ip)
+      !parsed.to_i.zero? && !IPAddr.new('224.0.0.0/4').include?(parsed) && !IPAddr.new('ff00::/8').include?(parsed)
+    rescue IPAddr::InvalidAddressError
+      false
+    end.uniq
+    return nil if addresses.empty?
+    { addresses: addresses, domain: domain, token: token }
+  end
+
+  def quic_endpoint_candidates(relay)
+    feature = quic_feature(relay)
+    return [] unless feature
+    local = @mutex.owned? ? @state[:local_network].dup : @mutex.synchronize { @state[:local_network].dup }
+    families = local[:status] == 'available' && local.key?(:address_families) ? Array(local[:address_families]) : %w[ipv4 ipv6]
+    feature[:addresses].select { |ip| families.include?(ipv4?(ip) ? 'ipv4' : 'ipv6') }
+      .sort_by { |ip| ipv4?(ip) ? 0 : 1 }.map { |ip| [ip, 443, 'relay-quic'] }
+  end
+
+  def quic_candidate_authorized?(relay, candidate)
+    current = Array(@metadata&.dig('wireguard', 'relays')).find { |row| row['hostname'] == relay['hostname'] && row['active'] == true }
+    return false unless current && current['public_key'] == relay['public_key'] && candidate.is_a?(Array)
+    feature = quic_feature(current)
+    feature && candidate[1] == 443 && feature[:addresses].include?(candidate[0])
   end
 
   def transport_candidates(preference, relay)
@@ -4524,18 +4691,29 @@ class MullvadAdapter
     FileUtils.rm_f(tmp) if defined?(tmp) && File.exist?(tmp)
   end
 
-  # Dedicated SS addresses and primary-address SS ports are simultaneous
-  # official paths, not mutually exclusive. Keep the pool separate from the
-  # small per-transaction selection window.
+  def normalized_ss_port_ranges(metadata = @metadata)
+    raw = metadata&.dig('wireguard', 'shadowsocks_port_ranges')
+    return [] if Array(raw).empty?
+    validated_port_ranges(raw, 'shadowsocks port ranges').sort.each_with_object([]) do |(low, high), merged|
+      if merged.last && low <= merged.last[1] + 1
+        merged.last[1] = [merged.last[1], high].max
+      else
+        merged << [low, high]
+      end
+    end
+  end
+
+  # Every official SS address can use the advertised SS ports. Pool coverage
+  # is independent of the small per-transaction selection/recovery window.
   def ss_catalogue_candidates(relay)
     extra = Array(relay['shadowsocks_extra_addr_in']).select { |ip| ipv4?(ip) }.uniq
     candidates = extra.map { |ip| [ip, EXTRA_SS_PORT, 'extra-ss-ipv4'] }
-    raw_ranges = @metadata&.dig('wireguard', 'shadowsocks_port_ranges')
-    ranges = Array(raw_ranges).empty? ? [] : validated_port_ranges(raw_ranges, 'shadowsocks port ranges')
-    if ipv4?(relay['ipv4_addr_in']) && !ranges.empty?
+    ranges = normalized_ss_port_ranges
+    unless ranges.empty?
       total = ranges.sum { |low, high| high - low + 1 }
       ports = total <= 512 ? ranges.flat_map { |low, high| (low..high).to_a }.uniq : deterministic_port_sample(ranges, relay['hostname'], 512)
-      candidates.concat(ports.map { |port| [relay['ipv4_addr_in'], port, 'relay-ipv4-ss-port'] })
+      candidates.concat(ports.map { |port| [relay['ipv4_addr_in'], port, 'relay-ipv4-ss-port'] }) if ipv4?(relay['ipv4_addr_in'])
+      candidates.concat(extra.flat_map { |ip| ports.map { |port| [ip, port, 'extra-ss-port'] } })
     end
     candidates.uniq { |ip, port, _| [ip, port] }
   end
@@ -4546,6 +4724,8 @@ class MullvadAdapter
     # instead of spending all slots on dedicated addresses on one fixed port.
     primary = result.index { |candidate| candidate[2] == 'relay-ipv4-ss-port' }
     result.insert(1, result.delete_at(primary)) if primary && primary > 1
+    ranged_extra = result.index { |candidate| candidate[2] == 'extra-ss-port' }
+    result.insert(2, result.delete_at(ranged_extra)) if ranged_extra && ranged_extra > 2
     result
   end
 
@@ -4576,15 +4756,17 @@ class MullvadAdapter
     end
     ip, port = candidate
     return false unless ipv4?(ip) && port.is_a?(Integer) && port.between?(1, 65_535)
-    return true if Array(relay['shadowsocks_extra_addr_in']).include?(ip) && port == EXTRA_SS_PORT
-    relay['ipv4_addr_in'] == ip && validated_port_ranges(@metadata.dig('wireguard', 'shadowsocks_port_ranges'), 'shadowsocks port ranges').any? { |low, high| port.between?(low, high) }
+    extra = Array(relay['shadowsocks_extra_addr_in']).include?(ip)
+    return true if extra && port == EXTRA_SS_PORT
+    (extra || relay['ipv4_addr_in'] == ip) && normalized_ss_port_ranges.any? { |low, high| port.between?(low, high) }
   rescue RuntimeError
     false
   end
 
   # Original short retries deliberately repeat one exact path. Only the
   # fallback queue rotates; planning never consumes an unstarted candidate.
-  def rotating_ss_recovery_inlets(relay_name, inlets, excluding: [], allow_cycle_restart: true)
+  def rotating_ss_recovery_inlets(relay_name, inlets, excluding: [], allow_cycle_restart: true, mode: 'ss')
+    window_name = mode == 'quic' ? "quic:#{relay_name}" : relay_name
     pool = inlets.uniq { |inlet| recovery_inlet_key(inlet) }
     keys = pool.map { |inlet| recovery_inlet_key(inlet) }
     fingerprint = Digest::SHA256.hexdigest(JSON.generate(keys.sort_by { |key| key.map(&:to_s) }))
@@ -4592,9 +4774,9 @@ class MullvadAdapter
     peers = Array(@metadata&.dig('wireguard', 'relays')).select { |relay| peer_names.include?(relay['hostname']) }
     peer_fingerprint = Digest::SHA256.hexdigest(JSON.generate(peers.map { |relay| [relay['hostname'], relay['public_key'] || relay['pubkey']] }.sort))
     @ss_endpoint_mutex.synchronize do
-      window = @ss_recovery_windows[relay_name]
+      window = @ss_recovery_windows[window_name]
       if !window || window[:peer_fingerprint] != peer_fingerprint
-        window = @ss_recovery_windows[relay_name] = { fingerprint: fingerprint, peer_fingerprint: peer_fingerprint, seen: [] }
+        window = @ss_recovery_windows[window_name] = { fingerprint: fingerprint, peer_fingerprint: peer_fingerprint, seen: [] }
       elsif window[:fingerprint] != fingerprint
         # An added/removed inlet does not erase attempts against unchanged ones.
         window[:seen] &= keys
@@ -4612,9 +4794,10 @@ class MullvadAdapter
     end
   end
 
-  def record_ss_recovery_attempt(relay_name, inlet)
+  def record_ss_recovery_attempt(relay_name, inlet, mode: 'ss')
+    window_name = mode == 'quic' ? "quic:#{relay_name}" : relay_name
     changed = @ss_endpoint_mutex.synchronize do
-      window = @ss_recovery_windows[relay_name]
+      window = @ss_recovery_windows[window_name]
       window[:seen] |= [recovery_inlet_key(inlet)] if window
     end
     persist_ss_recovery_windows if changed
@@ -4634,7 +4817,7 @@ class MullvadAdapter
       next unless %w[fingerprint peer_fingerprint].all? { |key| window[key].is_a?(String) && window[key].match?(/\A[0-9a-f]{64}\z/) }
       seen = Array(window['seen']).first(4096).select do |key|
         key.is_a?(Array) && key.length == 3 && (key[0].nil? || (key[0].is_a?(String) && key[0].bytesize <= 128)) &&
-          ipv4?(key[1]) && key[2].is_a?(Integer) && key[2].between?(1, 65_535)
+          (ipv4?(key[1]) || (name.start_with?('quic:') && (IPAddr.new(key[1]).ipv6? rescue false))) && key[2].is_a?(Integer) && key[2].between?(1, 65_535)
       end
       [name, { fingerprint: window['fingerprint'], peer_fingerprint: window['peer_fingerprint'], seen: seen.uniq }]
     end.to_h
@@ -4782,7 +4965,7 @@ class MullvadAdapter
     return [pinned[:candidate]] if pinned && pinned[:relay] == relay['hostname'] && pinned[:mode] == mode
     original = Thread.current[:adapter_resume_path]
     if original && original[:relay] == relay['hostname'] && original[:transport_mode] == mode
-      inlet = [original[:endpoint], original[:endpoint_port], original[:endpoint_kind]] if mode == 'ss' && original[:endpoint_port]
+      inlet = [original[:endpoint], original[:endpoint_port], original[:endpoint_kind]] if %w[ss quic].include?(mode) && original[:endpoint_port]
       if protection_profile[:multihop] && original[:entry_relay]
         return [{ entry: original[:entry_relay], inlet: inlet }]
       end
@@ -4791,11 +4974,11 @@ class MullvadAdapter
     if protection_profile[:multihop]
       entries = multihop_entries(relay, mode)
       return entries.flat_map do |entry|
-        inlets = mode.to_s == 'ss' ? ss_endpoint_candidates(entry).first(2) : [nil]
+        inlets = mode.to_s == 'ss' ? ss_endpoint_candidates(entry).first(2) : mode.to_s == 'quic' ? quic_endpoint_candidates(entry).first(2) : [nil]
         inlets.map { |inlet| { entry: entry['hostname'], inlet: inlet } }
       end
     end
-    mode.to_s == 'ss' ? ss_endpoint_candidates(relay).first(3) : [nil]
+    mode.to_s == 'ss' ? ss_endpoint_candidates(relay).first(3) : mode.to_s == 'quic' ? quic_endpoint_candidates(relay).first(2) : [nil]
   end
 
   def record_ss_endpoint_canary(relay_name, mode, worker_info, canary)
@@ -5376,6 +5559,10 @@ class MullvadAdapter
   rescue LocalNetworkInterrupted
     log_event('activation-paused-local-network', relay: relay_name, reason: reason)
     false
+  rescue QuicRemoteFailure
+    attempt_evidence[:quic_remote_failed] = true if attempt_evidence
+    log_probe_event('quic-carrier-unavailable', relay: relay_name, phase: 'quic-connect')
+    false
   rescue LocalProbeTimeout => error
     attempt_evidence[:local_failure] = error.phase if attempt_evidence
     log_event('activation-local-deferred', relay: relay_name, phase: error.phase)
@@ -5721,7 +5908,11 @@ class MullvadAdapter
 
     ensure_pq_available!(protection_profile)
     spec = @slot_config.fetch(slot)
-    config, path_info = worker_tunnel_config(spec, relay, mode, ss_candidate)
+    config, path_info = if mode == 'quic'
+      worker_tunnel_config(spec, relay, mode, ss_candidate, quic_local: ['127.0.0.1', 1])
+    else
+      worker_tunnel_config(spec, relay, mode, ss_candidate)
+    end
 
     dir = slot_dir(slot)
     FileUtils.rm_f(Dir.glob(File.join(dir, '*')).select { |p| File.file?(p) })
@@ -5746,6 +5937,39 @@ class MullvadAdapter
     worker_ready = cleanup_attempted = false
     phase = 'bootstrap-config'
     begin
+      if mode == 'quic'
+        phase = 'quic-carrier'
+        entry = path_info[:entry_relay] ? find_relay(path_info[:entry_relay]) : relay
+        feature = quic_feature(entry)
+        raise LocalProbeUnavailable, 'quic-catalogue-withdrawn' unless feature
+        interface = path_info[:interface]
+        endpoint = path_info[:endpoint]
+        index = Socket.getifaddrs.find { |item| item.name == interface }&.ifindex
+        source = Socket.getifaddrs.find do |item|
+          next false unless item.name == interface && item.addr&.ip?
+          next false unless item.addr.ipv4? == ipv4?(endpoint)
+          address = IPAddr.new(item.addr.ip_address.split('%').first)
+          !address.loopback? && !address.to_i.zero? && !IPAddr.new('fe80::/10').include?(address) && !IPAddr.new('169.254.0.0/16').include?(address)
+        end&.addr&.ip_address
+        raise LocalProbeUnavailable, 'quic-source-unavailable' unless index && source
+        remote = ipv4?(endpoint) ? "#{endpoint}:443" : "[#{endpoint}]:443"
+        request = { 'schema' => 1, 'remote_endpoint' => remote, 'server_hostname' => feature[:domain],
+                    'auth_token' => feature[:token], 'target_endpoint' => '127.0.0.1:51820',
+                    'interface_index' => index, 'interface_name' => interface, 'source_address' => source, 'mtu' => 1280 }
+        carrier = QuicCarrier.new(@options[:quic_helper], request, current: -> { network_attempt_current? && !@stop_requested }) do |owned|
+          info[:quic_carrier] = owned
+          @mutex.synchronize do
+            @workers[slot] = info.dup
+            @worker_state_tokens[slot] = info[:instance_token]
+            @state[:workers][slot] = public_worker_state(info).merge(state: 'starting')
+          end
+        end
+        raise LocalProbeUnavailable, 'quic-route-changed' unless physical_interface(endpoint) == interface && network_attempt_current?
+        proxy = config['proxies'].find { |item| item['name'] == (protection_profile[:multihop] ? 'WG-ENTRY' : 'MULLVAD') }
+        proxy['server'], proxy['port'] = carrier.local_endpoint
+        info[:quic_helper_sha256] = Digest::SHA256.file(@options[:quic_helper]).hexdigest
+        phase = 'bootstrap-config'
+      end
       write_json_private(path, config, secret: true)
       validate_runtime_config(path, dir) if @options[:validate_configs]
       phase = 'bootstrap-controller'
@@ -5754,7 +5978,12 @@ class MullvadAdapter
         log_event('pq-negotiation-started', relay: relay['hostname'], slot: slot)
         phase = 'pq-config-service'
         secrets = negotiate_pq(spec[:mixed])
-        stop_worker(slot)
+        if info[:quic_carrier]
+          stop_pid(pid)
+          @mutex.synchronize { @workers[slot][:pid] = nil if @workers[slot] }
+        else
+          stop_worker(slot)
+        end
         pid = nil
         wireguard = config['proxies'].find { |proxy| proxy['name'] == 'MULLVAD' }
         wireguard['private-key'] = secrets.fetch('ephemeral_private_key')
@@ -5784,7 +6013,7 @@ class MullvadAdapter
       @mutex.synchronize { @metrics[:worker_start_failures] += 1 }
       log_event('worker-start-failed', relay: relay['hostname'], slot: slot,
                 post_quantum: !!protection_profile[:post_quantum], phase: phase, error_class: error.class.name)
-      raise error if error.is_a?(LocalProbeTimeout)
+      raise error if error.is_a?(LocalProbeTimeout) || error.is_a?(QuicRemoteFailure)
       raise 'protected worker could not start; no unprotected fallback was selected'
     end
 
@@ -5886,7 +6115,7 @@ class MullvadAdapter
     }
   end
 
-  def worker_tunnel_config(spec, relay, mode, ss_candidate)
+  def worker_tunnel_config(spec, relay, mode, ss_candidate, quic_local: nil)
     exit_relay = relay
     profile = protection_profile
     if profile[:multihop]
@@ -5951,6 +6180,14 @@ class MullvadAdapter
         'mtu' => 1280
       )
       transport_name = 'wireguard-over-shadowsocks'
+    when 'quic'
+      endpoint, port, endpoint_kind = ss_candidate || quic_endpoint_candidates(relay).first
+      raise LocalProbeUnavailable, 'quic-catalogue-withdrawn' unless quic_candidate_authorized?(relay, [endpoint, port])
+      raise LocalProbeUnavailable, 'quic-helper-unavailable' unless File.executable?(@options[:quic_helper])
+      raise LocalProbeUnavailable, 'quic-carrier-not-ready' unless quic_local && IPAddr.new(quic_local.first).loopback? && quic_local[1].to_i.between?(1, 65_535)
+      outer_interface = physical_interface(endpoint)
+      wg.merge!('server' => quic_local.first, 'port' => quic_local[1], 'mtu' => 1280)
+      transport_name = 'wireguard-over-quic'
     when 'ipv4'
       endpoint = relay.fetch('ipv4_addr_in')
       port = ensure_wireguard_port_allowed!(DIRECT_IPV4_PORT)
@@ -6008,7 +6245,7 @@ class MullvadAdapter
       'allow-lan' => false,
       'mode' => 'rule',
       'log-level' => 'warning',
-      'ipv6' => mode == 'ipv6',
+      'ipv6' => mode == 'ipv6' || (mode == 'quic' && quic_local && !ipv4?(quic_local.first)),
       'sniffer' => https_destination_recovery_config,
       'tun' => { 'enable' => false },
       'dns' => { 'enable' => false },
@@ -6533,7 +6770,8 @@ class MullvadAdapter
 
     begin
       stop_pid(info[:pid])
-    rescue SystemCallError => error
+      info[:quic_carrier]&.stop
+    rescue SystemCallError, LocalProbeTimeout => error
       log_probe_event('worker-cleanup-deferred', slot: slot, relay: info[:relay], error_class: error.class.name)
       raise LocalProbeUnavailable, 'worker-cleanup'
     end
@@ -6561,6 +6799,9 @@ class MullvadAdapter
       entry_city: info[:entry_city],
       post_quantum: !!info[:post_quantum],
       pq_helper_sha256: info[:pq_helper_sha256],
+      quic_helper_sha256: info[:quic_helper_sha256],
+      quic_carrier_pid: info[:quic_carrier]&.pid,
+      quic_observed_packets: info[:quic_carrier]&.stats,
       daita: false,
       transport: info[:transport],
       transport_mode: info[:transport_mode],
@@ -6914,6 +7155,7 @@ if $PROGRAM_NAME == __FILE__
     parser.on('--state-dir PATH') { |v| options[:state_dir] = File.expand_path(v) }
     parser.on('--profile PATH') { |v| options[:profile] = File.expand_path(v) }
     parser.on('--core PATH') { |v| options[:core] = File.expand_path(v) }
+    parser.on('--quic-helper PATH') { |v| options[:quic_helper] = File.expand_path(v) }
     parser.on('--api-port PORT', Integer) { |v| options[:api_port] = v }
     parser.on('--front-port PORT', Integer) { |v| options[:front_mixed] = v }
     parser.on('--front-controller-port PORT', Integer) { |v| options[:front_controller] = v }

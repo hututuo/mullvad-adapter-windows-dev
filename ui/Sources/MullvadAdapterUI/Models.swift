@@ -3,6 +3,7 @@ import Foundation
 enum TransportPreference: String, CaseIterable, Identifiable, Hashable {
     case auto
     case ss
+    case quic
     case ipv6
     case ipv4
 
@@ -12,6 +13,7 @@ enum TransportPreference: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .auto: return "自动（优先近期可用链路）"
         case .ss: return "SS 混淆"
+        case .quic: return "QUIC 混淆"
         case .ipv6: return "IPv6 直连"
         case .ipv4: return "IPv4 直连"
         }
@@ -21,6 +23,7 @@ enum TransportPreference: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .auto: return "自动"
         case .ss: return "SS"
+        case .quic: return "QUIC"
         case .ipv6: return "IPv6"
         case .ipv4: return "IPv4"
         }
@@ -705,6 +708,7 @@ struct RelayPingTarget: Decodable, Hashable, Sendable {
 
 struct RelayPingTargets: Decodable, Hashable, Sendable {
     let ss: RelayPingTarget?
+    let quic: RelayPingTarget?
     let ipv4: RelayPingTarget?
     let ipv6: RelayPingTarget?
 
@@ -713,6 +717,7 @@ struct RelayPingTargets: Decodable, Hashable, Sendable {
         case "ipv6": return ipv6
         case "ipv4": return ipv4
         case "ss": return ss ?? ipv4
+        case "quic": return quic
         default: return ss ?? ipv6 ?? ipv4
         }
     }

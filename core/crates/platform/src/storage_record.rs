@@ -19,6 +19,7 @@ pub enum RecordKind {
     ChainProxy = 8,
     RecoveryHistory = 9,
     VerifiedChain = 10,
+    QuicHistory = 11,
 }
 impl RecordKind {
     pub fn filename(self) -> &'static str {
@@ -33,6 +34,7 @@ impl RecordKind {
             Self::ChainProxy => "chain-proxy.dpapi",
             Self::RecoveryHistory => "recovery-history.dpapi",
             Self::VerifiedChain => "verified-chain.dpapi",
+            Self::QuicHistory => "quic-history.dpapi",
         }
     }
 }
@@ -150,6 +152,7 @@ mod tests {
             RecordKind::ChainProxy,
             RecordKind::RecoveryHistory,
             RecordKind::VerifiedChain,
+            RecordKind::QuicHistory,
         ] {
             let valid = encode(kind, b"value").unwrap();
             let borrowed = decode(kind, valid.expose()).unwrap();
