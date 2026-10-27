@@ -1,6 +1,7 @@
 """Pinned Tauri NSIS payload provenance contracts, without Windows tools."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -146,6 +147,7 @@ class BuildSourceProvenanceTests(unittest.TestCase):
             mock.patch.object(build_candidate.sys, "platform", "win32"),
             mock.patch.object(build_candidate.shutil, "which", return_value="npm.cmd"),
             mock.patch.object(build_candidate, "stage_runtime", side_effect=fake_stage_runtime),
+            mock.patch.object(build_candidate, "require_upstream_long_paths"),
             mock.patch.object(build_candidate, "_validate_amd64_pe"),
         ):
             args = self._args(source_sha)
@@ -270,6 +272,28 @@ class BuildSourceProvenanceTests(unittest.TestCase):
                         build_candidate.build(args, source_root=self.root, command_runner=run_command)
                 self.assertTrue(commands)
                 self.assertFalse((Path(args.output) / "candidate.json").exists())
+
+
+
+
+class UpstreamLongPathTests(unittest.TestCase):
+    def test_requires_real_global_file_not_command_override_and_never_mutates_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "host.gitconfig"
+            config.write_text("[core]\nlongpaths = false\n")
+            with mock.patch.dict(os.environ, {
+                "GIT_CONFIG_GLOBAL": str(config), "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.longpaths", "GIT_CONFIG_VALUE_0": "true",
+            }):
+                before = config.read_bytes()
+                with self.assertRaisesRegex(ValueError, "no host setting was changed"):
+                    build_candidate.require_upstream_long_paths(root)
+                self.assertEqual(before, config.read_bytes())
+                config.write_text("[core]\nlongpaths = true\n")
+                before = config.read_bytes()
+                build_candidate.require_upstream_long_paths(root)
+                self.assertEqual(before, config.read_bytes())
 
 
 if __name__ == "__main__":

@@ -33,6 +33,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
+      # Cargo still checks out with libgit2 after a CLI fetch, and libgit2 does
+      # not read the per-command GIT_CONFIG_COUNT override used above.
+      - if: runner.os == 'Windows'
+        name: Enable long paths on disposable Windows runner
+        run: git config --global core.longpaths true
       - run: cargo test --manifest-path helpers/quic-carrier/Cargo.toml --locked
   core-checks:
     env:
@@ -147,6 +152,8 @@ jobs:
           toolchain: 1.97.1
       - run: npm ci --ignore-scripts
         working-directory: desktop
+      - name: Enable upstream long paths on disposable runner
+        run: git config --global core.longpaths true
       - name: Assemble full unsigned installer
         shell: pwsh
         run: >-

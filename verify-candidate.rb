@@ -45,7 +45,14 @@ baseline = production_status
 assert_unused_relay!(options[:relay])
 FileUtils.mkdir_p(options[:output], mode: 0o700)
 source_state = MullvadAdapter::DEFAULTS[:state_dir]
-%w[wireguard-template.json relays-cache.json ss-endpoints.json].each do |name|
+# Respect the selected saved identity. Copying the untouched legacy template
+# would test a different key after an explicit profile switch. Export only this
+# selected template, never the complete account/profile store.
+identity_reader = MullvadAdapter.new(state_dir: source_state)
+identity_reader.send(:load_template)
+identity_reader.send(:write_private_identity_once, File.join(options[:output], 'wireguard-template.json'),
+                     JSON.generate(identity_reader.instance_variable_get(:@template)))
+%w[relays-cache.json ss-endpoints.json].each do |name|
   source = File.join(source_state, name)
   next unless File.file?(source)
   FileUtils.cp(source, File.join(options[:output], name))

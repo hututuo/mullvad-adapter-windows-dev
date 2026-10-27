@@ -45,3 +45,5 @@ installed NSIS payload. The pinned bundler changes `__TAURI_BUNDLE_TYPE_VAR_UNK`
 to the equal-length `__TAURI_BUNDLE_TYPE_VAR_NSS` before packaging, then restores
 the original file. The builder refuses an absent or ambiguous marker instead of
 silently predicting a hash. See the pinned [bundler implementation](https://github.com/tauri-apps/tauri/blob/tauri-bundler-v2.10.1/crates/tauri-bundler/src/bundle.rs).
+
+QUIC builds fetch the pinned official repository, which includes long paths. A Windows build host must explicitly enable `git config --global core.longpaths true`; the builder only checks and never changes this setting. CI configures it on its disposable runner. Git CLI fetch with a process-only config override is insufficient for Cargo/libgit2 checkout. These are developer requirements; installed users need neither Git nor a compiler.

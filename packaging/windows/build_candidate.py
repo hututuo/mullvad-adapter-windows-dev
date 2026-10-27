@@ -279,6 +279,19 @@ def packaged_desktop_record(path: Path) -> dict:
             "sha256": hashlib.sha256(payload).hexdigest(), "bundle_type": "nsis"}
 
 
+def require_upstream_long_paths(source: Path) -> None:
+    # A CLI fetch alone does not change Cargo's libgit2 checkout settings. Only
+    # inspect the host configuration; never rewrite a developer's global file.
+    result = subprocess.run(
+        ["git", "config", "--global", "--bool", "--get", "core.longpaths"],
+        cwd=source, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        check=False,
+    )
+    if result.returncode != 0 or result.stdout.strip() != "true":
+        raise ValueError("Windows build host requires git config --global core.longpaths true "
+                         "for the pinned official QUIC repository; no host setting was changed")
+
+
 def build(
     args: argparse.Namespace,
     *,
@@ -297,6 +310,8 @@ def build(
     version = tomllib.loads((source / "core/Cargo.toml").read_text())["workspace"]["package"]["version"]
     if json.loads((desktop / "src-tauri/tauri.conf.json").read_text())["version"] != version:
         raise ValueError("Agent and desktop versions differ")
+
+    require_upstream_long_paths(source)
 
     # Never replace a prior candidate or erase a user's directory. Source
     # verification completes first so invalid provenance has no output side effect.
