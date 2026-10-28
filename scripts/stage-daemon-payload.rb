@@ -15,6 +15,9 @@ abort 'no daemon regression tests found' if tests.empty?
 
 files = [
   'daemon/mullvad_adapter.rb',
+  'daemon/account_api_routes.rb',
+  'daemon/account_lifecycle.rb',
+  'daemon/connection_control.rb',
   'daemon/import-local-identities.rb',
   'daemon/dns_registry_test_support.rb',
   'daemon/minitest_dependencies.rb',

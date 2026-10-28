@@ -34,6 +34,14 @@ struct AccountSnapshot: Decodable {
     var savedIdentities: [SavedLocalIdentity]? = nil
     var activeIdentityID: String? = nil
     var identitySwitchSupported: Bool? = nil
+    var mutationNotice: String? = nil
+    var profileWarning: String? = nil
+    var identityStoreError: String? = nil
+    var freshness: AccountFreshness? = nil
+    var managementBusy: Bool? = nil
+    var identitySaveSupported: Bool? = nil
+    var devicesLimit: Int? = nil
+    var devicesFull: Bool? = nil
     let signedIn: Bool
     let verified: Bool
     let accountSuffix: String?
@@ -62,6 +70,10 @@ struct AccountSnapshot: Decodable {
     }
     enum CodingKeys: String, CodingKey {
         case savedIdentities = "saved_identities", activeIdentityID = "active_identity_id", identitySwitchSupported = "identity_switch_supported"
+        case mutationNotice = "mutation_notice"
+        case profileWarning = "profile_warning", identityStoreError = "identity_store_error"
+        case freshness
+        case managementBusy = "management_busy", identitySaveSupported = "identity_save_supported", devicesLimit = "devices_limit", devicesFull = "devices_full"
         case signedIn = "signed_in", verified, accountSuffix = "account_suffix", expiry
         case checkedAt = "checked_at", publicKey = "public_key", deviceMatch = "device_match", devices
         case accountFingerprint = "account_fingerprint"
@@ -78,10 +90,13 @@ struct SavedLocalIdentity: Decodable, Identifiable, Equatable {
     let nameSource: String?
     let publicKey: String
     let current: Bool
+    var managing: Bool? = nil
+    var accountFingerprint: String? = nil
     let registrationStatus: String?
     var title: String { deviceName ?? "旧身份 · 设备名待核实" }
     enum CodingKeys: String, CodingKey {
-        case id, current, accountSuffix = "account_suffix", deviceName = "device_name", nameSource = "name_source"
+        case accountFingerprint = "account_fingerprint"
+        case id, current, managing, accountSuffix = "account_suffix", deviceName = "device_name", nameSource = "name_source"
         case publicKey = "public_key", registrationStatus = "registration_status"
     }
 }
@@ -115,8 +130,13 @@ final class AccountViewModel: ObservableObject {
     init(client: AdapterClient, draftStore: any AccountDraftPersisting = AccountDraftStore()) { self.client = client; self.draftStore = draftStore }
 
     func load() async {
-        await perform { try await self.client.account() }
-        if !hasError, snapshot?.signedIn == true, snapshot?.verified == false { await refresh() }
+        await perform(readbackOnFailure: false) { try await self.client.account() }
+        if !hasError, snapshot?.signedIn == true, snapshot?.managementBusy != true { await refresh() }
+    }
+    func readLocalSnapshot() async {
+        guard !busy else { return }
+        do { try accept(try await client.account()) }
+        catch { /* Existing status and explicit operation errors stay visible. */ }
     }
     func login(_ number: String) async {
         await perform(success: "账号已验证；本机身份以公钥匹配结果为准。") {
@@ -239,6 +259,18 @@ final class AccountViewModel: ObservableObject {
     func refresh() async {
         await perform(success: "已从 Mullvad 刷新账号与设备列表。") { try await self.client.account("refresh") }
     }
+    func manageIdentity(_ identity: SavedLocalIdentity) async {
+        await perform(success: "已刷新这个账号的官方设备列表；当前隧道身份没有切换。") {
+            try await self.client.account("identities/manage", payload: ["id": identity.id])
+        }
+    }
+    func saveDraft() async {
+        guard !busy, let snapshot, snapshot.identitySaveSupported == true,
+              let draft = deviceDraft, draft.stage == .created else { return }
+        await perform(success: "新设备与密钥已保存在本机；点击启用身份后才会更换连接。") {
+            try await self.client.saveIdentity(draft: draft)
+        }
+    }
     func switchIdentity(_ identity: SavedLocalIdentity) async {
         guard !busy, !identity.current, snapshot?.identitySwitchSupported == true else { return }
         hideKey(); busy = true; hasError = false
@@ -275,10 +307,10 @@ final class AccountViewModel: ObservableObject {
             try await self.client.account("logout", payload: ["account_fingerprint": self.snapshot?.accountFingerprint ?? ""])
         }
     }
-    func remove(_ device: AccountDevice) async {
-        guard !device.current else { return }
+    func remove(_ device: AccountDevice, allowCurrentIfStopped: Bool = false) async {
+        guard !device.current || allowCurrentIfStopped else { return }
         await perform(success: "设备已撤销，已刷新官方列表。") {
-            try await self.client.account("devices/remove", payload: ["device_id": device.id, "confirm": true, "account_fingerprint": self.snapshot?.accountFingerprint ?? ""])
+            try await self.client.account("devices/remove", payload: ["device_id": device.id, "confirm": true, "allow_current_if_stopped": allowCurrentIfStopped, "account_fingerprint": self.snapshot?.accountFingerprint ?? ""])
         }
     }
     func voucher(_ code: String) async {
@@ -323,7 +355,7 @@ final class AccountViewModel: ObservableObject {
             deviceDraft = draft
         }
     }
-    private func perform(success: String? = nil, _ operation: () async throws -> AccountSnapshot) async {
+    private func perform(success: String? = nil, readbackOnFailure: Bool = true, _ operation: () async throws -> AccountSnapshot) async {
         guard !busy else { return }
         hideKey()
         busy = true
@@ -333,7 +365,12 @@ final class AccountViewModel: ObservableObject {
         do {
             try accept(try await operation())
             try await restoreAbandonedDraftIfConfirmed()
-            message = success ?? (snapshot?.signedIn == true ? "已读取本地登录；可刷新官方状态。" : "请输入 Mullvad 的 16 位账号。")
-        } catch { message = error.localizedDescription; hasError = true }
+            message = snapshot?.mutationNotice ?? success ?? (snapshot?.signedIn == true ? "已读取本地登录；可刷新官方状态。" : "请输入 Mullvad 的 16 位账号。")
+        } catch {
+            let failure = error.localizedDescription
+            // Read local status after failure, never replay a remote mutation.
+            if readbackOnFailure, let cached = try? await client.account() { try? accept(cached) }
+            message = failure; hasError = true
+        }
     }
 }

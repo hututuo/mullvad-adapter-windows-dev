@@ -149,6 +149,37 @@ class MullvadStatusPublicationTest < Minitest::Test
     end
   end
 
+  def test_published_status_exposes_account_and_persisted_stop_controls
+    @adapter.instance_variable_set(:@account_number, '1234567890123456')
+    @adapter.instance_variable_get(:@account_observations)['1234567890123456'] = {
+      checked_at: Time.now.iso8601, last_attempt_at: Time.now.iso8601
+    }
+    @adapter.instance_variable_set(:@connections_stopped, true)
+    assert @adapter.send(:publish_status_snapshot)
+    code, _headers, body = request_status
+    assert_equal 200, code
+    assert_equal 'current', body.dig('account_health', 'state')
+    assert_equal true, body.dig('connection_control', 'stopped')
+    assert_equal 'stopped', body['service_readiness']
+    refute_includes publication.fetch(:json), '1234567890123456'
+  end
+
+  def test_busy_account_observation_does_not_block_status_or_renew_old_snapshot
+    assert @adapter.send(:publish_status_snapshot)
+    previous = publication
+    lock = @adapter.instance_variable_get(:@account_info_mutex)
+    lock.lock
+    begin
+      assert_equal false, bounded_call { @adapter.send(:publish_status_snapshot) }
+      assert_same previous, publication
+      code, _headers, body = bounded_call { request_status }
+      assert_equal 200, code
+      assert body.key?('account_health')
+    ensure
+      lock.unlock
+    end
+  end
+
   def test_ticking_publisher_reports_stale_lock_contention_without_renewing_age_or_flooding
     stale = publication.merge(captured_at: Process.clock_gettime(Process::CLOCK_MONOTONIC) - 4).freeze
     @adapter.instance_variable_set(:@status_publication, stale)

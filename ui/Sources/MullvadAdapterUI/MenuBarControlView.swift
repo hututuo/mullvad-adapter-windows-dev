@@ -100,6 +100,13 @@ struct MenuBarControlView: View {
             }
             .keyboardShortcut("o")
 
+            Button("账号登录与设备管理") {
+                model.accountPageRequested = true
+                showMainWindow()
+            }
+            Button(model.isStoppingConnections ? "正在停止连接…" : "停止全部连接与自动恢复") { model.stopConnections() }
+                .disabled(model.isStoppingConnections || model.isPreview)
+
             Button("刷新状态") {
                 model.refresh()
             }
@@ -153,7 +160,7 @@ struct MenuBarControlView: View {
 
             Divider()
 
-            Button("退出 Mullvad 本地适配器") {
+            Button("停止连接并退出适配器") {
                 NSApp.terminate(nil)
             }
             .keyboardShortcut("q")

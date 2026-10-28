@@ -32,7 +32,9 @@ macOS `ping6 -W` 是旧版 Node Information 请求选项，不能复用 IPv4 `pi
 - `install-daemon.rb`、`verify-candidate.rb`：有真实副作用的受控升级/canary工具，不是普通测试入口。
 - `scripts/stage-daemon-payload.rb`：只复制显式源码/fixture清单并运行假引擎回归，不安装服务。
 
-现有身份不因账号登录而替换；无身份首次启动可只管理账号。未知注册要先核对，首次身份安装须保留官方地址回执并显式确认。替换现有身份、旋转密钥和Mac独立Clash配置仍有未完成项，见[Mac差距清单](mac-parity.md)。Windows支持独立Clash配置不能当作Mac已接通。
+现有身份不因账号登录或切换管理账号而替换；无身份首次启动可只管理账号。已保存账号可分别刷新设备列表；新注册设备保留官方地址回执，先保存为本机身份，再明确启用，等待旧 worker 退出后提交。账号页始终允许输入账号；失败保留旧列表并显示时间与错误。后台每五分钟核实管理账号和当前身份所属账号，失败后至少等待一分钟，不自动创建或撤销设备。停止连接后暂停后台账号轮询，手动管理仍可用。自动旋转密钥和 Mac 独立 Clash 配置仍有未完成项，见[Mac差距清单](mac-parity.md)。Windows 支持独立 Clash 配置不能当作 Mac 已接通。
+
+账号路由、登记观察和停止控制分别位于 `daemon/account_api_routes.rb`、`account_lifecycle.rb`、`connection_control.rb`。安装与回退必须连同主后台一起处理这些文件；状态中的 `source_components` 记录各模块摘要。不要只替换主脚本。全局停止独立于普通切换准入，会取消正在进行的连接工作并保存停止意图；退出界面前等待停止确认，本机账号服务保留，不等于全系统断网开关。
 
 ## 本地检查
 

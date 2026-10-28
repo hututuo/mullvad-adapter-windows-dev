@@ -4,6 +4,19 @@ import SwiftUI
 @MainActor
 final class MullvadAdapterAppDelegate: NSObject, NSApplicationDelegate {
     let dockPresence = MainWindowDockPresence()
+    var stopConnections: (() async -> Bool)?
+    private var terminationPending = false
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !terminationPending else { return .terminateLater }
+        guard let stopConnections else { return .terminateNow }
+        terminationPending = true
+        Task {
+            let stopped = await stopConnections()
+            terminationPending = false
+            sender.reply(toApplicationShouldTerminate: stopped)
+        }
+        return .terminateLater
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         dockPresence.launchDidFinish()
@@ -32,6 +45,7 @@ struct MullvadAdapterUIApp: App {
     var body: some Scene {
         Window(model.isPreview ? "Mullvad 设计预览" : "Mullvad 本地适配器", id: "main") {
             ContentView(model: model)
+                .onAppear { appDelegate.stopConnections = { await model.stopAllConnections() } }
                 .background(MainWindowDockObserver(presence: appDelegate.dockPresence).frame(width: 0, height: 0))
         }
         .windowStyle(.automatic)
@@ -41,6 +55,7 @@ struct MullvadAdapterUIApp: App {
             MenuBarControlView(model: model, loginLaunch: loginLaunch, dockPresence: appDelegate.dockPresence)
         } label: {
             MenuBarStatusLabel(model: model)
+                .onAppear { appDelegate.stopConnections = { await model.stopAllConnections() } }
         }
         .menuBarExtraStyle(.menu)
     }

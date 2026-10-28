@@ -5,6 +5,55 @@ import AppKit
 
 @MainActor
 final class AdapterViewModel: ObservableObject {
+    lazy var accountManagement = AccountViewModel(client: accountClient)
+    @Published var accountPageRequested = false
+    @Published private(set) var isStoppingConnections = false
+    var connectionsStopped: Bool { status?.connectionControl?.stopped == true && status?.serviceReadiness == "stopped" }
+    func stopConnections(quitWhenStopped: Bool = false) {
+        if quitWhenStopped { NSApp.terminate(nil); return }
+        Task { _ = await stopAllConnections() }
+    }
+    func stopAllConnections() async -> Bool {
+        guard !isPreview, !isStoppingConnections else { return false }
+        isStoppingConnections = true
+        defer { isStoppingConnections = false }
+        actionMessage = "正在停止全部连接和自动恢复…"
+        do {
+            let receipt = try await client.disconnect()
+            let deadline = Date().addingTimeInterval(65)
+            while Date() < deadline {
+                let operation = try await client.fetchOperation(receipt.id)
+                actionMessage = operation.message
+                if !operation.isRunning {
+                    guard operation.state == "succeeded" else { throw AdapterActionError.rejected(operation.message ?? "停止未完成") }
+                    // The independent publisher may still hold the previous
+                    // second's snapshot when cleanup completes. Await its
+                    // matching receipt without turning that brief lag into a
+                    // failed stop or accepting an old successful stop.
+                    let publicationDeadline = min(deadline, Date().addingTimeInterval(5))
+                    while Date() < publicationDeadline {
+                        if let confirmed = try? await client.fetchStatus(),
+                           confirmed.connectionControl?.stopped == true,
+                           confirmed.connectionControl?.stopOperationID == receipt.id,
+                           confirmed.serviceReadiness == "stopped", confirmed.front?.ready != true {
+                            await refreshStatusBestEffort()
+                            actionMessage = "全部连接和自动恢复已停止，账号管理仍可用"
+                            return true
+                        }
+                        try await Task.sleep(nanoseconds: 250_000_000)
+                    }
+                    throw AdapterActionError.rejected("停止回执与最新状态未对应，不能确认全部连接已停止。")
+                }
+                try await Task.sleep(nanoseconds: 250_000_000)
+            }
+            throw AdapterActionError.timeout("停止尚未确认完成，请重试；没有重新连接。")
+        } catch {
+            errorMessage = error.localizedDescription
+            await refreshStatusBestEffort()
+            return false
+        }
+    }
+
     @Published var protection: ProtectionSnapshot?
     @Published var protectionError: String?
     @Published var status: AdapterStatus?

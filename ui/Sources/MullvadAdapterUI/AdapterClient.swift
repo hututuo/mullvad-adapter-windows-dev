@@ -77,6 +77,17 @@ struct AdapterClient: Sendable {
             "private_key": draft.privateKey.base64EncodedString()])
     }
 
+    func saveIdentity(draft: AccountDeviceDraft) async throws -> AccountSnapshot {
+        guard draft.stage == .created, let device = draft.device else { throw DraftError.corrupt }
+        return try await account("identity/save", payload: ["confirm": true,
+            "account_fingerprint": draft.accountFingerprint, "device_id": device.id, "public_key": draft.publicKey,
+            "ipv4_address": device.ipv4Address, "ipv6_address": device.ipv6Address,
+            "private_key": draft.privateKey.base64EncodedString()])
+    }
+    func disconnect() async throws -> OperationReceipt {
+        try decode(try await post("disconnect", json: [:]), path: "disconnect")
+    }
+
     func abandonIdentity(accountFingerprint: String, pending: PendingIdentityInstallation) async throws -> AccountSnapshot {
         try await account("identity/abandon", payload: ["confirm": true, "account_fingerprint": accountFingerprint,
             "expected_installation_account_fingerprint": pending.accountFingerprint, "expected_metadata_sha256": pending.metadataSHA256])
@@ -101,7 +112,7 @@ struct AdapterClient: Sendable {
     private func accountRequest(_ action: String?, payload: [String: Any]) throws -> URLRequest {
         var request = URLRequest(url: baseURL.appendingPathComponent("account" + (action.map { "/" + $0 } ?? "")))
         request.httpMethod = action == nil ? "GET" : "POST"
-        request.timeoutInterval = 75 // bounded token + validation + device reads; never retry mutations
+        request.timeoutInterval = action == nil ? 3 : 75 // local cached reads stay short; mutations are never replayed
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("Bearer " + (try accountCapability()), forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")

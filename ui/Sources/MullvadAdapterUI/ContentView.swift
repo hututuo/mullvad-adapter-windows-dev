@@ -2,6 +2,10 @@ import SwiftUI
 
 struct ContentView: View {
     @ObservedObject var model: AdapterViewModel
+    @ObservedObject private var account: AccountViewModel
+
+    init(model: AdapterViewModel) { self.model = model; account = model.accountManagement }
+
     @State private var selectedSection: AppSection? = .cities
     @State private var showingCatalogueChanges = false
 
@@ -47,6 +51,20 @@ struct ContentView: View {
                 .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 220)
         } detail: {
             VStack(spacing: 0) {
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(model.status?.accountHealth?.summary ?? "账号登记状态待读取；可随时打开账号管理")
+                            .font(.callout).lineLimit(1)
+                        Text(model.status?.accountHealth?.checkedAt.map { "官方设备核实：\($0)" } ?? "设备列表尚未核实，不以隧道断网推断撤销")
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                    Button("账号登录 / 设备管理") { selectedSection = .account }
+                        .buttonStyle(.bordered)
+                    Button(model.isStoppingConnections ? "停止中…" : "停止全部连接", systemImage: "stop.fill") { model.stopConnections() }
+                        .buttonStyle(.bordered).disabled(model.isStoppingConnections || model.isPreview)
+                }.padding(.horizontal, 16).frame(height: 66)
+                    .background(Color.secondary.opacity(0.05))
+                Divider()
                 detail.frame(maxWidth: .infinity, maxHeight: .infinity)
                 Divider()
                 OperationStatusBar(model: model)
@@ -57,6 +75,9 @@ struct ContentView: View {
         // grow the whole window beyond the visible screen.
         .navigationSplitViewStyle(.balanced)
         .frame(minWidth: 1040, idealWidth: 1280, minHeight: 720, idealHeight: 820)
+        .onReceive(model.$accountPageRequested) { requested in
+            if requested { selectedSection = .account; model.accountPageRequested = false }
+        }
         .sheet(isPresented: $showingCatalogueChanges) {
             CatalogueChangesView(metadata: model.status?.effectiveMetadata, activeRelay: model.status?.activeRelay)
         }

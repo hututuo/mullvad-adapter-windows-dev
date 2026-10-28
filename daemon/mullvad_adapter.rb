@@ -17,6 +17,9 @@ require 'timeout'
 require 'digest'
 require 'base64'
 require 'resolv'
+require_relative 'account_api_routes'
+require_relative 'account_lifecycle'
+require_relative 'connection_control'
 
 Encoding.default_external = Encoding::UTF_8
 Encoding.default_internal = Encoding::UTF_8
@@ -230,8 +233,9 @@ class MullvadAdapter
   TRANSPORT_PREFERENCES = (%w[auto] + TRANSPORT_MODES).freeze
   AUTO_TRANSPORT_ORDER = %w[ss quic ipv6 ipv4].freeze
   DEFAULT_TRANSPORT_PREFERENCE = 'ss'
-  BUILD_ID = '20261028-quic-ss-pool-1'
+  BUILD_ID = '20261028-account-recovery-1'
   SOURCE_SHA256 = Digest::SHA256.file(__FILE__).hexdigest
+  SOURCE_COMPONENTS = %w[account_api_routes.rb account_lifecycle.rb connection_control.rb].to_h { |name| [name, Digest::SHA256.file(File.join(__dir__, name)).hexdigest] }.freeze
   STATUS_PUBLICATION_INTERVAL = 1.0
   STATUS_PUBLICATION_MAX_AGE = 3.0
   # Keep recent history by capacity, not by calendar day: two files together
@@ -405,6 +409,7 @@ class MullvadAdapter
     }
     @state = {
       status: 'starting',
+      source_components: SOURCE_COMPONENTS,
       build_id: BUILD_ID,
       source_sha256: SOURCE_SHA256,
       generation: 0,
@@ -470,8 +475,15 @@ class MullvadAdapter
     load_ss_recovery_windows
     defaults_path = File.join(@state_dir, 'bootstrap-defaults.json')
     write_private_identity_once(defaults_path, JSON.generate(schema: 1, source: @bootstrap_defaults_source))
-    load_template
+    begin
+      load_template
+    rescue AccountError => error
+      raise unless error.code == 'identity_store_invalid'
+      @template = nil
+    end
     load_account_manager
+    load_connection_control
+    start_account_monitor
     @account_only_mode = @template.nil?
     trap_signals
     start_api_server
@@ -501,7 +513,7 @@ class MullvadAdapter
     start_city_maintenance
     Thread.new do
       begin
-        next if @stop_requested
+        next if @stop_requested || connections_stopped?
         next if local_network_paused?
         refresh_metadata unless @metadata
         next if @first_identity_installed # Selection and tunnel validation remain explicit.
@@ -1268,6 +1280,8 @@ class MullvadAdapter
         data['management_account_number'] = target['account_number']
         write_identity_profiles(data) # The sole durable commit point.
         @template = target['template'].dup
+        invalidate_identity_observation
+        @account_only_mode = false
         @account_number = target['account_number']
         @account_data = @account_token = nil
         @last_network_path = @network_resume_path = nil
@@ -1430,6 +1444,8 @@ class MullvadAdapter
   end
 
   def account_request(method, path, token: nil, payload: nil, expected_status: nil)
+    remaining = (Thread.current[:adapter_account_deadline] || monotonic_now + 45) - monotonic_now
+    raise AccountError.new('api_deadline_exceeded', '账号操作等待已到上限；请刷新核实，未自动重放操作') unless remaining.positive?
     # curl reads credentials from stdin; no account/token is exposed in argv,
     # environment, curlrc, application events, or diagnostic reports.
     config = ["url = #{JSON.generate('https://api.mullvad.net/' + path)}", "request = #{JSON.generate(method)}",
@@ -1437,7 +1453,7 @@ class MullvadAdapter
     config << "header = #{JSON.generate('Authorization: Bearer ' + token)}" if token
     config << "data = #{JSON.generate(JSON.generate(payload))}" if payload
     stdout, _stderr, status = Open3.capture3('/usr/bin/curl', '-q', '--config', '-', '--silent', '--show-error',
-      '--max-time', '12', '--connect-timeout', '4', '--noproxy', '', *bootstrap_proxy_args,
+      '--max-time', [remaining, 12].min.to_s, '--connect-timeout', [remaining, 4].min.to_s, '--max-filesize', '131072', '--noproxy', '', *(Thread.current[:adapter_account_api_route] ||= discover_account_api_route),
       '--write-out', "\n%{http_code}", stdin_data: config.join("\n") + "\n")
     unless status.success?
       raise AccountError.new('api_unreachable', 'Mullvad 账号 API 未确认完成；现有隧道保留。请检查引导代理并刷新；若刚提交撤销或兑换，确认官方状态后再操作')
@@ -1450,7 +1466,9 @@ class MullvadAdapter
       parsed_error = JSON.parse(body) rescue {}
       error = parsed_error['code'] || parsed_error['type'] if parsed_error.is_a?(Hash)
       messages = { 'INVALID_ACCOUNT' => '账号无效', 'INVALID_VOUCHER' => '兑换码无效',
-                   'VOUCHER_USED' => '兑换码已使用', 'DEVICE_NOT_FOUND' => '设备已被撤销；请刷新列表' }
+                   'VOUCHER_USED' => '兑换码已使用', 'DEVICE_NOT_FOUND' => '设备已被撤销；请刷新列表',
+                   'MAX_DEVICES_REACHED' => '设备名额已满，请先从最新列表明确选择一台撤销，再创建新设备',
+                   'TOO_MANY_DEVICES' => '设备名额已满，请先撤销一台不再使用的设备' }
       safe_code = error == 'INVALID_ACCESS_TOKEN' ? 'invalid_access_token' : "http_#{code}"
       raise AccountError.new(safe_code, messages.fetch(error, "官方接口 HTTP #{code}；请稍后刷新确认状态"))
     end
@@ -1479,6 +1497,10 @@ class MullvadAdapter
         validate_identity_selection!(payload)
         relay = @mutex.synchronize { @state[:active_relay] } || load_persisted_relay
         accepted_async(sock, relay.to_s, 'identity-switch', nil, identity_selection: payload.slice('id', 'expected_active_id'))
+      when ['POST', '/account/identities/manage']
+        respond(sock, 200, manage_saved_account(payload))
+      when ['POST', '/account/identity/save']
+        respond(sock, 200, save_registered_identity(payload))
       when ['POST', '/account/login']
         number = normalize_account(payload['account_number'])
         verified = account_refresh(number)
@@ -1568,11 +1590,16 @@ class MullvadAdapter
         @account_data = account_refresh
         device = account_snapshot[:devices].find { |d| d[:id] == id }
         raise AccountError.new('invalid_device', '设备不在当前账号列表中') unless device
-        raise AccountError.new('active_device', '不能撤销本适配器当前使用的设备') if device[:current]
+        if device[:current] && !(payload['allow_current_if_stopped'] == true && connections_stopped? && @workers.empty? && @front_pid.nil?)
+          raise AccountError.new('active_device', '本机设备仍受保护；请先停止全部连接，再明确确认撤销')
+        end
         account_api('DELETE', "accounts/v1/devices/#{id}", number: @account_number)
-        @account_data = nil
-        @account_data = account_refresh
-        respond(sock, 200, account_snapshot)
+        begin
+          @account_data = account_refresh
+          respond(sock, 200, account_snapshot)
+        rescue AccountError
+          respond(sock, 200, account_snapshot.merge(mutation_notice: '撤销已经由官方确认，但新列表暂未取得；请刷新核对，不要重复撤销'))
+        end
       when ['POST', '/account/voucher']
         verify_account_binding!(payload)
         code = payload['voucher_code'].to_s.delete(' -')
@@ -1591,6 +1618,7 @@ class MullvadAdapter
       # callers/logs. A failed mutation may have succeeded upstream: refresh.
       respond(sock, 500, { code: 'account_operation_failed', error: '账号操作未确认完成，请刷新官方状态后再操作' })
     ensure
+      publish_account_snapshot
       @account_mutex.unlock
     end
   end
@@ -1706,7 +1734,7 @@ class MullvadAdapter
       handle_account_http(sock, method, path, headers, body)
       return
     end
-    if @account_only_mode && method == 'POST' && path != '/metadata/refresh'
+    if @account_only_mode && method == 'POST' && !%w[/metadata/refresh /disconnect].include?(path)
       respond(sock, 409, { code: 'identity_not_configured', error: '隧道尚未初始化；当前仅开放账号与设备管理，未启动网络引擎' })
       return
     end
@@ -1782,6 +1810,8 @@ class MullvadAdapter
     when ['POST', '/speedtest/start']
       payload = parse_json_body(body)
       accepted_async(sock, payload['relay'].to_s, 'speedtest', payload['transport'])
+    when ['POST', '/disconnect']
+      respond(sock, 202, request_disconnect)
     when ['POST', '/recovery']
       command = parse_json_body(body)['action'].to_s
       raise ArgumentError, 'unsupported recovery action' unless %w[retry-current retry-round stop].include?(command)
@@ -1844,6 +1874,10 @@ class MullvadAdapter
 
   def accepted_async(sock, relay, reason, transport_preference = nil, profile: nil, identity_selection: nil)
     preference = normalize_transport_preference(transport_preference || current_transport_preference)
+    if identity_registration_blocked? && !%w[identity-switch diagnose speedtest].include?(reason)
+      respond(sock, 409, { code: 'device_registration_missing', error: '最新核实的官方列表没有当前本机身份；请打开账号与设备，刷新、重新创建设备或启用其他身份' })
+      return
+    end
     if preference == 'ipv6' && !local_transport_available?('ipv6') && reason != 'identity-switch'
       respond(sock, 409, { ok: false, code: 'local_ipv6_unavailable', error: '本机当前没有可用的 IPv6 地址；原连接保留。可选自动或 SS，不代表节点失效' })
       return
@@ -1899,6 +1933,7 @@ class MullvadAdapter
           update_operation(state: 'cancelled', stage: 'finished', message: '请求已被较新的停止操作取消', finished_at: Time.now.iso8601)
           next
         end
+        resume_connections_for_user(expected_epoch: recovery_ticket) unless %w[diagnose speedtest].include?(reason)
         update_operation(state: 'running')
         action_evidence = {}
         ok = case reason
@@ -2242,7 +2277,7 @@ class MullvadAdapter
       ensure
         @action_gate_mutex.unlock
       end
-      decorate_status_snapshot(copy)
+      return false unless decorate_status_snapshot(copy)
       json = JSON.generate(copy).freeze
       @status_publication = { json: json, captured_at: captured_at,
                               capture_ms: [(monotonic_now - started) * 1000, 0].max.round }.freeze
@@ -3543,6 +3578,7 @@ class MullvadAdapter
     # Manual callers have already invalidated the old token, so its bounded
     # attempt cleans up before the new owner starts. Automatic callers never queue.
     request_epoch = Thread.current[:adapter_recovery_request_epoch] || @mutex.synchronize { @recovery_control_epoch }
+    return false if connections_stopped? || identity_registration_blocked?
     return false unless manual ? @ordered_recovery_mutex.lock : @ordered_recovery_mutex.try_lock
     previous = %i[adapter_recovery_token adapter_recovery_id adapter_recovery_deadline adapter_network_epoch adapter_recovery_inlet].to_h { |key| [key, Thread.current[key]] }
     started = monotonic_now
@@ -5567,7 +5603,7 @@ class MullvadAdapter
     previous_profile = Thread.current[:adapter_protection_profile]
     previous_attempt = Thread.current[:adapter_attempt_id]
     raise '隧道尚未初始化；请先安装本机 WireGuard 身份' if @account_only_mode
-    return false if local_network_paused?
+    return false if local_network_paused? || connections_stopped? || identity_registration_blocked?
     Thread.current[:adapter_network_epoch] = network_epoch
     queued_at = monotonic_now
     Thread.current[:adapter_attempt_id] = SecureRandom.uuid
@@ -7388,6 +7424,9 @@ class MullvadAdapter
     end
   end
 end
+
+MullvadAdapter.prepend(AccountLifecycle)
+MullvadAdapter.prepend(ConnectionControl)
 
 if $PROGRAM_NAME == __FILE__
   options = {}

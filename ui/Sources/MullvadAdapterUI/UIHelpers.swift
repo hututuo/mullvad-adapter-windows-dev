@@ -186,6 +186,7 @@ func localizedAdapterStatus(_ rawStatus: String?) -> String {
     case "starting": return "启动中"
     case "stopping": return "停止中"
     case "stopped": return "已停止"
+    case "stop_pending": return "停止尚未完成"
     case "skip", "skipped": return "已跳过"
     case "idle": return "空闲"
     case "pending": return "等待中"

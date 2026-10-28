@@ -512,7 +512,7 @@ final class AccountTests: XCTestCase {
         AccountProtocol.handler = { _ in requests += 1; return (200, snapshot) }
         let model = AccountViewModel(client: client(), draftStore: store)
         await model.load(); await model.installDraft(); await model.createDevice()
-        XCTAssertEqual(requests, 1)
+        XCTAssertEqual(requests, 2) // Local read plus fresh official list; no mutation.
         XCTAssertEqual(store.draft?.stage, .registered)
         XCTAssertTrue(store.archives.isEmpty)
     }
@@ -606,7 +606,7 @@ final class AccountTests: XCTestCase {
         XCTAssertEqual(store.draft?.stage, .abandoned)
         XCTAssertEqual(store.draft?.privateKey, draft.privateKey)
         XCTAssertTrue(store.archives.isEmpty)
-        XCTAssertFalse(paths.contains("/account/refresh"))
+        XCTAssertEqual(paths.filter { $0 == "/account/refresh" }.count, 1) // Page entry refresh only; cancellation is never replayed.
         await model.createDevice()
         XCTAssertEqual(creates, 1)
         XCTAssertEqual(store.archives.count, 1)
@@ -642,7 +642,7 @@ final class AccountTests: XCTestCase {
         XCTAssertEqual(store.draft, current)
         XCTAssertTrue(store.archives.isEmpty)
         XCTAssertFalse(model.hasError)
-        XCTAssertFalse(paths.contains("/account/refresh"))
+        XCTAssertEqual(paths.filter { $0 == "/account/refresh" }.count, 1) // Page entry refresh only; cancellation is never replayed.
         XCTAssertFalse(paths.contains("/account/devices/create"))
     }
 
@@ -694,7 +694,7 @@ final class AccountTests: XCTestCase {
         AccountProtocol.handler = { _ in requests += 1; return (200, snapshot) }
         let model = AccountViewModel(client: client(), draftStore: store)
         await model.load(); await model.createDevice()
-        XCTAssertEqual(requests, 1)
+        XCTAssertEqual(requests, 2) // Local read plus fresh official list; no mutation.
         XCTAssertEqual(store.draft, draft)
         XCTAssertTrue(store.archives.isEmpty)
     }
@@ -723,4 +723,114 @@ final class AccountTests: XCTestCase {
         view.layoutSubtreeIfNeeded()
         XCTAssertLessThanOrEqual(view.fittingSize.width, 820)
     }
+    @MainActor
+    func testEnteringAccountPageRefreshesEvenPreviouslyVerifiedCache() async {
+        var paths: [String] = []
+        AccountProtocol.handler = { request in
+            paths.append(request.url!.path)
+            return (200, CityPreview.data("account"))
+        }
+        let model = AccountViewModel(client: client(), draftStore: MemoryAccountDraftStore())
+        await model.load()
+        XCTAssertEqual(paths, ["/account", "/account/refresh"])
+        XCTAssertFalse(model.hasError)
+    }
+
+    @MainActor
+    func testManagingSavedAccountDoesNotSwitchConnectionOrSendAnAccountNumber() async throws {
+        let identity = try JSONDecoder().decode(SavedLocalIdentity.self, from: Data(#"{"id":"saved-b","account_suffix":"3478","device_name":"Fixture Bird","public_key":"fixture-public","current":false}"#.utf8))
+        var paths: [String] = []
+        AccountProtocol.handler = { request in
+            paths.append(request.url!.path)
+            let body = self.requestObject(request)
+            XCTAssertEqual(body["id"] as? String, "saved-b")
+            XCTAssertNil(body["account_number"]); XCTAssertNil(body["private_key"])
+            return (200, CityPreview.data("account"))
+        }
+        let model = AccountViewModel(client: client(), draftStore: MemoryAccountDraftStore())
+        await model.manageIdentity(identity)
+        XCTAssertEqual(paths, ["/account/identities/manage"])
+        XCTAssertFalse(model.hasError)
+    }
+
+    @MainActor
+    func testSavingReplacementDraftNeverInstallsActivatesOrResubmitsRegistration() async throws {
+        let binding = String(repeating: "a", count: 64)
+        let draft = try createdDraft(binding: binding)
+        let store = MemoryAccountDraftStore(); store.draft = draft
+        var object = try JSONSerialization.jsonObject(with: identitySnapshot(draft, installed: false)) as! [String: Any]
+        object["identity_configured"] = true; object["public_key"] = "legacy-public"
+        object["identity_save_supported"] = true
+        let response = try JSONSerialization.data(withJSONObject: object)
+        var mutations: [String] = []
+        AccountProtocol.handler = { request in
+            let path = request.url!.path
+            if path == "/account/identity/save" {
+                mutations.append(path)
+                let body = self.requestObject(request)
+                XCTAssertEqual(body["public_key"] as? String, draft.publicKey)
+                XCTAssertEqual(body["private_key"] as? String, draft.privateKey.base64EncodedString())
+                XCTAssertEqual(body["account_fingerprint"] as? String, binding)
+                XCTAssertEqual(body["confirm"] as? Bool, true)
+            } else { XCTAssertTrue(path == "/account" || path == "/account/refresh") }
+            return (200, response)
+        }
+        let model = AccountViewModel(client: client(), draftStore: store)
+        await model.load(); await model.saveDraft()
+        XCTAssertEqual(mutations, ["/account/identity/save"])
+        XCTAssertEqual(store.draft?.stage, .created)
+        XCTAssertEqual(store.draft?.privateKey, draft.privateKey)
+        XCTAssertFalse(model.hasError)
+    }
+
+    func testDeviceMissingAndApiFailureAreSeparateReadableStates() throws {
+        let missing = try JSONDecoder().decode(AccountFreshness.self, from: Data(#"{"state":"current","device":{"state":"missing"}}"#.utf8))
+        let unavailable = try JSONDecoder().decode(AccountFreshness.self, from: Data(#"{"state":"error","error_code":"api_route_unavailable"}"#.utf8))
+        XCTAssertTrue(missing.summary.contains("没有本机设备"))
+        XCTAssertTrue(unavailable.summary.contains("刷新失败"))
+        XCTAssertFalse(unavailable.summary.contains("撤销"))
+        XCTAssertTrue(missing.needsAttention); XCTAssertTrue(unavailable.needsAttention)
+    }
+
+    @MainActor
+    func testStoppingIsAvailableDuringAnotherOperationAndRequiresMatchingLatestStatus() async throws {
+        let isolated = UserDefaults(suiteName: UUID().uuidString)!
+        let model = AdapterViewModel(client: client(), defaults: isolated, statusEventSink: { _ in })
+        model.isActionRunning = true // A stuck identity/recovery action must not disable Stop.
+        var stopCount = 0
+        var statusCount = 0
+        AccountProtocol.handler = { request in
+            switch request.url!.path {
+            case "/disconnect": stopCount += 1; return (202, Data(#"{"id":"stop-fixture"}"#.utf8))
+            case "/operations/stop-fixture": return (200, Data(#"{"id":"stop-fixture","kind":"disconnect","state":"succeeded"}"#.utf8))
+            case "/status":
+                statusCount += 1
+                if statusCount == 1 { return (200, CityPreview.data("status")) }
+                var state = try! JSONSerialization.jsonObject(with: CityPreview.data("status")) as! [String: Any]
+                state["status"] = "stopped"; state["service_readiness"] = "stopped"
+                state["connection_control"] = ["stopped":true,"stop_operation_id":"stop-fixture"]
+                state["front"] = ["ready":false]
+                return (200, try! JSONSerialization.data(withJSONObject: state))
+            default: return (404, Data())
+            }
+        }
+        let stopped = await model.stopAllConnections()
+        XCTAssertTrue(stopped); XCTAssertEqual(stopCount, 1)
+        XCTAssertGreaterThan(statusCount, 1) // Await the independent publisher's next snapshot.
+        XCTAssertFalse(model.isStoppingConnections)
+    }
+
+    @MainActor
+    func testOldStopReceiptCannotConfirmAConnectionThatHasSinceResumed() async {
+        let model = AdapterViewModel(client: client(), defaults: UserDefaults(suiteName: UUID().uuidString)!, statusEventSink: { _ in })
+        AccountProtocol.handler = { request in
+            if request.url!.path == "/disconnect" { return (202, Data(#"{"id":"old-stop"}"#.utf8)) }
+            if request.url!.path == "/operations/old-stop" { return (200, Data(#"{"id":"old-stop","state":"succeeded"}"#.utf8)) }
+            return (200, CityPreview.data("status")) // A new healthy connection is no longer stopped.
+        }
+        let stopped = await model.stopAllConnections()
+        XCTAssertFalse(stopped)
+        XCTAssertNotNil(model.errorMessage)
+    }
+
 }

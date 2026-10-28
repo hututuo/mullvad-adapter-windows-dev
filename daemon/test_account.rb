@@ -46,6 +46,7 @@ class MullvadAccountTest < Minitest::Test
   end
 
   def teardown
+    Thread.current[:adapter_account_api_route] = nil
     @adapter&.instance_variable_get(:@probe_event_writer)&.join(2)
     FileUtils.remove_entry(@dir)
   end
@@ -314,6 +315,7 @@ class MullvadAccountTest < Minitest::Test
 
   def test_authenticated_curl_keeps_credentials_out_of_process_arguments_and_sanitizes_errors
     @adapter.singleton_class.remove_method(:account_request)
+    @adapter.define_singleton_method(:discover_account_api_route) { ['--noproxy', '*', '--proxy', ''] }
     captured = nil
     capture = lambda do |*args, **options|
       captured = [args, options]

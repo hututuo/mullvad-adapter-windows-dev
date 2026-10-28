@@ -41,6 +41,8 @@ enum TransportPreference: String, CaseIterable, Identifiable, Hashable {
 }
 
 struct AdapterStatus: Decodable {
+    var accountHealth: AccountFreshness? = nil
+    var connectionControl: ConnectionControlStatus? = nil
     let status: String?
     let buildID: String?
     let operation: AdapterOperation?
@@ -74,6 +76,7 @@ struct AdapterStatus: Decodable {
     let switchReason: String?
 
     enum CodingKeys: String, CodingKey {
+        case accountHealth = "account_health", connectionControl = "connection_control"
         case status
         case buildID = "build_id"
         case operation, diagnosis, recovery

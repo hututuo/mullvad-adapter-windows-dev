@@ -3,7 +3,7 @@ import AppKit
 
 struct AccountView: View {
     @ObservedObject var model: AdapterViewModel
-    @StateObject private var account: AccountViewModel
+    @ObservedObject private var account: AccountViewModel
     @State private var number = ""
     @State private var voucher = ""
     @State private var removing: AccountDevice?
@@ -18,7 +18,7 @@ struct AccountView: View {
 
     init(model: AdapterViewModel) {
         self.model = model
-        _account = StateObject(wrappedValue: AccountViewModel(client: model.accountClient))
+        account = model.accountManagement
     }
 
     var body: some View {
@@ -44,6 +44,7 @@ struct AccountView: View {
 
             ScrollView {
                 VStack(spacing: 16) {
+                    loginCard
                     connectionCard
                     savedIdentitiesCard
                     identityCard
@@ -53,7 +54,13 @@ struct AccountView: View {
             }
         }
         .padding(22)
-        .task { await account.load() }
+        .task {
+            await account.load()
+            while !Task.isCancelled {
+                do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { break }
+                await account.readLocalSnapshot()
+            }
+        }
         .onDisappear { account.hideKey(); number = ""; voucher = "" }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in account.hideKey() }
         .alert("切换本机隧道身份？", isPresented: Binding(get: { switchingIdentity != nil }, set: { if !$0 { switchingIdentity = nil } })) {
@@ -70,7 +77,7 @@ struct AccountView: View {
         .alert("撤销设备？", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } })) {
             Button("取消", role: .cancel) { removing = nil }
             Button("撤销", role: .destructive) {
-                if let device = removing { Task { await account.remove(device) } }
+                if let device = removing { Task { await account.remove(device, allowCurrentIfStopped: device.current && model.connectionsStopped) } }
                 removing = nil
             }
         } message: { Text("\(removing?.name ?? "此设备") 将无法再使用这个账号连接。此操作会修改 Mullvad 官方设备列表。") }
@@ -114,8 +121,8 @@ struct AccountView: View {
 
     @ViewBuilder private var savedIdentitiesCard: some View {
         if let identities = account.snapshot?.savedIdentities, !identities.isEmpty {
-            AppCard("保存的本机身份") {
-                Text("只启用一条身份。设备名称来自已保存的官方响应；当前登记情况需刷新官方状态核实。")
+            AppCard("已保存账号与本机身份") {
+                Text("“管理设备”只刷新和管理所选账号，不切换网络；“启用身份”才会重新连接。")
                     .font(.caption).foregroundStyle(.secondary)
                 ForEach(identities) { identity in
                     HStack(alignment: .top, spacing: 12) {
@@ -135,7 +142,10 @@ struct AccountView: View {
                                 Text("最近刷新时官方登记匹配；不等于隧道已连通。").font(.caption).foregroundStyle(.secondary)
                             }
                         }.frame(maxWidth: .infinity, alignment: .leading)
-                        Button(identity.current ? "使用中" : "切换…") { switchingIdentity = identity }
+                        Button(identity.managing == true ? "刷新设备" : "管理设备") { Task { await account.manageIdentity(identity) } }
+                            .buttonStyle(.bordered).disabled(account.busy || model.isPreview)
+                            .help("从官方刷新这个保存账号的设备列表，不切换隧道身份")
+                        Button(identity.current ? "当前身份" : "启用身份…") { switchingIdentity = identity }
                             .buttonStyle(.bordered).contentShape(Rectangle())
                             .disabled(identity.current || account.busy || model.isBusy || model.isPreview || account.snapshot?.identitySwitchSupported != true)
                     }.padding(10).frame(maxWidth: .infinity, alignment: .leading)
@@ -145,48 +155,51 @@ struct AccountView: View {
         }
     }
 
-    private var connectionCard: some View {
-        AppCard("连接与账号") {
-            HStack(alignment: .top, spacing: 28) {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("当前隧道").foregroundStyle(.secondary)
-                    AdapterStatusBadge(rawStatus: model.displayedStatus)
-                    Text(model.status?.activeRelay ?? "尚无活动节点").font(.callout.monospaced())
-                    Text("隧道状态独立于账号 API 是否可达。").font(.caption).foregroundStyle(.secondary)
-                    if account.snapshot?.hasLocalIdentity == false {
-                        InlineNotice(text: "隧道尚未初始化。请登录账号、创建设备并安装本机身份，然后到城市页连接。", kind: .warning)
-                    }
-                    Button("重连当前节点", systemImage: "bolt.horizontal.circle") { model.reconnect() }
-                        .disabled(model.isBusy || model.status?.activeRelay == nil || model.isPreview)
-                }.frame(maxWidth: .infinity, alignment: .leading)
-                Divider()
-                VStack(alignment: .leading, spacing: 10) {
-                    if let data = account.snapshot, data.signedIn {
-                        Text("账号尾号 \(data.accountSuffix ?? "—")").font(.headline)
-                        Text(data.verified ? "账号已验证" : "已保存登录 · 待刷新验证")
-                        if let expiry = data.expiryDate {
-                            Text("有效期至 \(expiry.formatted(date: .abbreviated, time: .shortened))")
-                                .foregroundStyle(expiry < Date() ? Color.red : .primary)
-                        }
-                        Text(data.checkedAt.map { "官方核实：\($0)" } ?? "尚未核实官方状态")
-                            .font(.caption).foregroundStyle(.secondary)
-                        if data.deviceSource == "official_api" {
-                            Text("设备名称与公钥：官方账号 API").font(.caption).foregroundStyle(.secondary)
-                        }
-                    } else {
-                        Text("登录 Mullvad 账号").font(.headline)
-                        SecureField("16 位账号，可粘贴空格分组", text: $number).textFieldStyle(.roundedBorder)
-                        Button("验证并保存账号") {
-                            let value = number
-                            Task { await account.login(value); if account.snapshot?.signedIn == true && !account.hasError { number = "" } }
-                        }.disabled(number.isEmpty || account.busy || model.isPreview)
-                    }
-                    if let data = account.snapshot, let route = data.apiRoute {
-                        Text(route == "system_https" ? "账号接口：系统路由 HTTPS" : (data.apiRouteSource == "legacy_local_default" ? "账号接口：沿用旧版本机引导代理" : "账号接口：已配置的本机引导代理"))
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                }.frame(maxWidth: .infinity, alignment: .leading)
+    private var loginCard: some View {
+        AppCard("账号登录与设备管理") {
+            Text("可直接输入任一 Mullvad 账号管理设备。账号已满、原设备被撤销或隧道断开，都不需要先切换本机身份。")
+                .font(.callout).foregroundStyle(.secondary)
+            HStack {
+                SecureField("16 位账号，可粘贴空格分组", text: $number)
+                    .textFieldStyle(.roundedBorder).onSubmit { loginEnteredAccount() }
+                Button("验证并登录管理") { loginEnteredAccount() }
+                    .buttonStyle(.borderedProminent).disabled(number.isEmpty || account.busy || model.isPreview)
             }
+            if let data = account.snapshot, data.signedIn {
+                Text("正在管理：账号尾号 \(data.accountSuffix ?? "—") · 不等于正在用此账号联网")
+                    .font(.headline)
+                Text(data.freshness?.summary ?? (data.verified ? "上次读取成功，请刷新查看最新设备" : "已保存账号，尚未核实最新设备"))
+                    .foregroundStyle(account.hasError ? Color.orange : .secondary)
+                Text(data.checkedAt.map { "上次成功核实：\($0)" } ?? "尚无成功核实时间")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text(data.freshness?.routeDescription ?? "账号服务出口待核实").font(.caption).foregroundStyle(.secondary)
+                if let expiry = data.expiryDate { Text("账号有效期至 \(expiry.formatted(date: .abbreviated, time: .shortened))").font(.caption) }
+            }
+            if let warning = account.snapshot?.profileWarning ?? account.snapshot?.identityStoreError {
+                InlineNotice(text: warning, kind: .warning)
+            }
+        }
+    }
+
+    private func loginEnteredAccount() {
+        guard !number.isEmpty, !account.busy, !model.isPreview else { return }
+        let value = number
+        Task { await account.login(value); if !account.hasError { number = "" } }
+    }
+
+    private var connectionCard: some View {
+        AppCard("本机连接 · 与账号管理分开") {
+            HStack {
+                AdapterStatusBadge(rawStatus: model.displayedStatus)
+                Text(model.status?.activeRelay ?? "尚无活动节点").font(.callout.monospaced())
+                Spacer()
+                Button(model.isStoppingConnections ? "正在停止…" : "停止全部连接", systemImage: "stop.fill") { model.stopConnections() }
+                    .buttonStyle(.bordered).disabled(model.isStoppingConnections || model.isPreview)
+                Button("重连当前节点", systemImage: "bolt.horizontal.circle") { model.reconnect() }
+                    .disabled(model.isBusy || model.status?.activeRelay == nil || model.isPreview)
+            }
+            Text("停止会关闭本机隧道、转发入口和自动恢复；账号登录、刷新与设备管理继续可用。国内和其他节点的流量仍按 Clash 规则。")
+                .font(.caption).foregroundStyle(.secondary)
         }
     }
 
@@ -220,7 +233,7 @@ struct AccountView: View {
     private var deviceCard: some View {
         AppCard("官方设备列表 · \(account.snapshot?.devices.count ?? 0) 台") {
             if account.snapshot?.verified != true {
-                Text("登录或刷新后显示真实设备列表。").foregroundStyle(.secondary)
+                Text("以下可能是上次成功读取的列表；刷新失败不会把旧资料当成最新状态。可重新输入账号，或对保存账号点“管理设备”。").foregroundStyle(.secondary)
             }
             if let pending = account.snapshot?.pendingIdentityInstallation,
                account.snapshot?.hasLocalIdentity == false, !pending.cancellationComplete {
@@ -239,9 +252,12 @@ struct AccountView: View {
                 }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
             }
+            if account.snapshot?.devicesFull == true {
+                InlineNotice(text: "设备名额已满（\(account.snapshot?.devices.count ?? 0)/\(account.snapshot?.devicesLimit ?? 5)）。仍可登录和管理；先明确选择一台不再使用的设备撤销，再创建。", kind: .warning)
+            }
             HStack {
                 Button("为本机创建新设备…") { confirmingCreate = true }
-                    .disabled(account.busy || account.snapshot?.verified != true || model.isPreview || !canCreateDraft || account.snapshot?.accountFingerprint == nil)
+                    .disabled(account.busy || account.snapshot?.verified != true || model.isPreview || !canCreateDraft || account.snapshot?.devicesFull == true || account.snapshot?.accountFingerprint == nil)
                 Text("官方只提供公钥，其他电脑的私钥不能从服务端取回。").font(.caption).foregroundStyle(.secondary)
             }
             if let draft = account.deviceDraft {
@@ -263,6 +279,14 @@ struct AccountView: View {
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }
+                    if draft.stage == .created, account.snapshot?.hasLocalIdentity == true {
+                        Button("保存为可选本机身份") { Task { await account.saveDraft() } }
+                            .disabled(account.busy || model.isPreview || account.snapshot?.identitySaveSupported != true)
+                        if let saved = account.snapshot?.savedIdentities?.first(where: { $0.publicKey == draft.publicKey && $0.accountFingerprint == draft.accountFingerprint }) {
+                            Button("启用这个新身份…") { switchingIdentity = saved }
+                                .disabled(account.busy || model.isBusy || model.isPreview || saved.current)
+                        }
+                    }
                     Button(account.privateKeyIsDraft ? "隐藏新设备私钥" : "查看新设备私钥…") {
                         if account.privateKeyIsDraft { account.hideKey() } else { confirmingDraftKey = true }
                     }.disabled(account.busy || model.isPreview)
@@ -276,7 +300,7 @@ struct AccountView: View {
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
                             Text(device.name).font(.headline)
-                            if device.current { Text("本适配器正在使用").font(.caption).foregroundStyle(.green) }
+                            if device.current { Text(model.connectionsStopped ? "本机已配置 · 已停止" : "本机连接身份").font(.caption).foregroundStyle(.green) }
                         }
                         Text(device.created.map { "注册时间：\($0)" } ?? "注册时间未提供").font(.caption).foregroundStyle(.secondary)
                         DisclosureGroup("查看公钥与设备 ID") {
@@ -285,14 +309,14 @@ struct AccountView: View {
                         }.font(.caption)
                     }
                     Spacer(minLength: 0)
-                    if !device.current {
-                        Button("撤销设备…", role: .destructive) { removing = device }
+                    if !device.current || model.connectionsStopped {
+                        Button(device.current ? "撤销本机设备…" : "撤销设备…", role: .destructive) { removing = device }
                             .disabled(account.busy || model.isPreview)
                     }
                 }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color.secondary.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
             }
-            Text("名称由 Mullvad 分配。当前设备受保护；其他设备撤销后会失去账号连接权限。").font(.caption).foregroundStyle(.secondary)
+            Text("名称由 Mullvad 分配。正在使用的设备受保护；如要撤销本机设备，请先停止全部连接，再明确确认。撤销不会删除本机保留的旧密钥。").font(.caption).foregroundStyle(.secondary)
         }
     }
 
