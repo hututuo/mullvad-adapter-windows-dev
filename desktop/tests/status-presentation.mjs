@@ -11,6 +11,7 @@ try {
  const {SetupPage}=await server.ssrLoadModule('/src/setup-page.tsx');
  const {StatusReadStrip}=await server.ssrLoadModule('/src/status-read-strip.tsx');
  const {StatusReadHealth}=await server.ssrLoadModule('/src/status-read.ts');
+ const {AccountAPIStatus}=await server.ssrLoadModule('/src/account-api-status.tsx');
  const d={boot_id:'fixture',sequence:1,status_observation:{age_ms:0,capture_ms:0,native_elapsed_ms:0},status:'connected',physical_attachment:'available',active_relay:'us-sjc-wg-001',identity_configured:true,device_name:'fixture',front_ready:true,front_selected:'slot_a',readiness:'ready',settings:{selected_city:'us-sjc',favorite_cities:['us-sjc']},connection:{relay:'us-sjc-wg-001',dns:true,https:true},account:{authenticated:false,devices:[]}};
  const render=(component,props)=>renderToStaticMarkup(React.createElement(component,props));
  const fresh=render(RecoveryPanel,{data:d,busy:false,observationCurrent:true,onAction:async()=>{}});
@@ -27,5 +28,15 @@ try {
  assert.match(read,/4 秒前/);assert.doesNotMatch(read,/后台不可用|隧道已断开/);
  health.failure(health.begin(),'Bearer private-sentinel',5000);
  assert.doesNotMatch(render(StatusReadStrip,{view:health.view(5000)}),/private-sentinel|Bearer/);
+ const api={route:'independent_proxy',endpoint:'device_list',phase:'connection_setup',outcome:'failed',elapsed_ms:8000,http_status:null};
+ const accountError=render(AccountAPIStatus,{account:{authenticated:true,devices:[],checked_at:1793000000,error_code:'api_deadline_exceeded',api_last_result:api}});
+ assert.match(accountError,/保留上次成功/);assert.match(accountError,/上次成功核实/);
+ assert.match(accountError,/TCP、代理转接或 TLS，尚不能细分/);
+ assert.doesNotMatch(accountError,/设备已撤销|隧道已断开|8.*秒.*握手/);
+ const legacy=render(AccountAPIStatus,{account:{authenticated:false,devices:[]}});
+ assert.match(legacy,/尚无成功核实时间/);assert.match(legacy,/可输入账号管理设备/);
+ const pending=render(AccountAPIStatus,{account:{authenticated:true,devices:[]},busy:true});
+ assert.match(pending,/正在查询官方账号服务/);
+ console.log('account API presentation: legacy, pending, retained data and conservative setup phase PASS');
  console.log('status presentation: fresh/stale recovery, setup, observed age and private-error suppression PASS');
 } finally { await server.close(); }

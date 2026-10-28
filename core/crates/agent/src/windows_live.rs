@@ -13,7 +13,8 @@ use adapter_engine_mihomo::connection_lifecycle::{
 };
 use adapter_mullvad_api::{
     AccountNumber, AccountSession, AccountSnapshot, ApiAccessRoute, ApiAddressCache,
-    BootstrapProxy, DeviceId, MullvadClient, VoucherCode,
+    ApiObservation, ApiObserver, ApiRouteKey, ApiRouteReuse, BootstrapProxy, DeviceId,
+    MullvadClient, VoucherCode, API_TRANSACTION_BUDGET,
 };
 use adapter_platform::windows_icmp::PingResult;
 use adapter_platform::{
@@ -154,6 +155,8 @@ struct ApiJob {
     id: String,
     proxy: u16,
     healthy_front: u16,
+    healthy_instance: u64,
+    network_epoch: u64,
     public_key: Option<String>,
     command: WorkCommand,
 }
@@ -161,6 +164,7 @@ struct ApiDone {
     id: String,
     result: Result<ApiValue, &'static str>,
     draft: Option<crate::live_device::PublicDraft>,
+    evidence: Option<ApiRequestEvidence>,
 }
 enum ApiValue {
     Chain(std::sync::Arc<adapter_engine_mihomo::chain::UpstreamSs>),
@@ -172,6 +176,41 @@ enum ApiValue {
     Settings(Settings),
     Report(PathBuf),
 }
+fn api_observer(
+    logs: LogClient,
+    latest: std::sync::Arc<std::sync::Mutex<Option<ApiRequestEvidence>>>,
+    id: String,
+    epoch: u64,
+) -> ApiObserver {
+    std::sync::Arc::new(move |value: ApiObservation| {
+        let evidence = ApiRequestEvidence {
+            route: match value.route {
+                ApiAccessRoute::Direct => "direct",
+                ApiAccessRoute::IndependentProxy => "independent_proxy",
+                ApiAccessRoute::HealthyTunnel => "healthy_tunnel",
+            }
+            .into(),
+            endpoint: value.endpoint.into(),
+            phase: value.phase.into(),
+            outcome: value.outcome.into(),
+            elapsed_ms: value.elapsed_ms,
+            headers_ms: value.headers_ms,
+            body_ms: value.body_ms,
+            http_status: value.http_status,
+            error_code: value.error_code.map(str::to_owned),
+            configured_endpoint: value.configured_endpoint.map(|v| v.to_string()),
+            transaction_id: id.clone(),
+            network_epoch: epoch,
+        };
+        if evidence.valid() {
+            if let Ok(mut last) = latest.lock() {
+                *last = Some(evidence.clone());
+            }
+            let _ = logs.api_request(&evidence);
+        }
+    })
+}
+
 fn api_worker(
     store: PrivateStore,
     report_root: PathBuf,
@@ -188,9 +227,18 @@ fn api_worker(
                 .ok()
                 .and_then(|data| ApiAddressCache::decode(data.expose()).ok())
                 .unwrap_or_default();
+            let mut route_reuse = ApiRouteReuse::default();
             let mut session: Option<AccountSession> = None;
             let mut uncertain_mutation = false;
             while let Ok(job) = receive.recv() {
+                let deadline = Instant::now() + API_TRANSACTION_BUDGET;
+                let latest = std::sync::Arc::new(std::sync::Mutex::new(None));
+                let observation = api_observer(
+                    logs.clone(),
+                    latest.clone(),
+                    job.id.clone(),
+                    job.network_epoch,
+                );
                 let result = (|| -> Result<ApiValue, &'static str> {
                     let command = match job.command {
                         WorkCommand::Save(settings) => {
@@ -260,6 +308,7 @@ fn api_worker(
                     };
                     if matches!(command, AppCommand::AccountLogout) {
                         session = None;
+                        route_reuse.invalidate();
                         uncertain_mutation = false;
                         return Ok(ApiValue::Logout);
                     }
@@ -271,29 +320,50 @@ fn api_worker(
                                 .map(Some)
                         }
                     };
-                    let access = MullvadClient::bootstrap(
-                        &address_cache,
-                        proxy(job.proxy).map_err(|e| e.code())?,
-                        proxy(job.healthy_front).map_err(|e| e.code())?,
-                    )
-                    .map_err(|e| e.code())?;
-                    address_cache = access.cache;
-                    let _ = logs.event(
-                        "api_access",
-                        match access.route {
-                            ApiAccessRoute::Direct => "direct_verified",
-                            ApiAccessRoute::IndependentProxy => "independent_proxy_verified",
-                            ApiAccessRoute::HealthyTunnel => "healthy_tunnel_verified",
-                        },
-                    );
-                    let persisted = address_cache
-                        .encode()
-                        .map_err(|_| io::Error::other("api_cache_invalid"))
-                        .and_then(|data| store.prepare(RecordKind::ApiAddresses, &data)?.commit());
-                    if persisted.is_err() {
-                        let _ = logs.event("api_access", "cache_write_failed");
-                    }
-                    let client = access.client;
+                    let key = ApiRouteKey {
+                        network_epoch: job.network_epoch,
+                        healthy_instance: job.healthy_instance,
+                        independent: proxy(job.proxy).map_err(|e| e.code())?,
+                        healthy_tunnel: proxy(job.healthy_front).map_err(|e| e.code())?,
+                    };
+                    let access = if let Some(access) = route_reuse.get(key) {
+                        let _ = logs.event("api_access", "api_route_reused");
+                        access
+                    } else {
+                        let access = MullvadClient::bootstrap_until(
+                            &address_cache,
+                            key.independent,
+                            key.healthy_tunnel,
+                            deadline,
+                            Some(observation.clone()),
+                        )
+                        .map_err(|e| e.code())?;
+                        let _ = logs.event(
+                            "api_access",
+                            match access.route {
+                                ApiAccessRoute::Direct => "direct_verified",
+                                ApiAccessRoute::IndependentProxy => "independent_proxy_verified",
+                                ApiAccessRoute::HealthyTunnel => "healthy_tunnel_verified",
+                            },
+                        );
+
+                        address_cache = access.cache.clone();
+                        route_reuse.remember(key, &access);
+                        let persisted = address_cache
+                            .encode()
+                            .map_err(|_| io::Error::other("api_cache_invalid"))
+                            .and_then(|data| {
+                                store.prepare(RecordKind::ApiAddresses, &data)?.commit()
+                            });
+                        if persisted.is_err() {
+                            let _ = logs.event("api_access", "cache_write_failed");
+                        }
+                        access
+                    };
+                    let client = access
+                        .client
+                        .with_observer(observation)
+                        .with_deadline(deadline);
                     match command {
                         AppCommand::AccountLogin { account } => {
                             let mut input = account.into_value();
@@ -391,6 +461,13 @@ fn api_worker(
                         _ => Err("invalid_api_command"),
                     }
                 })();
+                let evidence = latest.lock().ok().and_then(|last| last.clone());
+                if evidence
+                    .as_ref()
+                    .is_some_and(|value| value.error_code.is_some())
+                {
+                    route_reuse.invalidate();
+                }
                 let draft = session
                     .as_ref()
                     .and_then(|s| crate::live_device::snapshot(&store, s).ok().flatten());
@@ -399,6 +476,7 @@ fn api_worker(
                         id: job.id,
                         result,
                         draft,
+                        evidence,
                     })
                     .is_err()
                 {
@@ -942,6 +1020,7 @@ pub fn serve(scope: &str) -> io::Result<()> {
     let mut quick: Option<PendingQuick> = None;
     let mut queued_connect: Option<QueuedConnect> = None;
     let mut pings = BTreeMap::<String, PingObservation>::new();
+    let mut api_route_epoch: u64 = 0;
     let mut ping_stamp = owner.observation().stamp();
     let mut maintenance = BTreeMap::<String, (u64, usize)>::new();
     let mut shutdown = false;
@@ -993,6 +1072,9 @@ pub fn serve(scope: &str) -> io::Result<()> {
         }
         let stamp = owner.observation().stamp();
         let binding_changed = ping_stamp != stamp;
+        if binding_changed {
+            api_route_epoch = api_route_epoch.saturating_add(1);
+        }
         if stamp.is_none() || binding_changed {
             pings.clear();
         }
@@ -1220,6 +1302,8 @@ pub fn serve(scope: &str) -> io::Result<()> {
                                 })
                                 .collect(),
                             error_code: None,
+                            checked_at: Some(now_seconds()),
+                            api_last_result: None,
                         };
                         dashboard.last_error = None;
                     }
@@ -1272,6 +1356,9 @@ pub fn serve(scope: &str) -> io::Result<()> {
                         dashboard.last_error = Some(code.into());
                         dashboard.account.error_code = Some(code.into());
                     }
+                }
+                if let Some(evidence) = done.evidence {
+                    dashboard.account.api_last_result = Some(evidence);
                 }
                 logs.event("api", dashboard.last_error.as_deref().unwrap_or("complete"))?;
             }
@@ -1418,6 +1505,11 @@ pub fn serve(scope: &str) -> io::Result<()> {
                                     id: operation_id.clone(),
                                     proxy: 0,
                                     healthy_front: 0,
+                                    network_epoch: api_route_epoch,
+                                    healthy_instance: dashboard
+                                        .connection
+                                        .as_ref()
+                                        .map_or(0, |c| c.instance),
                                     public_key: None,
                                     command: WorkCommand::Report(Box::new(dashboard.clone())),
                                 };
@@ -1496,6 +1588,11 @@ pub fn serve(scope: &str) -> io::Result<()> {
                                     id: operation_id.clone(),
                                     proxy: 0,
                                     healthy_front: 0,
+                                    network_epoch: api_route_epoch,
+                                    healthy_instance: dashboard
+                                        .connection
+                                        .as_ref()
+                                        .map_or(0, |c| c.instance),
                                     public_key: None,
                                     command: WorkCommand::Save(settings),
                                 };
@@ -1522,6 +1619,11 @@ pub fn serve(scope: &str) -> io::Result<()> {
                                     id: operation_id.clone(),
                                     proxy: 0,
                                     healthy_front: 0,
+                                    network_epoch: api_route_epoch,
+                                    healthy_instance: dashboard
+                                        .connection
+                                        .as_ref()
+                                        .map_or(0, |c| c.instance),
                                     public_key: None,
                                     command: WorkCommand::Save(settings),
                                 };
@@ -1855,6 +1957,11 @@ pub fn serve(scope: &str) -> io::Result<()> {
                                     } else {
                                         0
                                     },
+                                    network_epoch: api_route_epoch,
+                                    healthy_instance: dashboard
+                                        .connection
+                                        .as_ref()
+                                        .map_or(0, |c| c.instance),
                                     public_key: dashboard.public_key.clone(),
                                     command: WorkCommand::Api(command),
                                 };

@@ -1,4 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
+export type ApiRequestEvidence = {
+  route:string; endpoint:string; phase:string; outcome:string; elapsed_ms:number;
+  headers_ms?:number|null; body_ms?:number|null; http_status?:number|null;
+  error_code?:string|null; configured_endpoint?:string|null;
+  transaction_id:string; network_epoch:number;
+};
 export type Settings = {
   favorite_cities: string[];
   selected_city: string | null;
@@ -86,6 +92,8 @@ export type Dashboard = {
   backup_test_restored?: boolean;
   account: {
     authenticated: boolean;
+    checked_at?:number|null;
+    api_last_result?:ApiRequestEvidence|null;
     expiry: string | null;
     devices: Device[];
     error_code: string | null;

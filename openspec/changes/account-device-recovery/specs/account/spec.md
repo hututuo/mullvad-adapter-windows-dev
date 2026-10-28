@@ -13,3 +13,19 @@
 - AC-11: WHEN a control API request fails, THEN keep safe stage/timing/peer/correlation evidence without raw responses or credentials. Proxy connection uncertainty must not be reported as confirmed origin TLS failure, and another account's request must not replace the selected account's evidence.
 
 Validation is synthetic/local unless separately recorded; source tests never imply installed or live-account acceptance.
+
+## Windows control-plane synchronization
+
+AC-9/AC-10 apply to the Rust account worker as well. Route reuse also binds the
+independent proxy setting and healthy tunnel instance; each transaction replaces
+its observer and deadline. Discovery must reserve an attempt for each configured
+fallback, and an expired operation must open no new socket. HTTP mutation
+ambiguity must not introduce automatic route-based replay.
+
+Windows AC-11 evidence uses typed ureq errors: combined connection setup is
+explicitly uncertain between TCP, proxy negotiation and TLS. Only measured
+header/body/total boundaries are reported. A successful HTTP exchange must not
+be rendered as tunnel success or device registration. Legacy snapshots without
+verification/evidence fields remain readable and show no invented timestamp.
+This synchronization does not claim Mac's saved multi-identity management or the
+entire AC-1 through AC-8 workflow is implemented on Windows.

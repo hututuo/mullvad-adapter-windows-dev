@@ -29,11 +29,23 @@ struct LogEvent {
     quick_test: Option<adapter_protocol::app::QuickTestState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     catalogue_changes: Option<adapter_protocol::catalogue_changes::CatalogueChanges>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api_request: Option<adapter_protocol::app::ApiRequestEvidence>,
 }
 fn safe_event(value: &LogEvent) -> bool {
-    value.catalogue_changes.as_ref().is_none_or(|changes| {
-        value.stage == "api" && serde_json::to_vec(changes).is_ok_and(|b| b.len() <= 16 * 1024)
-    }) && value.connection.as_ref().is_none_or(|c| c.valid())
+    let api_request_is_safe = match value.api_request.as_ref() {
+        Some(evidence) => {
+            matches!(value.stage.as_str(), "api" | "api_access")
+                && value.code == "api_request_observed"
+                && evidence.valid()
+        }
+        None => value.code != "api_request_observed",
+    };
+    api_request_is_safe
+        && value.catalogue_changes.as_ref().is_none_or(|changes| {
+            value.stage == "api" && serde_json::to_vec(changes).is_ok_and(|b| b.len() <= 16 * 1024)
+        })
+        && value.connection.as_ref().is_none_or(|c| c.valid())
         && value
             .quick_test
             .as_ref()
@@ -95,6 +107,8 @@ fn safe_event(value: &LogEvent) -> bool {
                 | "invalid_voucher"
                 | "voucher_used"
                 | "api_rejected"
+                | "api_request_observed"
+                | "api_route_reused"
                 | "connected"
                 | "disconnected"
                 | "probing"
@@ -207,6 +221,8 @@ pub struct EventView {
     pub dns: Option<adapter_protocol::app::ProbeOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub https: Option<adapter_protocol::app::ProbeOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_request: Option<adapter_protocol::app::ApiRequestEvidence>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -269,6 +285,7 @@ fn accept_event_line(
         https: connection
             .as_ref()
             .and_then(|c| outcome(c.probes.as_ref().map(|p| p.https), c.https)),
+        api_request: value.api_request.filter(|evidence| evidence.valid()),
     };
     if events.len() == limit {
         events.pop_front();
@@ -883,6 +900,7 @@ fn safe_report_code(value: Option<&str>) -> Option<String> {
                 connection: None,
                 quick_test: None,
                 catalogue_changes: None,
+                api_request: None,
             })
         })
         .map(str::to_owned)
@@ -911,6 +929,7 @@ impl Logs {
             connection,
             quick_test,
             catalogue_changes: None,
+            api_request: None,
         };
         self.append_event(row)
     }
@@ -931,6 +950,27 @@ impl Logs {
             connection: None,
             quick_test: None,
             catalogue_changes: Some(changes),
+            api_request: None,
+        })
+    }
+    fn api_request_event(
+        &self,
+        evidence: adapter_protocol::app::ApiRequestEvidence,
+    ) -> io::Result<()> {
+        let stage = if evidence.endpoint == "address_discovery" {
+            "api_access"
+        } else {
+            "api"
+        };
+        self.append_event(LogEvent {
+            time: now_seconds(),
+            layer: "agent".into(),
+            stage: stage.into(),
+            code: "api_request_observed".into(),
+            connection: None,
+            quick_test: None,
+            catalogue_changes: None,
+            api_request: Some(evidence),
         })
     }
     fn append_event(&self, row: LogEvent) -> io::Result<()> {
@@ -1008,36 +1048,37 @@ impl Logs {
         Ok(path)
     }
 }
+type LogCommand = (
+    String,
+    String,
+    Option<adapter_protocol::app::ConnectionInfo>,
+    Option<adapter_protocol::app::QuickTestState>,
+    Option<adapter_protocol::catalogue_changes::CatalogueChanges>,
+    Option<adapter_protocol::app::ApiRequestEvidence>,
+);
+
 #[derive(Clone)]
 pub struct LogClient {
-    sender: mpsc::SyncSender<(
-        String,
-        String,
-        Option<adapter_protocol::app::ConnectionInfo>,
-        Option<adapter_protocol::app::QuickTestState>,
-        Option<adapter_protocol::catalogue_changes::CatalogueChanges>,
-    )>,
+    sender: mpsc::SyncSender<LogCommand>,
     pub fault: Arc<AtomicBool>,
     pub dropped: Arc<AtomicU64>,
 }
 impl LogClient {
     pub fn start(root: PathBuf) -> io::Result<Self> {
-        let (sender, receive) = mpsc::sync_channel::<(
-            String,
-            String,
-            Option<adapter_protocol::app::ConnectionInfo>,
-            Option<adapter_protocol::app::QuickTestState>,
-            Option<adapter_protocol::catalogue_changes::CatalogueChanges>,
-        )>(256);
+        let (sender, receive) = mpsc::sync_channel::<LogCommand>(256);
         let fault = Arc::new(AtomicBool::new(false));
         let observed = fault.clone();
         thread::Builder::new()
             .name("bounded-event-log".into())
             .spawn(move || {
                 let logs = Logs { root };
-                while let Ok((stage, code, connection, quick_test, catalogue)) = receive.recv() {
+                while let Ok((stage, code, connection, quick_test, catalogue, api_request)) =
+                    receive.recv()
+                {
                     let result = if let Some(changes) = catalogue {
                         logs.catalogue_event(changes)
+                    } else if let Some(evidence) = api_request {
+                        logs.api_request_event(evidence)
                     } else {
                         logs.detailed_event(&stage, &code, connection, quick_test)
                     };
@@ -1053,7 +1094,7 @@ impl LogClient {
         })
     }
     pub fn event(&self, stage: &str, code: &str) -> io::Result<()> {
-        self.send(stage, code, None, None)
+        self.send(stage, code, None, None, None)
     }
     pub fn catalogue(
         &self,
@@ -1067,6 +1108,7 @@ impl LogClient {
                 None,
                 None,
                 Some(changes.clone()),
+                None,
             ))
             .is_err()
         {
@@ -1080,14 +1122,34 @@ impl LogClient {
         code: &str,
         info: Option<&adapter_protocol::app::ConnectionInfo>,
     ) -> io::Result<()> {
-        self.send("connection", code, info.cloned(), None)
+        self.send("connection", code, info.cloned(), None, None)
     }
     pub fn quick(
         &self,
         code: &str,
         progress: &adapter_protocol::app::QuickTestState,
     ) -> io::Result<()> {
-        self.send("quick", code, None, Some(progress.clone()))
+        self.send("quick", code, None, Some(progress.clone()), None)
+    }
+    pub fn api_request(
+        &self,
+        evidence: &adapter_protocol::app::ApiRequestEvidence,
+    ) -> io::Result<()> {
+        if !evidence.valid() {
+            return Err(io::Error::other("log_event_rejected"));
+        }
+        let stage = if evidence.endpoint == "address_discovery" {
+            "api_access"
+        } else {
+            "api"
+        };
+        self.send(
+            stage,
+            "api_request_observed",
+            None,
+            None,
+            Some(evidence.clone()),
+        )
     }
     fn send(
         &self,
@@ -1095,10 +1157,18 @@ impl LogClient {
         code: &str,
         connection: Option<adapter_protocol::app::ConnectionInfo>,
         quick_test: Option<adapter_protocol::app::QuickTestState>,
+        api_request: Option<adapter_protocol::app::ApiRequestEvidence>,
     ) -> io::Result<()> {
         if self
             .sender
-            .try_send((stage.into(), code.into(), connection, quick_test, None))
+            .try_send((
+                stage.into(),
+                code.into(),
+                connection,
+                quick_test,
+                None,
+                api_request,
+            ))
             .is_err()
         {
             self.dropped.fetch_add(1, Ordering::AcqRel);
@@ -1112,6 +1182,24 @@ impl LogClient {
 mod tests {
     use super::*;
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    fn api_request_evidence(endpoint: &str) -> adapter_protocol::app::ApiRequestEvidence {
+        adapter_protocol::app::ApiRequestEvidence {
+            route: "direct".into(),
+            endpoint: endpoint.into(),
+            phase: "response_headers".into(),
+            outcome: "response_received".into(),
+            elapsed_ms: 11,
+            headers_ms: Some(8),
+            body_ms: Some(3),
+            http_status: Some(200),
+            error_code: None,
+            configured_endpoint: Some("45.83.223.196:443".into()),
+            transaction_id: "synthetic-txn-01".into(),
+            network_epoch: 1,
+        }
+    }
+
     fn temporary() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "adapter-diagnostics-test-{}-{}-{}",
@@ -1421,6 +1509,7 @@ mod tests {
                 connection: None,
                 quick_test: None,
                 catalogue_changes: None,
+                api_request: None,
             };
             assert!(
                 safe_event(&event),
@@ -1428,6 +1517,152 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn api_request_evidence_round_trips_through_logs_events_and_reports() {
+        let root = temporary();
+        let logs = LogClient::start(root.clone()).unwrap();
+        let access = api_request_evidence("address_discovery");
+        let request = api_request_evidence("authentication");
+
+        logs.api_request(&access).unwrap();
+        logs.api_request(&request).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let page = loop {
+            let page = recent_events(&root, 10).unwrap();
+            if page.events.len() == 2 {
+                break page;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "queued events were not persisted"
+            );
+            thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(page.events.len(), 2);
+        assert_eq!(page.events[0].stage, "api_access");
+        assert_eq!(
+            page.events[0].api_request.as_ref().unwrap().endpoint,
+            "address_discovery"
+        );
+        assert_eq!(
+            serde_json::to_value(page.events[0].api_request.as_ref().unwrap()).unwrap(),
+            serde_json::to_value(&access).unwrap()
+        );
+        assert_eq!(page.events[1].stage, "api");
+        assert_eq!(page.events[1].code, "api_request_observed");
+        assert_eq!(
+            serde_json::to_value(page.events[1].api_request.as_ref().unwrap()).unwrap(),
+            serde_json::to_value(&request).unwrap()
+        );
+
+        let report = Logs { root: root.clone() }
+            .report(&snapshot(), "44444444-4444-4444-8444-444444444444")
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+        assert_eq!(
+            value["events"][0]["api_request"],
+            serde_json::to_value(access).unwrap()
+        );
+        assert_eq!(
+            value["events"][1]["api_request"],
+            serde_json::to_value(request).unwrap()
+        );
+
+        // Pre-evidence event rows remain readable because the field is optional.
+        let legacy: LogEvent = serde_json::from_slice(
+            br#"{"time":1,"layer":"agent","stage":"api","code":"complete"}"#,
+        )
+        .unwrap();
+        assert!(safe_event(&legacy));
+        assert!(legacy.api_request.is_none());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn api_request_evidence_rejects_untrusted_stage_code_and_payload_fields() {
+        let root = temporary();
+        let logs = Logs { root: root.clone() };
+        let evidence = api_request_evidence("authentication");
+        let mut invalid = evidence.clone();
+        invalid.error_code = Some("synthetic-raw-token-sentinel".into());
+        assert!(!invalid.valid());
+        assert!(logs.api_request_event(invalid.clone()).is_err());
+
+        let event = LogEvent {
+            time: 1,
+            layer: "agent".into(),
+            stage: "connection".into(),
+            code: "api_request_observed".into(),
+            connection: None,
+            quick_test: None,
+            catalogue_changes: None,
+            api_request: Some(evidence.clone()),
+        };
+        assert!(!safe_event(&event));
+        assert!(logs.append_event(event).is_err());
+
+        let mut json = serde_json::to_value(LogEvent {
+            time: 1,
+            layer: "agent".into(),
+            stage: "api".into(),
+            code: "api_request_observed".into(),
+            connection: None,
+            quick_test: None,
+            catalogue_changes: None,
+            api_request: Some(evidence),
+        })
+        .unwrap();
+        json["api_request"]["url"] = serde_json::json!("https://secret.example/account");
+        assert!(serde_json::from_value::<LogEvent>(json).is_err());
+        let persisted = std::fs::read_to_string(root.join("events.jsonl")).unwrap_or_default();
+        assert!(!persisted.contains("synthetic-raw-token-sentinel"));
+        assert!(!persisted.contains("secret.example"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn api_request_logging_keeps_the_existing_queue_bounded_and_nonblocking() {
+        let (sender, receiver) = mpsc::sync_channel::<LogCommand>(256);
+        for _ in 0..256 {
+            sender
+                .try_send(("api".into(), "complete".into(), None, None, None, None))
+                .unwrap();
+        }
+        let client = LogClient {
+            sender,
+            fault: Arc::new(AtomicBool::new(false)),
+            dropped: Arc::new(AtomicU64::new(0)),
+        };
+        let fault = client.fault.clone();
+        let dropped = client.dropped.clone();
+        let evidence = api_request_evidence("authentication");
+        let (finished, result) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            finished.send(client.api_request(&evidence)).unwrap();
+        });
+
+        let immediate = result.recv_timeout(std::time::Duration::from_secs(2));
+        let did_not_block = immediate.is_ok();
+        if immediate.is_err() {
+            // Let a mistakenly blocking producer finish so the regression fails cleanly.
+            receiver.recv().unwrap();
+        }
+        let result = immediate.unwrap_or_else(|_| {
+            result
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+        });
+        worker.join().unwrap();
+
+        assert!(did_not_block, "logging must not wait for a full queue");
+        assert!(result.is_ok());
+        assert_eq!(dropped.load(Ordering::Acquire), 1);
+        assert!(fault.load(Ordering::Acquire));
+    }
+
     fn snapshot() -> Dashboard {
         use adapter_protocol::app::{Account, Settings};
         Dashboard {
@@ -1571,6 +1806,8 @@ mod tests {
                 current: true,
             }],
             error_code: Some("account-error-sentinel".into()),
+            checked_at: None,
+            api_last_result: None,
         };
         dashboard.operation = Some("operation-sentinel".into());
         dashboard.last_error = Some("active_front_repair_failed".into());

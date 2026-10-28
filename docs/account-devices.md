@@ -162,3 +162,52 @@ A TLS-validated API route choice is reused in memory for at most 15 minutes; thi
 Discovery allows up to 8 seconds per attempt, 4 seconds for connection establishment and 24 seconds in total. Its elapsed time is deducted from the complete 60-second account transaction before authenticated curl starts. Existing per-request 12-second bounds remain; normal five-minute monitoring and failure one-minute minimum intervals are unchanged. These are process waiting budgets, not guarantees against OS stalls or remote service failures.
 
 `account-api-route-attempt`, `account-api-discovery-finished` and `account-api-request` events keep only allowlisted route/endpoint labels, validated peer/official IPs, proxy port, transaction ID, observed network epoch, curl exit/HTTP codes and timings. DNS, TCP, TLS, certificate, HTTP waiting and invalid-response failures have separate human messages. `dns_ms`, `tcp_ms`, `tls_ms` and `first_byte_ms` are cumulative curl milestones from request start, not independent stage durations; a proxy peer IP describes the proxy socket and cannot identify the remote origin's resolved IP. Raw stderr, reply bodies, URLs, device IDs, account numbers, tokens and keys are excluded. The account page shows the last request evidence for the selected management account, separately from registration evidence and its timestamp.
+
+### Windows API request diagnostics and bounds
+
+Windows uses the Rust account worker and ureq/Rustls, independently of the
+WireGuard device key. A revoked tunnel device does not invalidate the account
+number used to request a token and list devices. The login input stays available
+while a management session exists; a failed replacement login retains the old
+session and device snapshot. This does not add Mac's saved multi-identity UI to
+Windows.
+
+Each account job receives one 60-second monotonic deadline before discovery.
+Credential-free, TLS-verified API-address discovery has a separate 24-second cap
+and at most 8 seconds per attempt. The direct-address phase reserves one full
+attempt for each configured fallback: independent loopback proxy, then an already
+healthy adapter tunnel. With both available, direct discovery gets at most 8
+seconds; with one or neither, at most 16 seconds. There is no dependency on an
+unhealthy tunnel to authenticate. These are upper bounds, not mandatory waits.
+The existing request/read bounds remain in force and the shared deadline clamps
+all later authentication, reads and mutations. Failed account/device operations
+are not automatically resent on another route; ambiguous writes still require
+reconciliation.
+
+The selected TLS-validated route can be reused for 15 minutes in memory. Network
+binding observations, independent proxy configuration and healthy-tunnel instance
+are part of its reuse key. A changed key, expiry, logout or transport failure
+invalidates it. This route-proof counter only invalidates the API cache; it does
+not initiate tunnel recovery. The protected official-address cache is separate.
+Every new transaction binds fresh diagnostics and a fresh deadline; no token or
+account number is stored in the route cache.
+
+The account page and readable event list show route, last successful snapshot
+time, HTTP status, elapsed time and conservative failure phase. Discovery reuse
+is logged explicitly rather than pretending another discovery happened. ureq's
+connection timeout covers TCP, proxy CONNECT and TLS together: Windows allows
+up to 8 seconds for this combined setup, unlike Mac curl's 4-second TCP-only cap.
+A setup timeout is labelled as uncertain between those stages. Header elapsed
+time includes setup/request/header waiting; body time is measured separately.
+No DNS/TCP/TLS substage duration is fabricated. A configured API address or local
+proxy socket is not packet-capture proof of the physical route through an
+external TUN.
+
+Only closed endpoint/phase/error labels, bounded timings/statuses, transaction
+IDs, route epochs and validated public API or loopback proxy sockets reach logs
+and exports. No raw URL, response, account number, device identifier, token, key
+or ureq error text is recorded. Logging uses the existing bounded nonblocking
+queue. HTTP receipt is not tunnel health or proof that a device exists; API
+failure preserves the last snapshot and is not labelled device revocation.
+Tests use synthetic/loopback fixtures; native Windows execution, installation,
+real account operations and real egress are separate acceptance gates.

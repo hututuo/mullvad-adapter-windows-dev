@@ -19,6 +19,7 @@ import {
   type Settings,
 } from "./app-api";
 import "./style.css";
+import {AccountAPIStatus} from "./account-api-status";
 import { ClashPage } from "./clash-page";
 import { SetupPage } from "./setup-page";
 import { ChainRoute, useChainBackup } from "./chain-route";
@@ -614,8 +615,7 @@ function App() {
                   {data?.account.authenticated ? "已登录" : "尚未登录"}
                 </span>
               </div>
-              {!data?.account.authenticated ? (
-                <form
+              <form
                   className="inline-form"
                   onSubmit={(e) => {
                     e.preventDefault();
@@ -639,10 +639,11 @@ function App() {
                     className="primary"
                     disabled={busy || account.replaceAll(" ", "").length !== 16}
                   >
-                    登录
+                    {data?.account.authenticated ? "管理另一个账号" : "登录"}
                   </button>
                 </form>
-              ) : (
+              {data && <AccountAPIStatus account={data.account} busy={data.operation?.startsWith("account_")} />}
+              {data?.account.authenticated && (
                 <>
                   <dl className="details">
                     <div>

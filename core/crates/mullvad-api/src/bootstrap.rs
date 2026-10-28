@@ -97,12 +97,14 @@ fn valid_address(address: SocketAddr) -> bool {
         }
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ApiAccessRoute {
     Direct,
     IndependentProxy,
     HealthyTunnel,
 }
+#[derive(Clone)]
 pub struct ApiBootstrap {
     pub client: MullvadClient,
     pub cache: ApiAddressCache,
@@ -117,17 +119,43 @@ impl MullvadClient {
         independent: Option<BootstrapProxy>,
         healthy_tunnel: Option<BootstrapProxy>,
     ) -> Result<ApiBootstrap, Error> {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let direct_deadline = Instant::now() + Duration::from_secs(10);
+        Self::bootstrap_until(
+            cache,
+            independent,
+            healthy_tunnel,
+            Instant::now() + API_DISCOVERY_BUDGET,
+            None,
+        )
+        .map(|mut access| {
+            // Compatibility API bounds discovery only. Hosts bind each later
+            // operation explicitly with with_deadline().
+            access.client.transport.operation_deadline = None;
+            access
+        })
+    }
+    pub fn bootstrap_until(
+        cache: &ApiAddressCache,
+        independent: Option<BootstrapProxy>,
+        healthy_tunnel: Option<BootstrapProxy>,
+        transaction_deadline: Instant,
+        observer: Option<ApiObserver>,
+    ) -> Result<ApiBootstrap, Error> {
+        let deadline = transaction_deadline.min(Instant::now() + API_DISCOVERY_BUDGET);
+        // Reserve one complete attempt for each available fallback. A slow
+        // direct address must not consume the healthy-tunnel fallback budget.
+        let direct_deadline =
+            deadline.min(Instant::now() + direct_budget(independent, healthy_tunnel));
         let mut error = Error::Unreachable;
         for address in cache.candidates() {
-            let until = (Instant::now() + Duration::from_secs(5)).min(direct_deadline);
+            let until = (Instant::now() + API_ATTEMPT_BUDGET).min(direct_deadline);
             if until <= Instant::now() {
                 break;
             }
-            let client = Self {
+            let mut client = Self {
                 transport: HttpTransport::with_address(address)?,
             };
+            client.transport.observer = observer.clone();
+            client.transport.operation_deadline = Some(transaction_deadline);
             match client
                 .bootstrap_addresses(until)
                 .and_then(|body| cache.updated(&body, Some(address)))
@@ -149,11 +177,14 @@ impl MullvadClient {
             let Some(proxy) = proxy else {
                 continue;
             };
-            let until = (Instant::now() + Duration::from_secs(5)).min(deadline);
+            let until = (Instant::now() + API_ATTEMPT_BUDGET).min(deadline);
             if until <= Instant::now() {
                 break;
             }
-            let client = Self::new(proxy)?;
+            let mut client = Self::new(proxy)?;
+            client.transport.route = route;
+            client.transport.observer = observer.clone();
+            client.transport.operation_deadline = Some(transaction_deadline);
             match client
                 .bootstrap_addresses(until)
                 .and_then(|body| cache.updated(&body, None))
@@ -183,9 +214,23 @@ impl MullvadClient {
         Ok(response.body.to_vec())
     }
 }
+fn direct_budget(independent: Option<BootstrapProxy>, healthy: Option<BootstrapProxy>) -> Duration {
+    let reserved = u64::from(independent.is_some()) + u64::from(healthy.is_some());
+    Duration::from_secs((24 - reserved * 8).min(16))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn discovery_reserves_full_attempts_for_configured_fallbacks() {
+        let proxy = BootstrapProxy::new("127.0.0.1:7897".parse().unwrap()).unwrap();
+        assert_eq!(direct_budget(None, None), Duration::from_secs(16));
+        assert_eq!(direct_budget(Some(proxy), None), Duration::from_secs(16));
+        assert_eq!(
+            direct_budget(Some(proxy), Some(proxy)),
+            Duration::from_secs(8)
+        );
+    }
     #[test]
     fn cache_prioritizes_actual_success_and_always_includes_official_seed() {
         let cache = ApiAddressCache::decode(br#"{"addresses":["45.83.223.193:443","45.83.223.194:443"],"last_success":"45.83.223.193:443"}"#).unwrap();

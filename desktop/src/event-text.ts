@@ -1,11 +1,15 @@
+import type {ApiRequestEvidence} from "./app-api";
+import {apiRequestSummary} from "./account-api-text.ts";
 export type EventItem = {
   time: number; stage: string; code: string;
+  api_request?:ApiRequestEvidence|null;
   relay?: string | null; city?: string | null; phase?: string | null;
   ip?: string | null; dns?: string | null; https?: string | null;
 };
 // Cover the backend's entire closed event vocabulary. Technical codes remain
 // available separately, but the primary reading path is ordinary language.
 export const eventMessages: Record<string, string> = {
+  api_request_observed:"账号接口请求已记录", api_route_reused:"复用最近核实的账号服务出口",
   agent_started:"后台已启动", agent_stopped:"后台已退出", started:"开始建立连接",
   ready_reject:"本地入口已准备，尚未放行流量", stopped:"已停止", stopped_uncertain:"停止结果尚待确认",
   cleanup_uncertain:"清理结果尚待确认，保留现场", available:"本机已取得网络接入", unavailable:"本机网络断开，暂停重试",
@@ -76,6 +80,10 @@ export const eventMessages: Record<string, string> = {
 };
 const cancelled = new Set(["cancelled","candidate_cancelled","worker_start_cancelled","connection_cancelled","active_probe_cancelled","maintenance_cancelled","maintenance_preempted","binding_changed","network_binding_changed","active_binding_changed","candidate_stale","candidate_evidence_stale","active_evidence_stale"]);
 export function eventView(item: EventItem) {
+  if(item.api_request) {
+    const failure=item.api_request.outcome==='failed'||(item.api_request.http_status??0)>=400;
+    return {title:`账号服务 · ${apiRequestSummary(item.api_request)}`,probes:'',tone:failure?'warning':'info'};
+  }
   const title = eventMessages[item.code] ?? "记录了一项新的系统事件";
   const node = item.relay ? `节点 ${item.relay}` : item.stage === "connection" ? "当前连接（未记录节点）" : "本机服务";
   const ok = ["connected","complete","maintenance_complete","metadata_refresh_complete","available","direct_verified","independent_proxy_verified","healthy_tunnel_verified"].includes(item.code);

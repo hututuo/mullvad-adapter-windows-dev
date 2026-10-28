@@ -310,12 +310,118 @@ pub struct DeviceDraft {
     pub device_id: Option<String>,
     pub device_name: Option<String>,
 }
+/// Allowlisted control-plane evidence; never a URL, device ID, response or credential.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiRequestEvidence {
+    pub route: String,
+    pub endpoint: String,
+    pub phase: String,
+    pub outcome: String,
+    pub elapsed_ms: u64,
+    pub headers_ms: Option<u64>,
+    pub body_ms: Option<u64>,
+    pub http_status: Option<u16>,
+    pub error_code: Option<String>,
+    pub configured_endpoint: Option<String>,
+    pub transaction_id: String,
+    pub network_epoch: u64,
+}
+impl ApiRequestEvidence {
+    pub fn valid(&self) -> bool {
+        matches!(
+            self.route.as_str(),
+            "direct" | "independent_proxy" | "healthy_tunnel"
+        ) && matches!(
+            self.endpoint.as_str(),
+            "address_discovery"
+                | "authentication"
+                | "account_info"
+                | "device_list"
+                | "device_create"
+                | "device_remove"
+                | "catalogue"
+                | "voucher"
+                | "account_operation"
+        ) && matches!(
+            self.phase.as_str(),
+            "deadline"
+                | "dns"
+                | "connection_setup"
+                | "proxy_connect"
+                | "tls"
+                | "response_headers"
+                | "response_body"
+                | "http_response"
+                | "transport_unknown"
+        ) && matches!(self.outcome.as_str(), "failed" | "response_received")
+            && self.elapsed_ms <= 9_007_199_254_740_991
+            && self.network_epoch <= 9_007_199_254_740_991
+            && self.headers_ms.is_none_or(|v| v <= self.elapsed_ms)
+            && self.body_ms.is_none_or(|v| v <= self.elapsed_ms)
+            && self.http_status.is_none_or(|v| (100..=599).contains(&v))
+            && self.error_code.as_deref().is_none_or(|v| {
+                matches!(
+                    v,
+                    "api_unreachable"
+                        | "api_proxy_tunnel_failed"
+                        | "api_tls_failed"
+                        | "api_deadline_exceeded"
+                        | "api_response_too_large"
+                        | "invalid_api_response"
+                )
+            })
+            && !self.transaction_id.is_empty()
+            && self.transaction_id.len() <= 64
+            && self
+                .transaction_id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+            && self.configured_endpoint.as_deref().is_none_or(|value| {
+                value.len() <= 80
+                    && value.parse::<std::net::SocketAddr>().is_ok_and(|address| {
+                        if self.route == "direct" {
+                            address.port() == 443 && public_api_ip(address.ip())
+                        } else {
+                            address.ip().is_loopback() && address.port() >= 1024
+                        }
+                    })
+            })
+    }
+}
+// Keep raw private/local network addresses out of diagnostic exports. These
+// are configured API destinations, never proof of the physical packet route.
+fn public_api_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let [a, b, _, _] = ip.octets();
+            !ip.is_private()
+                && !ip.is_loopback()
+                && !ip.is_link_local()
+                && !ip.is_broadcast()
+                && !ip.is_multicast()
+                && !ip.is_documentation()
+                && a != 0
+                && a < 224
+                && !(a == 100 && (64..=127).contains(&b))
+                && !(a == 198 && (b == 18 || b == 19))
+        }
+        std::net::IpAddr::V6(ip) => {
+            ip.segments()[0] & 0xe000 == 0x2000
+                && !(ip.segments()[0] == 0x2001 && ip.segments()[1] == 0x0db8)
+        }
+    }
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Account {
     pub authenticated: bool,
     pub expiry: Option<String>,
     pub devices: Vec<Device>,
     pub error_code: Option<String>,
+    #[serde(default)]
+    pub checked_at: Option<u64>,
+    #[serde(default)]
+    pub api_last_result: Option<ApiRequestEvidence>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -777,5 +883,76 @@ mod tests {
             info.valid(),
             "older snapshots without discriminator remain readable"
         );
+    }
+}
+
+#[cfg(test)]
+mod api_evidence_tests {
+    use super::*;
+    fn evidence() -> ApiRequestEvidence {
+        serde_json::from_value(serde_json::json!({
+            "route":"direct", "endpoint":"device_list", "phase":"http_response",
+            "outcome":"response_received", "elapsed_ms":20, "headers_ms":15,
+            "body_ms":5, "http_status":200, "error_code":null,
+            "configured_endpoint":"45.83.223.196:443", "transaction_id":"fixture-1",
+            "network_epoch":1
+        }))
+        .unwrap()
+    }
+    #[test]
+    fn legacy_account_has_no_fabricated_verification() {
+        let old: Account = serde_json::from_str(
+            r#"{"authenticated":true,"expiry":null,"devices":[],"error_code":null}"#,
+        )
+        .unwrap();
+        assert!(old.checked_at.is_none());
+        assert!(old.api_last_result.is_none());
+    }
+    #[test]
+    fn evidence_accepts_only_closed_labels_and_public_or_loopback_destinations() {
+        let base = evidence();
+        assert!(base.valid());
+        for address in [
+            "192.168.1.1:443",
+            "100.64.1.1:443",
+            "127.0.0.1:443",
+            "[::ffff:45.83.223.196]:443",
+            "[fe80::1]:443",
+            "api.mullvad.net:443",
+            "45.83.223.196:80",
+        ] {
+            let mut value = base.clone();
+            value.configured_endpoint = Some(address.into());
+            assert!(!value.valid(), "{address}");
+        }
+        let mut proxy = base.clone();
+        proxy.route = "independent_proxy".into();
+        proxy.configured_endpoint = Some("127.0.0.1:7897".into());
+        assert!(proxy.valid());
+        proxy.configured_endpoint = Some("192.168.1.1:7897".into());
+        assert!(!proxy.valid());
+        for field in [
+            "route",
+            "endpoint",
+            "phase",
+            "outcome",
+            "error_code",
+            "transaction_id",
+        ] {
+            let mut value = serde_json::to_value(&base).unwrap();
+            value[field] = serde_json::json!("Bearer secret-sentinel/unknown");
+            assert!(
+                !serde_json::from_value::<ApiRequestEvidence>(value)
+                    .unwrap()
+                    .valid(),
+                "{field}"
+            );
+        }
+        let mut value = base.clone();
+        value.headers_ms = Some(21);
+        assert!(!value.valid());
+        value = base;
+        value.http_status = Some(999);
+        assert!(!value.valid());
     }
 }

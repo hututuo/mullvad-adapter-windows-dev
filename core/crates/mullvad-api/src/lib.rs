@@ -9,7 +9,13 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 mod bootstrap;
+mod observation;
 pub use bootstrap::{ApiAccessRoute, ApiAddressCache, ApiBootstrap};
+use observation::{endpoint_label, millis, transport_phase};
+pub use observation::{
+    ApiObservation, ApiObserver, ApiRouteKey, ApiRouteReuse, API_ATTEMPT_BUDGET,
+    API_DISCOVERY_BUDGET, API_ROUTE_REUSE, API_TRANSACTION_BUDGET,
+};
 
 const ROOT: &str = "https://api.mullvad.net/";
 const DEADLINE: Duration = Duration::from_secs(12);
@@ -246,6 +252,7 @@ impl fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 
+#[derive(Clone)]
 pub struct MullvadClient {
     transport: HttpTransport,
 }
@@ -390,8 +397,13 @@ trait Transport {
         cap: usize,
     ) -> Result<Response, Error>;
 }
+#[derive(Clone)]
 struct HttpTransport {
     agent: ureq::Agent,
+    observer: Option<ApiObserver>,
+    operation_deadline: Option<Instant>,
+    route: ApiAccessRoute,
+    configured_endpoint: Option<SocketAddr>,
 }
 
 // Official 2026.5 compile-time API endpoint, not relay/device metadata:
@@ -438,6 +450,7 @@ impl HttpTransport {
         address: SocketAddr,
     ) -> Result<Self, Error> {
         let direct = proxy.is_none();
+        let configured_endpoint = Some(proxy.map_or(address, |p| p.0));
         let proxy = proxy
             .map(|proxy| {
                 ureq::Proxy::new(&format!("http://{}", proxy.0)).map_err(|_| Error::InvalidProxy)
@@ -455,9 +468,17 @@ impl HttpTransport {
             // TLS handshake, not just the local proxy socket. Each request's
             // remaining global deadline still clamps this upper bound, including
             // the shorter mutation deadline.
-            .timeout_connect(Some(ACCOUNT_READ_DEADLINE))
+            .timeout_connect(Some(API_ATTEMPT_BUDGET))
             .build();
         Ok(Self {
+            observer: None,
+            operation_deadline: None,
+            route: if direct {
+                ApiAccessRoute::Direct
+            } else {
+                ApiAccessRoute::IndependentProxy
+            },
+            configured_endpoint,
             agent: if direct {
                 ureq::Agent::with_parts(
                     config,
@@ -481,10 +502,36 @@ impl Transport for HttpTransport {
         deadline: Instant,
         cap: usize,
     ) -> Result<Response, Error> {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
+        let started = Instant::now();
+        let deadline = self
+            .operation_deadline
+            .map_or(deadline, |bound| deadline.min(bound));
+        let mut observation = ApiObservation {
+            route: self.route,
+            endpoint: endpoint_label(method, path),
+            phase: "deadline",
+            outcome: "failed",
+            elapsed_ms: 0,
+            headers_ms: None,
+            body_ms: None,
+            http_status: None,
+            error_code: None,
+            configured_endpoint: self.configured_endpoint,
+        };
+        let emit = |mut value: ApiObservation| {
+            value.elapsed_ms = millis(started.elapsed());
+            if let Some(observer) = &self.observer {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer(value)));
+            }
+        };
+        let Some(remaining) = deadline
+            .checked_duration_since(started)
             .filter(|v| !v.is_zero())
-            .ok_or(Error::DeadlineExceeded)?;
+        else {
+            observation.error_code = Some(Error::DeadlineExceeded.code());
+            emit(observation);
+            return Err(Error::DeadlineExceeded);
+        };
         let url = format!("{ROOT}{path}");
         let authorization = token.map(|t| Zeroizing::new(format!("Bearer {}", &*t.0)));
         let result = match method {
@@ -521,12 +568,40 @@ impl Transport for HttpTransport {
             }
         };
         // Never propagate ureq diagnostic text, headers, bodies, or URLs.
-        let mut response = result.map_err(classify_transport_error)?;
+        let mut response = match result {
+            Ok(response) => response,
+            Err(error) => {
+                observation.phase = transport_phase(&error);
+                let error = classify_transport_error(error);
+                observation.error_code = Some(error.code());
+                emit(observation);
+                return Err(error);
+            }
+        };
+        observation.headers_ms = Some(millis(started.elapsed()));
         let status = response.status().as_u16();
-        let body = read_bounded(response.body_mut().as_reader(), cap)?;
+        observation.http_status = Some(status);
+        let body_started = Instant::now();
+        let body = match read_bounded(response.body_mut().as_reader(), cap) {
+            Ok(body) => body,
+            Err(error) => {
+                observation.phase = "response_body";
+                observation.body_ms = Some(millis(body_started.elapsed()));
+                observation.error_code = Some(error.code());
+                emit(observation);
+                return Err(error);
+            }
+        };
+        observation.body_ms = Some(millis(body_started.elapsed()));
         if Instant::now() > deadline {
+            observation.phase = "deadline";
+            observation.error_code = Some(Error::DeadlineExceeded.code());
+            emit(observation);
             return Err(Error::DeadlineExceeded);
         }
+        observation.phase = "http_response";
+        observation.outcome = "response_received";
+        emit(observation);
         Ok(Response { status, body })
     }
 }
