@@ -8,5 +8,8 @@
 - AC-6: WHEN Stop is clicked during recovery/switching, THEN reject new data work and attempt all owned cleanup. Only confirmed cleanup plus persisted stop can report success. Keep account management accessible and pause background remote work. Old tickets cannot resume it.
 - AC-7: WHEN a user requests removal of the current local device, THEN preserve default protection unless all connections are confirmed stopped and the user explicitly confirms that device.
 - AC-8: WHEN a DELETE succeeds but trailing list refresh fails, THEN report confirmed deletion with an unverified list, not a failed deletion requiring replay.
+- AC-9: WHEN a validated API route choice is recent and the physical network epoch is unchanged, THEN reuse that choice without another address-list request; expire it within 15 minutes and invalidate it after transport failure.
+- AC-10: WHEN discovery consumes waiting time, THEN subtract it before starting authenticated requests. Keep per-attempt, discovery and complete-transaction limits independent and bounded.
+- AC-11: WHEN a control API request fails, THEN keep safe stage/timing/peer/correlation evidence without raw responses or credentials. Proxy connection uncertainty must not be reported as confirmed origin TLS failure, and another account's request must not replace the selected account's evidence.
 
 Validation is synthetic/local unless separately recorded; source tests never imply installed or live-account acceptance.

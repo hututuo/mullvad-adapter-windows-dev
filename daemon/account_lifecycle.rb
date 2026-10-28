@@ -5,6 +5,7 @@
 module AccountLifecycle
   ACCOUNT_REFRESH_SECONDS = 300
   ACCOUNT_FAILURE_RECHECK_SECONDS = 60
+  ACCOUNT_OPERATION_SECONDS = 60
 
   def initialize(options)
     @account_info_mutex = Mutex.new
@@ -21,17 +22,18 @@ module AccountLifecycle
   end
 
   def account_health_summary_unlocked
-      @account_observations ||= {}
-      @registration_observation ||= {}
-      info = @account_observations[@account_number] || {}
-      checked = info[:checked_at]
-      fresh = checked && !info[:error_code] && Time.now - Time.parse(checked) <= ACCOUNT_REFRESH_SECONDS
-      registration = @registration_observation.reject { |key, _| %i[public_key account_number block_recovery].include?(key) }
-      registration[:fresh] = !!(registration[:checked_at] && Time.now - Time.parse(registration[:checked_at]) <= ACCOUNT_REFRESH_SECONDS)
-      { signed_in: !@account_number.nil?, state: @account_number.nil? ? 'signed_out' : info[:refreshing] ? 'refreshing' : fresh ? 'current' : info[:error_code] ? 'error' : 'stale',
-        checked_at: checked, last_attempt_at: info[:last_attempt_at], error_code: info[:error_code],
-        refresh_interval_seconds: ACCOUNT_REFRESH_SECONDS, api_route: @account_route_kind,
-        device: registration }
+    @account_observations ||= {}
+    @registration_observation ||= {}
+    info = @account_observations[@account_number] || {}
+    checked = info[:checked_at]
+    fresh = checked && !info[:error_code] && Time.now - Time.parse(checked) <= ACCOUNT_REFRESH_SECONDS
+    registration = @registration_observation.reject { |key, _| %i[public_key account_number block_recovery].include?(key) }
+    registration[:fresh] = !!(registration[:checked_at] && Time.now - Time.parse(registration[:checked_at]) <= ACCOUNT_REFRESH_SECONDS)
+    { signed_in: !@account_number.nil?, state: @account_number.nil? ? 'signed_out' : info[:refreshing] ? 'refreshing' : fresh ? 'current' : info[:error_code] ? 'error' : 'stale',
+      checked_at: checked, last_attempt_at: info[:last_attempt_at], error_code: info[:error_code],
+      refresh_interval_seconds: ACCOUNT_REFRESH_SECONDS, api_route: @account_route_kind,
+      api_last_result: @account_number ? info[:api_last_result] : @account_api_last_result,
+      device: registration }
   end
 
   def decorate_status_snapshot(copy)
@@ -121,6 +123,8 @@ module AccountLifecycle
   end
 
   def account_refresh(number = @account_number)
+    previous_observation_account = Thread.current[:adapter_account_observation_account]
+    Thread.current[:adapter_account_observation_account] = number
     raise MullvadAdapter::AccountError.new('not_signed_in', '请先输入 Mullvad 账号') unless number
     @account_info_mutex.synchronize do
       @account_observations[number] ||= {}
@@ -137,6 +141,8 @@ module AccountLifecycle
       @account_observations[number]&.merge!(refreshing: false, error_code: error.code)
     end
     raise
+  ensure
+    Thread.current[:adapter_account_observation_account] = previous_observation_account
   end
 
   def observe_device_registration(number, data)
@@ -177,11 +183,12 @@ module AccountLifecycle
       respond(sock, 200, cached)
       return
     end
-    Thread.current[:adapter_account_deadline] = monotonic_now + 45
+    Thread.current[:adapter_account_deadline] = monotonic_now + ACCOUNT_OPERATION_SECONDS
     super
   ensure
     Thread.current[:adapter_account_api_route] = nil
     Thread.current[:adapter_account_deadline] = nil
+    Thread.current[:adapter_account_request_id] = nil
   end
 
   def manage_saved_account(payload)
@@ -221,14 +228,53 @@ module AccountLifecycle
     account_snapshot
   end
 
+  def record_account_api_observation(value)
+    safe = value.slice(:route, :phase, :outcome, :message, :exit_code, :http_code,
+                       :proxy_http_code, :dns_ms, :tcp_ms, :tls_ms, :first_byte_ms,
+                       :total_ms, :elapsed_ms, :attempt, :attempts, :budget_exhausted, :endpoint, :peer_ip, :api_address, :proxy_port)
+    safe[:checked_at] = Time.now.iso8601
+    safe[:transaction_id] = Thread.current[:adapter_account_request_id]
+    safe[:observed_network_epoch] = network_epoch
+    @account_info_mutex.synchronize do
+      @account_api_last_result = safe.freeze
+      number = Thread.current[:adapter_account_observation_account] || @account_number
+      if number
+        @account_observations[number] ||= {}
+        @account_observations[number][:api_last_result] = safe
+      end
+    end
+    log_probe_event(value[:event] || 'account-api-request', **safe.reject { |key, _| key == :message })
+  rescue StandardError
+    nil # Diagnostic collection must not change the result of an API operation.
+  end
+
+  def account_api_endpoint_label(method, path)
+    return 'authentication' if path == 'auth/v1/token'
+    return 'account_info' if path == 'accounts/v1/accounts/me'
+    return method == 'GET' ? 'device_list' : 'device_create' if path == 'accounts/v1/devices'
+    return 'device_remove' if method == 'DELETE' && path.start_with?('accounts/v1/devices/')
+    return 'device_lookup' if method == 'GET' && path.start_with?('accounts/v1/devices/')
+    'account_operation' # Never log a dynamic URL/device ID or payload.
+  end
+
+  def invalidate_account_api_route
+    @account_api_selector&.invalidate
+  end
+
   def discover_account_api_route
     ports = [@options[:front_mixed], *@slot_config.values.map { |s| s[:mixed] }]
-    route = AccountApiRoutes.new(proxy: @options[:bootstrap_proxy],
-      cache_path: File.join(@state_dir, 'account-api-addresses.json'), excluded_proxy_ports: ports).select
+    @account_api_selector ||= AccountApiRoutes.new(proxy: @options[:bootstrap_proxy],
+      cache_path: File.join(@state_dir, 'account-api-addresses.json'), excluded_proxy_ports: ports,
+      observer: method(:record_account_api_observation))
+    epoch = network_epoch
+    @account_api_selector.invalidate if @account_route_network_epoch != epoch
+    @account_route_network_epoch = epoch
+    route = @account_api_selector.select(deadline: Thread.current[:adapter_account_deadline])
     @account_info_mutex.synchronize { @account_route_kind = route[:kind] }
     route[:args]
-  rescue AccountApiRoutes::Error
-    raise MullvadAdapter::AccountError.new('api_route_unavailable', '账号服务暂不可达：独立引导代理和官方 HTTPS 引导均未通过。可重新输入账号；这不表示设备已撤销。')
+  rescue AccountApiRoutes::Error => error
+    detail = error.diagnostic && error.diagnostic[:message]
+    raise MullvadAdapter::AccountError.new('api_route_unavailable', "账号服务暂不可达：#{detail || '独立代理和官方 HTTPS 均未取得有效响应'}。设备登记尚未核实；现有隧道保留。")
   end
 
   def start_account_monitor
@@ -256,7 +302,7 @@ module AccountLifecycle
         interval = info[:error_code] || unhealthy ? ACCOUNT_FAILURE_RECHECK_SECONDS : ACCOUNT_REFRESH_SECONDS
         next if age < interval
         begin
-          Thread.current[:adapter_account_deadline] = monotonic_now + 45
+          Thread.current[:adapter_account_deadline] = monotonic_now + ACCOUNT_OPERATION_SECONDS
           data = account_refresh(number)
           @account_data = data if number == @account_number
           remember_verified_identity_name if number == @account_number
@@ -265,6 +311,7 @@ module AccountLifecycle
         ensure
           Thread.current[:adapter_account_api_route] = nil
           Thread.current[:adapter_account_deadline] = nil
+          Thread.current[:adapter_account_request_id] = nil
         end
       end
       publish_account_snapshot

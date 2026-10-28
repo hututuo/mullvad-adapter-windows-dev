@@ -233,7 +233,7 @@ class MullvadAdapter
   TRANSPORT_PREFERENCES = (%w[auto] + TRANSPORT_MODES).freeze
   AUTO_TRANSPORT_ORDER = %w[ss quic ipv6 ipv4].freeze
   DEFAULT_TRANSPORT_PREFERENCE = 'ss'
-  BUILD_ID = '20261028-account-recovery-1'
+  BUILD_ID = '20261028-account-api-observability-1'
   SOURCE_SHA256 = Digest::SHA256.file(__FILE__).hexdigest
   SOURCE_COMPONENTS = %w[account_api_routes.rb account_lifecycle.rb connection_control.rb].to_h { |name| [name, Digest::SHA256.file(File.join(__dir__, name)).hexdigest] }.freeze
   STATUS_PUBLICATION_INTERVAL = 1.0
@@ -1444,21 +1444,30 @@ class MullvadAdapter
   end
 
   def account_request(method, path, token: nil, payload: nil, expected_status: nil)
-    remaining = (Thread.current[:adapter_account_deadline] || monotonic_now + 45) - monotonic_now
+    Thread.current[:adapter_account_request_id] ||= SecureRandom.hex(6)
+    deadline = Thread.current[:adapter_account_deadline] ||= monotonic_now + AccountLifecycle::ACCOUNT_OPERATION_SECONDS
+    raise AccountError.new('api_deadline_exceeded', '账号操作等待已到上限；请刷新核实，未自动重放操作') unless deadline > monotonic_now
+    route = Thread.current[:adapter_account_api_route] ||= discover_account_api_route
+    # Discovery is part of this transaction, so recompute AFTER it completes.
+    remaining = deadline - monotonic_now
     raise AccountError.new('api_deadline_exceeded', '账号操作等待已到上限；请刷新核实，未自动重放操作') unless remaining.positive?
-    # curl reads credentials from stdin; no account/token is exposed in argv,
-    # environment, curlrc, application events, or diagnostic reports.
     config = ["url = #{JSON.generate('https://api.mullvad.net/' + path)}", "request = #{JSON.generate(method)}",
               'header = "Content-Type: application/json"']
     config << "header = #{JSON.generate('Authorization: Bearer ' + token)}" if token
     config << "data = #{JSON.generate(JSON.generate(payload))}" if payload
+    started = monotonic_now
     stdout, _stderr, status = Open3.capture3('/usr/bin/curl', '-q', '--config', '-', '--silent', '--show-error',
-      '--max-time', [remaining, 12].min.to_s, '--connect-timeout', [remaining, 4].min.to_s, '--max-filesize', '131072', '--noproxy', '', *(Thread.current[:adapter_account_api_route] ||= discover_account_api_route),
-      '--write-out', "\n%{http_code}", stdin_data: config.join("\n") + "\n")
+      '--max-time', [remaining, 12].min.to_s, '--connect-timeout', [remaining, 4].min.to_s, '--max-filesize', '131072', '--noproxy', '', *route,
+      '--write-out', AccountApiRoutes::CURL_WRITE_OUT, stdin_data: config.join("\n") + "\n")
+    body, metrics = AccountApiRoutes.split_response(stdout)
+    kind = @account_info_mutex.synchronize { @account_route_kind }
+    observation = AccountApiRoutes.observation(status, metrics, route: kind)
+    record_account_api_observation(observation.merge(endpoint: account_api_endpoint_label(method, path), elapsed_ms: ((monotonic_now - started) * 1000).round))
     unless status.success?
-      raise AccountError.new('api_unreachable', 'Mullvad 账号 API 未确认完成；现有隧道保留。请检查引导代理并刷新；若刚提交撤销或兑换，确认官方状态后再操作')
+      invalidate_account_api_route
+      raise AccountError.new('api_unreachable', "Mullvad 账号请求未确认完成：#{observation[:message]}。现有隧道保留；刚提交的设备变更不会自动重放，请先刷新核实。")
     end
-    body, _, code = stdout.rpartition("\n")
+    code = format('%03d', metrics[:http_code].to_i)
     if expected_status && %w[200 201 204].include?(code) && code != expected_status.to_s
       raise AccountError.new('mutation_outcome_unknown', '官方注册返回了非预期成功状态；密钥已保留，请核实设备列表，不要重复提交')
     end
@@ -1474,7 +1483,12 @@ class MullvadAdapter
     end
     code == '204' ? {} : JSON.parse(body)
   rescue JSON::ParserError
+    record_account_api_observation(route: @account_route_kind, phase: 'response_validation', outcome: 'invalid_response', message: '官方 HTTPS 已响应，但账号数据不是有效 JSON', endpoint: account_api_endpoint_label(method, path))
     raise AccountError.new('invalid_response', '官方接口响应不是有效 JSON')
+  rescue SystemCallError, IOError
+    invalidate_account_api_route
+    record_account_api_observation(route: @account_route_kind, phase: 'local_execution', outcome: 'unavailable', message: '本机账号请求进程未执行完成', endpoint: account_api_endpoint_label(method, path))
+    raise AccountError.new('api_unreachable', '本机账号请求未执行完成，设备状态尚未核实；已保留现有隧道和未确认操作')
   end
 
   def handle_account_http(sock, method, path, headers, body)

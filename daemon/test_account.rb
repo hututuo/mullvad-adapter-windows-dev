@@ -47,6 +47,7 @@ class MullvadAccountTest < Minitest::Test
 
   def teardown
     Thread.current[:adapter_account_api_route] = nil
+    Thread.current[:adapter_account_deadline] = nil
     @adapter&.instance_variable_get(:@probe_event_writer)&.join(2)
     FileUtils.remove_entry(@dir)
   end

@@ -159,8 +159,8 @@ class AccountApiRoutesTest < Minitest::Test
     refute captured.any? { |arg| %w[-k --insecure -L --location].include?(arg) }
     assert_equal ['GET'], captured.each_with_index.filter_map { |arg, index| captured[index + 1] if arg == '--request' }
     assert_equal 1, captured.count { |arg| arg == 'https://api.mullvad.net/app/v1/api-addrs' }
-    assert_equal 3.0, captured[captured.index('--max-time') + 1].to_f
-    assert_equal 2.0, captured[captured.index('--connect-timeout') + 1].to_f
+    assert_equal 8.0, captured[captured.index('--max-time') + 1].to_f
+    assert_equal 4.0, captured[captured.index('--connect-timeout') + 1].to_f
   end
 
   def test_invalid_proxy_and_network_errors_do_not_leak_raw_details

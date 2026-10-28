@@ -833,4 +833,13 @@ final class AccountTests: XCTestCase {
         XCTAssertNotNil(model.errorMessage)
     }
 
+    func testAPIConnectionStageIsReadableWithoutCallingDeviceRevoked() throws {
+        let data = Data(#"{"state":"error","api_last_result":{"phase":"tls_handshake","outcome":"timeout","message":"TCP 已建立，等待官方 TLS 握手超时","elapsed_ms":8000}}"#.utf8)
+        let freshness = try JSONDecoder().decode(AccountFreshness.self, from: data)
+        XCTAssertEqual(freshness.apiLastResult?.phase, "tls_handshake")
+        XCTAssertTrue(freshness.apiLastResult?.summary.contains("8.0 秒") == true)
+        XCTAssertFalse(freshness.summary.contains("已撤销"))
+        XCTAssertFalse(freshness.summary.contains("账号无效"))
+    }
+
 }

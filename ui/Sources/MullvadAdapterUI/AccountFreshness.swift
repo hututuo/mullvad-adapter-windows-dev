@@ -15,9 +15,11 @@ struct AccountFreshness: Decodable {
     let errorCode: String?
     let apiRoute: String?
     let device: DeviceRegistrationStatus?
+    var apiLastResult: AccountAPIResult? = nil
     enum CodingKeys: String, CodingKey {
         case state, device; case signedIn = "signed_in", checkedAt = "checked_at", lastAttemptAt = "last_attempt_at"
         case errorCode = "error_code", apiRoute = "api_route"
+        case apiLastResult = "api_last_result"
     }
     var needsAttention: Bool { device?.state == "missing" || state == "error" || state == "signed_out" }
     var summary: String {
@@ -37,6 +39,21 @@ struct AccountFreshness: Decodable {
         case "system_https": return "系统 HTTPS"
         default: return "尚未确认可用的账号服务出口"
         }
+    }
+}
+struct AccountAPIResult: Decodable {
+    let phase: String?
+    let outcome: String?
+    let message: String?
+    let checkedAt: String?
+    let elapsedMS: Double?
+    enum CodingKeys: String, CodingKey {
+        case phase, outcome, message
+        case checkedAt = "checked_at", elapsedMS = "elapsed_ms"
+    }
+    var summary: String {
+        let duration = elapsedMS.map { String(format: "（%.1f 秒）", $0 / 1000) } ?? ""
+        return "最近请求：\(message ?? "具体阶段未确认")\(duration)"
     }
 }
 struct ConnectionControlStatus: Decodable {

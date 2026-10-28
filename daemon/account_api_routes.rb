@@ -18,19 +18,23 @@ class AccountApiRoutes
   MAX_ADDRESSES = 16
   MAX_CACHE_BYTES = 16 * 1024
   MAX_DIRECT_CANDIDATES = 4
-  MAX_TOTAL_SECONDS = 12.0
-  MAX_ATTEMPT_SECONDS = 3.0
+  MAX_TOTAL_SECONDS = 24.0
+  MAX_ATTEMPT_SECONDS = 8.0
+  ROUTE_REUSE_SECONDS = 900.0
+  CURL_WRITE_OUT = "\n%{http_code}|%{time_namelookup}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{time_total}|%{http_connect}|%{remote_ip}".freeze
 
   class Error < StandardError
-    attr_reader :code
+    attr_reader :code, :diagnostic
 
-    def initialize(code = 'route_unavailable')
-      @code = code
-      super('Mullvad account API route unavailable')
+    def initialize(code = 'route_unavailable', diagnostic: nil)
+      @code, @diagnostic = code, diagnostic
+      super(diagnostic ? diagnostic[:message] : 'Mullvad account API route unavailable')
     end
   end
 
-  def initialize(proxy:, cache_path:, excluded_proxy_ports: [], runner: nil, clock: nil)
+  def initialize(proxy:, cache_path:, excluded_proxy_ports: [], runner: nil, clock: nil, observer: nil)
+    @observer = observer
+    @selected = nil
     @proxy = proxy
     @cache_path = File.expand_path(cache_path.to_s)
     @excluded_proxy_ports = Array(excluded_proxy_ports).filter_map do |port|
@@ -43,11 +47,20 @@ class AccountApiRoutes
     @clock = clock || -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
   end
 
-  # Returns curl route arguments, the route kind, and only addresses accepted
-  # from a successful TLS-verified official api-addrs response.
-  def select
-    cache, cache_writable = read_cache
+  # Drop only the in-memory route choice. Retain the protected official address
+  # cache so the next bounded discovery can still try previously known entries.
+  def invalidate
+    @selected = nil
+  end
+
+  def select(deadline: nil)
     started_at = @clock.call
+    if @selected && started_at - @selected[:at] < ROUTE_REUSE_SECONDS
+      return Marshal.load(Marshal.dump(@selected[:route])).merge(reused: true)
+    end
+    cache, cache_writable = read_cache
+    budget = deadline ? [MAX_TOTAL_SECONDS, deadline - started_at].min : MAX_TOTAL_SECONDS
+    diagnostics = []
     routes = []
     last_success = cache[:last_success]
     routes << direct_route(last_success) if last_success
@@ -63,24 +76,91 @@ class AccountApiRoutes
 
         direct_count += 1
       end
-      remaining = MAX_TOTAL_SECONDS - (@clock.call - started_at)
+      remaining = budget - (@clock.call - started_at)
       break unless remaining.positive?
 
       timeout = [MAX_ATTEMPT_SECONDS, remaining].min
+      attempt_started = @clock.call
+      diagnostic = nil
       begin
-        body = request_addresses(route[:args], timeout)
-        raise Error if @clock.call - started_at > MAX_TOTAL_SECONDS
-
+        body, diagnostic = request_addresses(route[:args], timeout, route[:kind])
+        diagnostic = diagnostic.merge(api_address: route[:address], proxy_port: route[:proxy_port]).compact
+        if @clock.call - started_at > budget
+          diagnostic = diagnostic.merge(phase: 'budget', outcome: 'timeout', message: 'HTTPS 响应返回时已超过本轮发现预算')
+          raise Error.new(diagnostic: diagnostic)
+        end
         addresses = parse_addresses(body)
         persist_cache(cache, addresses, route[:address], cache_writable)
-        return { args: route[:args].dup, kind: route[:kind], addresses: addresses.dup }
-      rescue StandardError
-        # A failed route or invalid reply is safe to discard. Do not expose curl,
-        # proxy, or response details through this selector's errors.
+        diagnostic = diagnostic.merge(outcome: 'validated', message: '官方 HTTPS 地址列表已核实')
+        emit(diagnostic.merge(attempt: diagnostics.length + 1))
+        selected = { args: route[:args].dup, kind: route[:kind], addresses: addresses.dup }
+        @selected = { at: @clock.call, route: selected }
+        return Marshal.load(Marshal.dump(selected))
+      rescue StandardError => error
+        diagnostic ||= error.is_a?(Error) && error.diagnostic
+        diagnostic ||= { route: route[:kind], phase: 'local_execution', outcome: 'unavailable', message: '本机 API 请求未执行完成' }
+        if diagnostic[:http_code] == 200 && diagnostic[:outcome] == 'response_received'
+          diagnostic = diagnostic.merge(phase: 'response_validation', outcome: 'invalid_response', message: 'HTTPS 已响应，但官方地址列表未通过格式校验')
+        end
+        diagnostic = diagnostic.merge(api_address: route[:address], proxy_port: route[:proxy_port]).compact
+        diagnostic = diagnostic.merge(elapsed_ms: ((@clock.call - attempt_started) * 1000).round, attempt: diagnostics.length + 1)
+        diagnostics << diagnostic
+        emit(diagnostic)
       end
     end
+    last = diagnostics.last || { phase: 'budget', outcome: 'timeout', message: 'API 发现操作等待预算已用尽' }
+    emit(last.merge(event: 'account-api-discovery-finished', attempts: diagnostics.length,
+                    budget_exhausted: @clock.call - started_at >= budget))
+    raise Error.new(diagnostic: last)
+  end
 
-    raise Error
+  # Only numeric metrics and validated peer IPs are parsed. Never return stderr, response bodies,
+  # URLs, account numbers, proxy URLs or authorization headers as diagnostics.
+  def self.split_response(stdout)
+    body, separator, line = stdout.to_s.rpartition("\n")
+    return [stdout.to_s, {}] if separator.empty?
+    fields = line.split('|')
+    return [body, {}] unless [1, 7, 8].include?(fields.length)
+    return [body, {}] unless fields[0].match?(/\A[0-9]{3}\z/)
+    data = { http_code: fields[0].to_i }
+    if fields.length >= 7
+      %i[dns_ms tcp_ms tls_ms first_byte_ms total_ms].each_with_index do |key, index|
+        value = fields[index + 1]
+        next unless value.match?(/\A[0-9]+(?:\.[0-9]+)?\z/)
+        number = value.to_f * 1000
+        data[key] = number.round if number.finite? && number.between?(0, 300_000)
+      end
+      data[:proxy_http_code] = fields[6].to_i if fields[6].match?(/\A[0-9]{3}\z/)
+    end
+    if fields.length == 8 && fields[7].bytesize <= 64 && !fields[7].include?('/')
+      begin
+        data[:peer_ip] = IPAddr.new(fields[7]).to_s
+      rescue IPAddr::InvalidAddressError
+        # Do not log an unvalidated curl field as an address.
+      end
+    end
+    [body, data]
+  end
+
+  def self.observation(status, metrics, route:)
+    code = status.respond_to?(:exitstatus) ? status.exitstatus : status.success? ? 0 : nil
+    phase, outcome, message = case code
+    when 0 then metrics[:http_code].to_i.positive? ? ['http_response', 'response_received', "官方 HTTPS 返回 HTTP #{metrics[:http_code]}"] : ['response_validation', 'invalid_response', '请求已结束，但没有有效的 HTTP 状态']
+    when 5, 6 then ['dns', 'failed', 'API 域名或代理域名解析失败']
+    when 7 then ['tcp_connect', 'failed', route == 'configured_proxy' ? '无法连接本机引导代理' : '无法建立到官方地址的 TCP 连接']
+    when 28
+      if metrics[:tcp_ms].to_i.positive? && !metrics[:tls_ms].to_i.positive? && (route != 'configured_proxy' || metrics[:proxy_http_code] == 200)
+        ['tls_handshake', 'timeout', 'TCP 已建立，等待官方 TLS 握手超时']
+      elsif metrics[:tls_ms].to_i.positive?
+        ['http_response', 'timeout', 'TLS 已建立，等待官方 HTTPS 响应超时']
+      else
+        ['connection_wait', 'timeout', '等待 API 连接或代理转接超时，尚未确认 TLS 建立']
+      end
+    when 35 then ['tls_handshake', 'failed', '官方 HTTPS 的 TLS 握手失败']
+    when 51, 60 then ['certificate', 'failed', '官方 HTTPS 证书校验失败，已拒绝继续']
+    else ['request', 'failed', 'API 请求未完成，具体阶段未确认']
+    end
+    metrics.merge(exit_code: code, route: route, phase: phase, outcome: outcome, message: message)
   end
 
   private
@@ -104,7 +184,7 @@ class AccountApiRoutes
     address = IPAddr.new(uri.host.to_s)
     return unless loopback_address?(address)
 
-    { kind: 'configured_proxy', args: ['--proxy', raw, '--noproxy', ''] }
+    { kind: 'configured_proxy', proxy_port: uri.port, args: ['--proxy', raw, '--noproxy', ''] }
   rescue URI::InvalidURIError, IPAddr::InvalidAddressError
     nil
   end
@@ -126,19 +206,23 @@ class AccountApiRoutes
     { kind: 'system_https', args: ['--proxy', '', '--noproxy', '*'] }
   end
 
-  def request_addresses(route_args, timeout)
+  def request_addresses(route_args, timeout, kind)
     argv = ['/usr/bin/curl', '-q', '--silent', '--show-error', '--request', 'GET',
             '--max-time', format('%.3f', timeout),
-            '--connect-timeout', format('%.3f', [timeout, 2.0].min),
+            '--connect-timeout', format('%.3f', [timeout, 4.0].min),
             '--max-filesize', MAX_CACHE_BYTES.to_s,
-            *route_args, '--write-out', "\n%{http_code}", API_ADDRESSES_URL]
+            *route_args, '--write-out', CURL_WRITE_OUT, API_ADDRESSES_URL]
     stdout, _stderr, status = @runner.call(argv, timeout: timeout)
-    raise Error unless command_succeeded?(status)
+    body, metrics = self.class.split_response(stdout)
+    diagnostic = self.class.observation(status, metrics, route: kind)
+    raise Error.new(diagnostic: diagnostic) unless command_succeeded?(status) && metrics[:http_code] == 200 && body.bytesize <= MAX_CACHE_BYTES
+    [body, diagnostic]
+  end
 
-    body, separator, code = stdout.to_s.rpartition("\n")
-    raise Error unless separator == "\n" && code == '200' && body.bytesize <= MAX_CACHE_BYTES
-
-    body
+  def emit(diagnostic)
+    @observer&.call({ event: 'account-api-route-attempt' }.merge(diagnostic))
+  rescue StandardError
+    nil # Diagnostic delivery cannot break account access.
   end
 
   def run_curl(argv, timeout:)

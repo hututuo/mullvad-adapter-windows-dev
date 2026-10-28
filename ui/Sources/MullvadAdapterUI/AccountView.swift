@@ -173,6 +173,9 @@ struct AccountView: View {
                 Text(data.checkedAt.map { "上次成功核实：\($0)" } ?? "尚无成功核实时间")
                     .font(.caption).foregroundStyle(.secondary)
                 Text(data.freshness?.routeDescription ?? "账号服务出口待核实").font(.caption).foregroundStyle(.secondary)
+                if let result = data.freshness?.apiLastResult {
+                    Text(result.summary).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                }
                 if let expiry = data.expiryDate { Text("账号有效期至 \(expiry.formatted(date: .abbreviated, time: .shortened))").font(.caption) }
             }
             if let warning = account.snapshot?.profileWarning ?? account.snapshot?.identityStoreError {

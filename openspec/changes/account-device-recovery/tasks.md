@@ -5,6 +5,7 @@
 - [x] Save newly registered identities without replacing the active one; retain explicit activation and mutation guards.
 - [x] Add synthetic lifecycle/cancellation/privacy tests and future payload component handling.
 - [x] Local backend/shared/UI checks, including nonblocking published status and delayed Stop confirmation.
+- [x] Bound and observe API discovery/request stages; reuse recent validated route choices and invalidate on physical network changes/transport failures.
 - [ ] Cloud checks, bound to the delivery commit in private verification.
 - [ ] Real account mutation, installed UI/stop/activation and long-term acceptance (requires its own scope).
 
